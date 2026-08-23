@@ -66,6 +66,27 @@ node scripts/check-against-published-types.mjs \
 It lives outside `cargo test` because it needs the npm package, which CI does not
 have. Run it whenever that package moves.
 
+## Where it runs
+
+LiveKit is deployed in the homelab at `wss://livekit.sanctuary.gdn`, reachable over
+Tailscale only. Both Happy clients dial that hostname directly — native passes it as
+`serverUrl`, web as `livekitUrl` — so it is this project's published API and should
+not change casually.
+
+Signaling goes through Caddy. Media does not, because WebRTC cannot cross an HTTP
+reverse proxy: the SFU advertises the runner VM's own address and clients dial it
+directly on 7881/tcp and 7882/udp, which the tailnet's `192.168.7.0/24` subnet route
+makes reachable from every device.
+
+The API key and secret live in Vault at `secret/livekit` — one path, read by both the
+SFU that verifies room JWTs and the token endpoint that signs them. `room.auto_create`
+is off, so a room exists only once `GET /v1/convai/conversation/token` has created it
+and dispatched the agent; a client that skips that path fails to join rather than
+landing in a room with nobody in it.
+
+The job spec, firewall entries, and Vault scaffolding are in `~/code/home-infra`
+(`jobs/livekit.nomad.hcl`).
+
 ## Backlog
 
 Tracked in `lit` in this repo — twelve tickets under the `openconv` epic, ranked in
