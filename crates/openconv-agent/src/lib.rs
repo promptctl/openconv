@@ -24,15 +24,23 @@
 
 pub mod audio;
 pub mod control;
+pub mod endpoint;
+pub mod listen;
+pub mod transcribe;
 
 use audio::Voice;
 use control::{ControlChannel, PublishFailed, Unannounced};
+use listen::Speech;
+use livekit::track::RemoteTrack;
 use livekit::{Room, RoomEvent, RoomOptions};
 use openconv_protocol::{
-    AudioFormat, ConversationInitiationMetadataEvent, ServerEvent, VadScoreEvent,
+    AudioFormat, ConversationInitiationMetadataEvent, ServerEvent,
+    TentativeUserTranscriptionEvent, UserTranscriptionEvent, VadScoreEvent,
 };
 use std::fmt;
 use std::sync::Arc;
+use tokio::sync::mpsc;
+use transcribe::Transcriber;
 
 /// Everything an agent needs to serve one conversation.
 ///
@@ -49,8 +57,19 @@ pub struct Assignment {
     pub conversation_id: String,
 }
 
+/// What every conversation in the process shares.
+///
+/// Kept apart from [`Assignment`] because the two have opposite lifetimes and opposite
+/// costs: an assignment is three small strings describing one call, while these are
+/// heavyweight handles — a speech model is hundreds of megabytes — that are loaded once
+/// and used by every call. Folding them together would either copy a model per
+/// conversation or make the per-call value impossible to construct in a test.
+pub struct Services {
+    pub transcriber: Arc<Transcriber>,
+}
+
 /// Joins the room and serves the conversation until it ends.
-pub async fn run(assignment: Assignment) -> Result<(), AgentError> {
+pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), AgentError> {
     let (room, mut events) = Room::connect(&assignment.url, &assignment.token, RoomOptions::default())
         .await
         .map_err(|error| AgentError::Join(error.to_string()))?;
@@ -78,7 +97,23 @@ pub async fn run(assignment: Assignment) -> Result<(), AgentError> {
     // transcripts, agent responses, tool calls. Today only the VAD placeholder does.
     let mut control: Option<ControlChannel> = None;
 
-    while let Some(event) = events.recv().await {
+    // Transcripts arrive from a separate task, because the caller's track is subscribed
+    // before the control channel exists and inference must not run on this loop. The
+    // loop below is the only thing that publishes, so ids and ordering stay in one place.
+    let (heard, mut speech) = mpsc::channel::<Speech>(32);
+
+    loop {
+        let event = tokio::select! {
+            event = events.recv() => match event {
+                Some(event) => event,
+                None => break,
+            },
+            Some(said) = speech.recv() => {
+                publish_transcript(control.as_ref(), &assignment, said).await?;
+                continue;
+            }
+        };
+
         match event {
             // Deliberately not `ParticipantConnected`, which the SDK documents as
             // firing *before* the participant can receive data messages. Announcing
@@ -128,6 +163,23 @@ pub async fn run(assignment: Assignment) -> Result<(), AgentError> {
                 voice.enqueue(&audio::tone(440.0, 400, 0.2));
             }
 
+            // The caller's microphone. Listening runs in its own task because
+            // transcription is CPU-bound and would otherwise stall this loop — and with
+            // it the announcement, the disconnect handling, and every other
+            // conversation's audio pump sharing the runtime.
+            RoomEvent::TrackSubscribed { track: RemoteTrack::Audio(track), participant, .. } => {
+                tracing::info!(
+                    conversation = %assignment.conversation_id,
+                    participant = %participant.identity(),
+                    "listening to the caller"
+                );
+                tokio::spawn(listen::listen(
+                    track,
+                    services.transcriber.clone(),
+                    heard.clone(),
+                ));
+            }
+
             RoomEvent::ParticipantDisconnected(participant) => {
                 tracing::info!(
                     conversation = %assignment.conversation_id,
@@ -166,14 +218,53 @@ pub async fn run(assignment: Assignment) -> Result<(), AgentError> {
     Ok(())
 }
 
+/// Sends one transcript to the client.
+///
+/// The tentative/final distinction survives all the way to the wire as two different
+/// message types, because the app renders them differently — settled text replaces the
+/// provisional line rather than appending to it.
+async fn publish_transcript(
+    control: Option<&ControlChannel>,
+    assignment: &Assignment,
+    said: Speech,
+) -> Result<(), AgentError> {
+    // Speech can be transcribed before the caller is ready to receive data, since the
+    // track is subscribed first. Dropping it is right — there is nowhere to send it —
+    // but it is said out loud, because a transcript vanishing is otherwise invisible.
+    let Some(channel) = control else {
+        tracing::warn!(
+            conversation = %assignment.conversation_id,
+            text = said.text(),
+            "heard speech before the conversation was announced; dropping it"
+        );
+        return Ok(());
+    };
+
+    let event_id = channel.next_event_id();
+    let event = match said {
+        Speech::Tentative(user_transcript) => ServerEvent::TentativeUserTranscript {
+            tentative_user_transcription_event: TentativeUserTranscriptionEvent {
+                user_transcript,
+                event_id,
+            },
+        },
+        Speech::Final(user_transcript) => ServerEvent::UserTranscript {
+            user_transcription_event: UserTranscriptionEvent { user_transcript, event_id },
+        },
+    };
+
+    channel.publish(&event).await?;
+    Ok(())
+}
+
 /// Starts an agent in the background, logging rather than returning its outcome.
 ///
 /// The caller is an HTTP handler that must answer its own request; an agent that fails
 /// to join has to be visible in the logs, not in a response the client already received.
-pub fn spawn(assignment: Assignment) {
+pub fn spawn(assignment: Assignment, services: Arc<Services>) {
     tokio::spawn(async move {
         let conversation = assignment.conversation_id.clone();
-        if let Err(error) = run(assignment).await {
+        if let Err(error) = run(assignment, services).await {
             tracing::error!(%conversation, %error, "agent failed");
         }
     });

@@ -124,8 +124,22 @@ them. That is `webhook.urls` in `jobs/livekit.nomad.hcl` over in `home-infra`, a
 needs a reachable openconv to point at. Until it is set, every conversation reads as
 in-progress and is billed for elapsed time capped at six hours.
 
-The agent speaks, but it has nothing to say yet. It joins, announces, and plays a tone
-so the track can be proven end to end; speech arrives with the STT, LLM and TTS tickets.
+The agent listens. It joins, announces, plays a tone so the track can be proven end to
+end, and transcribes what the caller says into `user_transcript` events. It has nothing
+to *say* yet — that arrives with the LLM and TTS tickets.
+
+Hearing needs a model, which lives outside the repository:
+
+```
+scripts/fetch-whisper-model.sh          # ~/.cache/openconv/models/ggml-base.en.bin
+```
+
+**Run the agent in release.** This is not a preference. The same sentence takes 121 ms
+to transcribe in a release build and 41 seconds in a debug one, because whisper.cpp
+without optimisation is three hundred times slower than with it — the difference between
+a conversation and a hang. The model also warms itself up at startup rather than lazily:
+the first call through Metal compiles a shader library, and unpaid it lands on the first
+thing the first caller ever says.
 
 ```
 OPENCONV_API_KEY=... node scripts/agent-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
@@ -135,6 +149,23 @@ That one needs `npm install @livekit/rtc-node`. It joins a real room as the app 
 and asserts what the app depends on: the agent is a connected participant, its first
 control event is the announcement, a `vad_score` follows, and the published track
 carries audible samples rather than silence.
+
+```
+OPENCONV_API_KEY=... node scripts/stt-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
+```
+
+That one speaks. It renders a sentence with the macOS `say` voice, publishes it as a
+microphone in real time, and checks the words come back as a `user_transcript`. Real
+synthesized speech over a real track rather than a recorded fixture, because the
+resampling and the endpointing are exactly the parts a fixture would skip.
+
+To try the model on its own, without a room — the fastest way to tell a speech problem
+from a transport one:
+
+```
+say -o /tmp/s.wav --data-format=LEI16@16000 "hello can you hear me"
+cargo run --release -p openconv-agent --example transcribe_wav -- /tmp/s.wav
+```
 
 ## Where it runs
 

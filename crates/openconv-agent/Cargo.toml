@@ -16,3 +16,13 @@ tracing = "0.1"
 # no TLS backend, and every wss:// connection then fails as if the host were down.
 livekit = { version = "0.8", features = ["rustls-tls-native-roots"] }
 libwebrtc = "0.3"
+whisper-rs = "0.16"
+futures-util = "0.3"
+
+# whisper-rs ships with no acceleration compiled in — its default feature set is empty,
+# so inference runs on the CPU alone and lands well behind realtime, which for a
+# conversation is the same as not working. Metal is the one that matters on Apple
+# Silicon. Declared per-target because the feature does not exist elsewhere; cargo
+# unions it with the base dependency above.
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", features = ["metal"] }
