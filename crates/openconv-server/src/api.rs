@@ -25,14 +25,23 @@ pub struct AppState {
     pub livekit: Arc<LiveKit>,
     pub log: Arc<ConversationLog>,
     pub webhooks: Arc<Webhooks>,
+    /// Handed to every agent this process starts. Loaded once — see
+    /// [`openconv_agent::Services`].
+    pub agents: Arc<openconv_agent::Services>,
     pub xi_api_key: XiApiKey,
 }
 
 impl AppState {
-    pub fn new(config: &Config, livekit: LiveKit, log: ConversationLog) -> Self {
+    pub fn new(
+        config: &Config,
+        livekit: LiveKit,
+        log: ConversationLog,
+        agents: Arc<openconv_agent::Services>,
+    ) -> Self {
         Self {
             livekit: Arc::new(livekit),
             log: Arc::new(log),
+            agents,
             webhooks: Arc::new(Webhooks::new(
                 &config.livekit_api_key,
                 &config.livekit_api_secret,
@@ -133,7 +142,7 @@ async fn conversation_token(
         url: state.livekit.signaling_url(),
         token: state.livekit.mint_agent_token(&record.conversation_id)?.as_str().to_owned(),
         conversation_id: record.conversation_id.as_str().to_owned(),
-    });
+    }, state.agents.clone());
 
     tracing::info!(
         conversation = %record.conversation_id,

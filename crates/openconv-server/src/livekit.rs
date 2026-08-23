@@ -245,6 +245,7 @@ mod tests {
             xi_api_key: XiApiKey::new("sk-test"),
             bind: "127.0.0.1:0".parse().unwrap(),
             conversation_log: "conversations.jsonl".into(),
+            whisper_model: "ggml-base.en.bin".into(),
         }
     }
 

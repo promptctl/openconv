@@ -7,6 +7,7 @@ use openconv_server::config::Config;
 use openconv_server::livekit::LiveKit;
 use openconv_server::store::ConversationLog;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -34,7 +35,15 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // cannot be billed, and finding that out at startup costs nothing.
     log.read_all().await?;
 
-    let state = AppState::new(&config, LiveKit::new(&config), log);
+    // Loaded here rather than on the first utterance: a missing or corrupt model must
+    // stop the process, not produce a service that answers calls and cannot hear.
+    let agents = Arc::new(openconv_agent::Services {
+        transcriber: Arc::new(openconv_agent::transcribe::Transcriber::load(
+            &config.whisper_model,
+        )?),
+    });
+
+    let state = AppState::new(&config, LiveKit::new(&config), log, agents);
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
 
     tracing::info!(

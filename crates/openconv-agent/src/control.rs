@@ -29,8 +29,9 @@
 //! is no ordering to remember because there is no other order available.
 
 use livekit::{DataPacket, Room};
-use openconv_protocol::{ConversationInitiationMetadataEvent, ServerEvent};
+use openconv_protocol::{ConversationInitiationMetadataEvent, EventId, ServerEvent};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// A room the agent has joined but has not yet announced itself in.
@@ -53,7 +54,7 @@ impl Unannounced {
         self,
         metadata: ConversationInitiationMetadataEvent,
     ) -> Result<ControlChannel, PublishFailed> {
-        let channel = ControlChannel { room: self.room };
+        let channel = ControlChannel { room: self.room, next_event_id: AtomicU64::new(1) };
         channel
             .publish(&ServerEvent::ConversationMetadata {
                 conversation_initiation_metadata_event: metadata,
@@ -70,9 +71,21 @@ impl Unannounced {
 /// than by review.
 pub struct ControlChannel {
     room: Arc<Room>,
+    /// The per-conversation event counter the client echoes back on `pong` and attaches
+    /// to feedback.
+    ///
+    /// It lives here because this is the only thing that publishes: a counter kept
+    /// anywhere else would be a second opinion about what the next id is, and two call
+    /// sites would eventually disagree.
+    next_event_id: AtomicU64,
 }
 
 impl ControlChannel {
+    /// Takes the next event id. Ids are consumed in publish order.
+    pub fn next_event_id(&self) -> EventId {
+        EventId(self.next_event_id.fetch_add(1, Ordering::Relaxed))
+    }
+
     /// Publishes one event as UTF-8 JSON on the reliable data channel.
     ///
     /// One `publishData` call carries exactly one serialized event, with no envelope

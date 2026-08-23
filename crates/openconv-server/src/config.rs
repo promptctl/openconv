@@ -27,6 +27,9 @@ pub struct Config {
     pub bind: SocketAddr,
     /// Append-only record of conversations, read back by `GET /v1/convai/conversations`.
     pub conversation_log: PathBuf,
+    /// The whisper.cpp model the agent hears with. Loaded once at startup and shared by
+    /// every conversation.
+    pub whisper_model: PathBuf,
 }
 
 impl Config {
@@ -67,12 +70,26 @@ impl Config {
                 "OPENCONV_CONVERSATION_LOG",
                 "conversations.jsonl",
             )),
+            whisper_model: PathBuf::from(optional(
+                "OPENCONV_WHISPER_MODEL",
+                &default_whisper_model(),
+            )),
         })
     }
 }
 
 fn optional(name: &str, fallback: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| fallback.to_owned())
+}
+
+/// Where `scripts/fetch-whisper-model.sh` puts the model.
+///
+/// Outside the repository because it is a hundred-odd megabytes of weights that no
+/// commit should carry, and under the user's cache rather than a temporary directory so
+/// it survives a reboot and is fetched once.
+fn default_whisper_model() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+    format!("{home}/.cache/openconv/models/ggml-base.en.bin")
 }
 
 /// The shared secret callers present as `xi-api-key`.
