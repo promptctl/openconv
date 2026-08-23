@@ -1710,6 +1710,7 @@ dependencies = [
  "libwebrtc",
  "livekit",
  "openconv-protocol",
+ "reqwest",
  "serde_json",
  "tokio",
  "tracing",

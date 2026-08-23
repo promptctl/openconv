@@ -75,11 +75,13 @@ longer string and neither raises an error when the pattern does not match. A
 whose name breaks that regex cannot be named.
 
 ```
-LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... OPENCONV_API_KEY=... cargo run -p openconv-server
+LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... OPENCONV_API_KEY=... ANTHROPIC_API_KEY=... \
+  cargo run --release -p openconv-server
 ```
 
-`LIVEKIT_URL`, `OPENCONV_BIND`, and `OPENCONV_CONVERSATION_LOG` have defaults; the
-three above do not, and the process refuses to start without them.
+`LIVEKIT_URL`, `OPENCONV_BIND`, `OPENCONV_CONVERSATION_LOG`, `OPENCONV_WHISPER_MODEL`,
+and `OPENCONV_LLM_MODEL` have defaults; the four above do not, and the process refuses
+to start without them — with every missing name listed at once.
 
 It also serves `POST /livekit/webhook`, which is how conversations get their durations.
 The end of a call is observed rather than reported — the SFU sees the room close even
@@ -124,9 +126,26 @@ them. That is `webhook.urls` in `jobs/livekit.nomad.hcl` over in `home-infra`, a
 needs a reachable openconv to point at. Until it is set, every conversation reads as
 in-progress and is billed for elapsed time capped at six hours.
 
-The agent listens. It joins, announces, plays a tone so the track can be proven end to
-end, and transcribes what the caller says into `user_transcript` events. It has nothing
-to *say* yet — that arrives with the LLM and TTS tickets.
+The agent holds a conversation. It joins, announces, transcribes what the caller says,
+answers with an LLM, and publishes the reply as `agent_response`. What it cannot do yet
+is *speak* the reply — the words go out as text on the control channel, and giving them
+a voice is the TTS ticket.
+
+The part worth knowing is the session configuration. The client sends a system prompt
+override, a first message, and dynamic variables; Happy puts the coding session's id and
+context in those variables, and the override *replaces* the default prompt rather than
+extending it. An agent that quietly ignored any of that would still hold a fluent
+conversation — it would simply know nothing about the session it was meant to be
+driving, with nothing failing and nothing logged. `scripts/llm-acceptance.mjs` exists
+because "it replied" is not evidence: it plants a session id that reaches the model only
+through `dynamic_variables` and asks a question no generic assistant can answer.
+
+The LLM sits behind one trait, so swapping Claude for a local model is a different value
+in `Services`, not a different shape. Two settings are deliberate: `effort: "low"`,
+because the caller is waiting in real time and depth past a spoken sentence is latency
+they hear as silence; and thinking left **on**, because disabling it is the larger saving
+and it breaks tool use — the model then occasionally writes a tool call into its visible
+text, so the call silently never runs and the words get spoken aloud instead.
 
 Hearing needs a model, which lives outside the repository:
 
@@ -152,6 +171,7 @@ carries audible samples rather than silence.
 
 ```
 OPENCONV_API_KEY=... node scripts/stt-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
+OPENCONV_API_KEY=... node scripts/llm-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
 ```
 
 That one speaks. It renders a sentence with the macOS `say` voice, publishes it as a

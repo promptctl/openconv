@@ -27,6 +27,20 @@ async fn main() -> ExitCode {
     }
 }
 
+/// What the agent is when the client does not say.
+///
+/// Deliberately thin. Happy sends its own prompt in
+/// `conversation_initiation_client_data`, and that override *replaces* this rather than
+/// extending it — so anything substantive written here would be dead text in the only
+/// deployment that matters, while still shaping every conversation started by a client
+/// that forgot to configure one. What it does say is the part that is true of any voice
+/// agent: replies are spoken aloud, so they have to be short.
+const DEFAULT_PROMPT: &str = "\
+You are a voice assistant. Your replies are spoken aloud, so keep them to one or two \
+short sentences and use plain words that are easy to hear. Do not use markdown, lists, \
+or formatting of any kind. If you do not understand what was said, ask for it again \
+rather than guessing.";
+
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let log = ConversationLog::new(&config.conversation_log);
@@ -41,6 +55,11 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         transcriber: Arc::new(openconv_agent::transcribe::Transcriber::load(
             &config.whisper_model,
         )?),
+        llm: Arc::new(openconv_agent::llm::Claude::new(
+            config.anthropic_api_key.clone(),
+            config.llm_model.clone(),
+        )),
+        default_prompt: DEFAULT_PROMPT.into(),
     });
 
     let state = AppState::new(&config, LiveKit::new(&config), log, agents);
