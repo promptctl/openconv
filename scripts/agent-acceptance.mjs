@@ -54,8 +54,19 @@ room.on(RoomEvent.DataReceived, (payload) => {
   }
 });
 room.on(RoomEvent.ParticipantConnected, (p) => participants.push(p.identity));
+// Start reading the moment the track is subscribed, the way a client that is playing
+// audio does. Reading later instead — after the control-event assertions below — misses
+// whatever the agent said on subscribe, and reports a working track as silent.
+const heard = { frames: 0, peak: 0 };
 room.on(RoomEvent.TrackSubscribed, (track) => {
-  audioTrack ??= track;
+  if (audioTrack) return;
+  audioTrack = track;
+  (async () => {
+    for await (const frame of new AudioStream(track)) {
+      heard.frames += 1;
+      for (const sample of frame.data) heard.peak = Math.max(heard.peak, Math.abs(sample));
+    }
+  })().catch(() => {});
 });
 
 await Promise.race([
@@ -123,25 +134,15 @@ check(
   audioTrack?.kind !== undefined ? `kind=${audioTrack.kind}` : "",
 );
 
-if (audioTrack) {
-  // Read a couple of seconds and look for actual sound. A subscribed-but-silent track
-  // is what a broken pump looks like, and it is indistinguishable from a working one
-  // until you measure the samples.
-  const stream = new AudioStream(audioTrack);
-  let frames = 0;
-  let peak = 0;
-  const reading = (async () => {
-    for await (const frame of stream) {
-      frames += 1;
-      for (const sample of frame.data) peak = Math.max(peak, Math.abs(sample));
-      if (frames >= 200) break;
-    }
-  })();
-  await Promise.race([reading, new Promise((resolve) => setTimeout(resolve, 8_000))]);
-
-  check("audio frames are flowing", frames > 0, `${frames} frames`);
-  check("the track carries audible sound, not silence", peak > 1000, `peak amplitude ${peak}`);
-}
+// A subscribed-but-silent track is exactly what a broken pump looks like, and it is
+// indistinguishable from a working one until you measure the samples.
+await waitFor(() => heard.frames > 50, 10_000, "audio frames");
+check("audio frames are flowing", heard.frames > 0, `${heard.frames} frames`);
+check(
+  "the track carried audible sound, not silence",
+  heard.peak > 1000,
+  `peak amplitude ${heard.peak}`,
+);
 
 await room.disconnect();
 

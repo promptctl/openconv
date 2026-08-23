@@ -124,11 +124,17 @@ them. That is `webhook.urls` in `jobs/livekit.nomad.hcl` over in `home-infra`, a
 needs a reachable openconv to point at. Until it is set, every conversation reads as
 in-progress and is billed for elapsed time capped at six hours.
 
-The agent has not been observed completing a call. It authenticates and opens an RTC
-session — the SFU logs it joining with the right identity and grants — but ICE has not
-been seen to finish on the development Mac, so the published track and the control
-events have not been watched arriving at a client. `scripts/agent-acceptance.mjs` is the
-check that closes that gap; it joins a room as the app would and asserts all of it.
+The agent speaks, but it has nothing to say yet. It joins, announces, and plays a tone
+so the track can be proven end to end; speech arrives with the STT, LLM and TTS tickets.
+
+```
+OPENCONV_API_KEY=... node scripts/agent-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
+```
+
+That one needs `npm install @livekit/rtc-node`. It joins a real room as the app would
+and asserts what the app depends on: the agent is a connected participant, its first
+control event is the announcement, a `vad_score` follows, and the published track
+carries audible samples rather than silence.
 
 ## Where it runs
 
