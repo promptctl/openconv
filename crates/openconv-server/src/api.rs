@@ -5,12 +5,14 @@
 use crate::config::{Config, XiApiKey};
 use crate::conversation::ConversationId;
 use crate::livekit::{ConversationToken, LiveKit, LiveKitError};
-use crate::record::{now_unix_secs, AgentId, ConversationRecord, HappyUserId};
+use crate::record::{now_unix_secs, AgentId, ConversationEvent, ConversationRecord, HappyUserId};
 use crate::store::{ConversationLog, LogError};
+use crate::usage::{self, ConversationPage, UsageQuery};
+use crate::webhook::{WebhookRejected, Webhooks};
 use axum::extract::{FromRequestParts, Query, State};
-use axum::http::{request::Parts, StatusCode};
+use axum::http::{request::Parts, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -22,6 +24,7 @@ const API_KEY_HEADER: &str = "xi-api-key";
 pub struct AppState {
     pub livekit: Arc<LiveKit>,
     pub log: Arc<ConversationLog>,
+    pub webhooks: Arc<Webhooks>,
     pub xi_api_key: XiApiKey,
 }
 
@@ -30,6 +33,10 @@ impl AppState {
         Self {
             livekit: Arc::new(livekit),
             log: Arc::new(log),
+            webhooks: Arc::new(Webhooks::new(
+                &config.livekit_api_key,
+                &config.livekit_api_secret,
+            )),
             xi_api_key: config.xi_api_key.clone(),
         }
     }
@@ -38,6 +45,10 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/convai/conversation/token", get(conversation_token))
+        .route("/v1/convai/conversations", get(conversations))
+        // Authenticated by LiveKit's own signature over the body rather than by
+        // `xi-api-key`, because LiveKit is the caller here and knows nothing about ours.
+        .route("/livekit/webhook", post(livekit_webhook))
         // Unauthenticated on purpose: a liveness probe that needs a credential tells
         // you the credential is good, not that the service is up.
         .route("/health", get(|| async { "ok" }))
@@ -111,7 +122,7 @@ async fn conversation_token(
     );
 
     state.livekit.create_room(&record).await?;
-    state.log.append(&record).await?;
+    state.log.append(&ConversationEvent::Started(record.clone())).await?;
     let token = state.livekit.mint_participant_token(&record)?;
 
     tracing::info!(
@@ -124,11 +135,104 @@ async fn conversation_token(
     Ok(Json(TokenResponse { token }))
 }
 
+/// `GET /v1/convai/conversations?user_id=...&created_after=...&page_size=...`
+#[derive(Debug, Deserialize)]
+pub struct ConversationsRequest {
+    #[serde(default)]
+    user_id: Option<HappyUserId>,
+    /// Left as a string here because callers disagree about its format; see
+    /// [`parse_created_after`].
+    #[serde(default)]
+    created_after: Option<String>,
+    #[serde(default)]
+    page_size: Option<usize>,
+}
+
+/// Reads `created_after` in either form its callers send.
+///
+/// ElevenLabs documents unix seconds, but Happy sends `new Date(...).toISOString()` —
+/// an ISO-8601 string — and Happy is the caller that has to work. Accepting both is
+/// liberality at the outermost edge, and it ends here: the rest of the service sees
+/// one integer and never learns there was a choice.
+///
+/// An unparseable value is an error rather than a silently ignored filter. Dropping it
+/// would widen the window to all of history and quietly under-report nobody's usage
+/// while over-reporting everyone's.
+fn parse_created_after(raw: &str) -> Result<i64, ApiError> {
+    use time::format_description::well_known::Rfc3339;
+
+    raw.parse::<i64>()
+        .ok()
+        .or_else(|| {
+            time::OffsetDateTime::parse(raw, &Rfc3339).ok().map(|at| at.unix_timestamp())
+        })
+        .ok_or_else(|| ApiError::BadCreatedAfter(raw.to_owned()))
+}
+
+/// Serves the usage history Happy sums to decide whether a user may start a call.
+async fn conversations(
+    _: Authenticated,
+    State(state): State<AppState>,
+    Query(request): Query<ConversationsRequest>,
+) -> Result<Json<ConversationPage>, ApiError> {
+    let created_after_unix_secs =
+        request.created_after.as_deref().map(parse_created_after).transpose()?;
+
+    let events = state.log.read_all().await?;
+
+    Ok(Json(usage::conversations(
+        &events,
+        &UsageQuery {
+            user_id: request.user_id,
+            created_after_unix_secs,
+            page_size: request.page_size,
+        },
+        now_unix_secs(),
+    )))
+}
+
+/// Receives LiveKit's room lifecycle notifications, and records the ends of calls.
+///
+/// Takes the body as a `String` rather than parsed JSON because the signature covers
+/// the exact bytes sent: re-serializing a parsed value would change them, and the
+/// verification would fail for reasons that have nothing to do with authenticity.
+async fn livekit_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<StatusCode, ApiError> {
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(ApiError::UnsignedWebhook)?;
+
+    let Some(event) = state.webhooks.interpret(&body, auth)? else {
+        // A kind of event this service does not record. Acknowledged so LiveKit stops
+        // retrying it.
+        return Ok(StatusCode::NO_CONTENT);
+    };
+
+    state.log.append(&event).await?;
+
+    tracing::info!(conversation = %event.conversation_id(), "conversation ended");
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Debug)]
 pub enum ApiError {
     Unauthenticated,
+    BadCreatedAfter(String),
+    UnsignedWebhook,
+    Webhook(WebhookRejected),
     LiveKit(LiveKitError),
     Log(LogError),
+}
+
+impl From<WebhookRejected> for ApiError {
+    fn from(error: WebhookRejected) -> Self {
+        Self::Webhook(error)
+    }
 }
 
 impl From<LiveKitError> for ApiError {
@@ -164,6 +268,29 @@ impl IntoResponse for ApiError {
                 "invalid_api_key",
                 format!("missing or incorrect {API_KEY_HEADER} header"),
             ),
+            Self::BadCreatedAfter(value) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_created_after",
+                format!(
+                    "created_after={value:?} is neither unix seconds nor an ISO-8601 timestamp"
+                ),
+            ),
+            // The webhook arms answer LiveKit, not a user. Both are 401 so a
+            // misconfigured webhook key shows up in the SFU's delivery log as a
+            // rejection rather than as a success that recorded nothing.
+            Self::UnsignedWebhook => (
+                StatusCode::UNAUTHORIZED,
+                "unsigned_webhook",
+                "webhook delivery carried no Authorization header".to_owned(),
+            ),
+            Self::Webhook(error) => {
+                tracing::warn!(%error, "rejected a webhook delivery");
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_webhook",
+                    "webhook delivery was not accepted".to_owned(),
+                )
+            }
             // The caller did nothing wrong in either remaining case, so both are 5xx —
             // and both are logged here with their full cause, because the body
             // deliberately does not carry it.
