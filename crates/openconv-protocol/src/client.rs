@@ -1,0 +1,187 @@
+//! Messages the client sends to the agent.
+
+use serde::{Deserialize, Serialize};
+
+use crate::{ClientEventKind, EventId, JsonObject};
+
+/// A message the client publishes onto the LiveKit data channel.
+///
+/// Unlike [`ServerEvent`](crate::ServerEvent), most of these carry their payload as
+/// fields sitting directly alongside `type` rather than nested under a per-variant
+/// name — `{"type":"pong","event_id":42}`, not `{"type":"pong","pong_event":{…}}`.
+/// The nesting is a property of each individual message, not of the direction, so it
+/// is transcribed message by message from the spec.
+///
+/// There is no catch-all variant. A message this enum cannot name is protocol drift
+/// between openconv and the client SDK, and deserialization fails loudly so the drift
+/// is reported at the point it happens instead of being silently ignored.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientEvent {
+    /// Answers a [`ServerEvent::Ping`](crate::ServerEvent::Ping), echoing its id.
+    Pong { event_id: EventId },
+    /// Typed input standing in for speech: it opens a turn exactly as talking would.
+    UserMessage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    /// A liveness signal — the user is present and interacting, so hold off on
+    /// whatever the agent does when a conversation goes quiet.
+    UserActivity,
+    Feedback {
+        event_id: EventId,
+        score: FeedbackScore,
+    },
+    /// The outcome of a tool the agent asked the client to run. `result` is a string
+    /// even when the tool produced structured data; the client serializes it.
+    ClientToolResult {
+        tool_call_id: String,
+        result: String,
+        is_error: bool,
+    },
+    McpToolApprovalResult {
+        tool_call_id: String,
+        is_approved: bool,
+    },
+    /// Context for the agent to absorb without treating it as the user's turn — the
+    /// distinction that keeps background session events from being answered aloud.
+    ContextualUpdate { text: String },
+    /// The first message of every conversation, carrying the per-session
+    /// configuration the agent applies before its opening turn.
+    ///
+    /// Boxed and named, unlike the other variants: this payload is an order of
+    /// magnitude larger than the rest, and it outlives the message — the agent holds
+    /// onto it for the whole conversation, so it wants to be a value that can be
+    /// passed around on its own.
+    #[serde(rename = "conversation_initiation_client_data")]
+    ConversationInitiation(Box<ConversationInitiationClientData>),
+}
+
+/// The per-session configuration accompanying a conversation's first message.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConversationInitiationClientData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_config_override: Option<ConversationConfigOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_llm_extra_body: Option<JsonObject>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_variables: Option<JsonObject>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_info: Option<SourceInfo>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackScore {
+    Like,
+    Dislike,
+}
+
+/// Per-session overrides of the agent's configured defaults.
+///
+/// The SDK builds all three sub-objects whenever the caller passes any override at
+/// all, so `tts` and `conversation` routinely arrive as empty objects. Every field is
+/// optional for that reason, not merely because the spec marks them so.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConversationConfigOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<ConversationConfigOverrideAgent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts: Option<ConversationConfigOverrideTts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<ConversationConfigOverrideConversation>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConversationConfigOverrideAgent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<Language>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<PromptOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_mcp_server_ids: Option<Vec<String>>,
+}
+
+/// A one-field wrapper in the spec, kept as one so the wire stays
+/// `{"prompt":{"prompt":"…"}}` — which is what the SDK actually sends.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PromptOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConversationConfigOverrideTts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stability: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similarity_boost: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConversationConfigOverrideConversation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_events: Option<Vec<ClientEventKind>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SourceInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// The languages the agent may be switched to.
+///
+/// A closed set, because the published type is a closed union: the client picks from
+/// this list or omits the field entirely to let the agent auto-detect. A code outside
+/// it is a client that has outrun this crate, and failing to parse says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    En,
+    Ja,
+    Zh,
+    De,
+    Hi,
+    Fr,
+    Ko,
+    Pt,
+    #[serde(rename = "pt-br")]
+    PtBr,
+    It,
+    Es,
+    Id,
+    Nl,
+    Tr,
+    Pl,
+    Sv,
+    Bg,
+    Ro,
+    Ar,
+    Cs,
+    El,
+    Fi,
+    Ms,
+    Da,
+    Ta,
+    Uk,
+    Ru,
+    Hu,
+    Hr,
+    Sk,
+    No,
+    Vi,
+    Tl,
+}

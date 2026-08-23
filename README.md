@@ -47,6 +47,25 @@ handling, and streaming TTS chunking are ours to write.
 The control protocol is not among these. It ships as generated TypeScript in the
 `@elevenlabs/types` package, so the message shapes are read, not guessed.
 
+## Layout
+
+`crates/openconv-protocol` holds the control-message types — two serde enums,
+`ServerEvent` and `ClientEvent`, covering every message the SDK can send or receive
+over the LiveKit data channel. Its tests pin each message to the JSON shape published
+in `@elevenlabs/types`, because a wrong field name is otherwise invisible: it
+round-trips perfectly and the client quietly ignores the message.
+
+Those fixtures are transcribed by hand, so `scripts/check-against-published-types.mjs`
+checks the transcription against the TypeScript itself:
+
+```
+node scripts/check-against-published-types.mjs \
+  ~/code/brandon-fryslie_happy/node_modules/@elevenlabs/types/generated/types/asyncapi-types.ts
+```
+
+It lives outside `cargo test` because it needs the npm package, which CI does not
+have. Run it whenever that package moves.
+
 ## Backlog
 
 Tracked in `lit` in this repo — twelve tickets under the `openconv` epic, ranked in
