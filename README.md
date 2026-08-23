@@ -66,6 +66,30 @@ node scripts/check-against-published-types.mjs \
 It lives outside `cargo test` because it needs the npm package, which CI does not
 have. Run it whenever that package moves.
 
+`crates/openconv-server` serves the REST endpoints. The room name is the piece worth
+knowing about: it is not derived from the conversation ID, it *is* the conversation
+ID, because both consumers recover that ID by running `(conv_[a-zA-Z0-9]+)` over a
+longer string and neither raises an error when the pattern does not match. A
+`ConversationId` can only be built by generating one or by parsing one, so a room
+whose name breaks that regex cannot be named.
+
+```
+LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... OPENCONV_API_KEY=... cargo run -p openconv-server
+```
+
+`LIVEKIT_URL`, `OPENCONV_BIND`, and `OPENCONV_CONVERSATION_LOG` have defaults; the
+three above do not, and the process refuses to start without them. To check a running
+instance against the contract Happy's server actually depends on:
+
+```
+OPENCONV_API_KEY=... LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
+  node scripts/token-endpoint-acceptance.mjs http://127.0.0.1:8080
+```
+
+That one needs a real LiveKit deployment because parts of the contract cannot be
+observed without one — a rejected signature, a room that was never created, and a
+build with no TLS backend compiled in all look identical to a passing unit test.
+
 ## Where it runs
 
 LiveKit is deployed in the homelab at `wss://livekit.sanctuary.gdn`, reachable over

@@ -1,0 +1,23 @@
+[package]
+name = "openconv-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ElevenLabs Conversational AI-compatible REST endpoints, backed by LiveKit"
+
+[dependencies]
+openconv-protocol = { path = "../openconv-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "signal"] }
+# The TLS feature is not optional despite looking like one. livekit-api's defaults
+# pull in reqwest with no TLS backend enabled, so every https:// call to the SFU fails
+# at the transport layer with a bare "error sending request" that reads exactly like
+# the host being unreachable. Native roots rather than a bundled set, so the homelab's
+# certificate chain is trusted on the same terms as every other tool on the machine.
+livekit-api = { version = "0.6", features = ["rustls-tls-native-roots"] }
+rand = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
