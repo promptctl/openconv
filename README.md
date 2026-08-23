@@ -36,13 +36,21 @@ handling, and streaming TTS chunking are ours to write.
 
 ## Open questions
 
-- Which VAD, STT, and LLM. Silero via ONNX and whisper.cpp via `whisper-rs` are the
-  obvious Rust-native candidates; the LLM is an HTTP call either way.
-- How VAD scores and speaking/listening mode changes reach the client. The SDK
-  exposes `onVadScore` and `onModeChange`, so the agent has to emit both over a
-  LiveKit data channel in whatever shape the SDK's decoder expects — needs capture
-  from a live ElevenLabs session.
-- The exact message shape of a client tool call, same capture.
+- Which STT engine, and whether it holds real-time on CPU. `whisper-rs` is the
+  Rust-native candidate.
+- Whether the agent runs as one process per room or one process serving many, and
+  how it gets dispatched into a room the token endpoint just created.
+- How much of LiveKit's Python pipeline behaviour — barge-in, endpointing, TTS
+  chunking — has to be rebuilt before conversations feel natural rather than
+  walkie-talkie.
+
+The control protocol is not among these. It ships as generated TypeScript in the
+`@elevenlabs/types` package, so the message shapes are read, not guessed.
+
+## Backlog
+
+Tracked in `lit` in this repo — twelve tickets under the `openconv` epic, ranked in
+build order. `lit backlog` to see them.
 
 ## Background
 
