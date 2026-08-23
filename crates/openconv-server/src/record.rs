@@ -65,6 +65,40 @@ pub struct ConversationRecord {
     pub started_at_unix_secs: i64,
 }
 
+/// One line of the conversation log.
+///
+/// A conversation is not a row that gets updated when the call ends — it is the fold
+/// of the events about it. That keeps the log strictly append-only: a line is written
+/// once and never revised, so there is no read-modify-write to lose a race, and a
+/// half-finished write can only ever cost the last line rather than corrupt an
+/// existing record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum ConversationEvent {
+    /// Written when the token is minted and the room created.
+    Started(ConversationRecord),
+    /// Written when LiveKit reports the room closed.
+    ///
+    /// The end of a call is observed rather than reported: it comes from the SFU's
+    /// `room_finished` webhook, not from the agent. An agent that crashes mid-call
+    /// still owes an accurate number, and a conversation that never lands here reads
+    /// to Happy as free usage.
+    Finished {
+        conversation_id: ConversationId,
+        ended_at_unix_secs: i64,
+    },
+}
+
+impl ConversationEvent {
+    /// The conversation every event belongs to — the key the fold groups on.
+    pub fn conversation_id(&self) -> &ConversationId {
+        match self {
+            Self::Started(record) => &record.conversation_id,
+            Self::Finished { conversation_id, .. } => conversation_id,
+        }
+    }
+}
+
 impl ConversationRecord {
     /// Builds the record. The clock is a parameter rather than a call to
     /// [`std::time::SystemTime`] so that constructing a record stays pure and its

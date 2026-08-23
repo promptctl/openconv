@@ -13,6 +13,7 @@ side of that — two REST endpoints and the agent itself.
 |---|---|
 | `GET /v1/convai/conversation/token` | Create a room, dispatch the agent into it, return a LiveKit JWT. The room name must contain a `conv_<id>`; Happy's server pulls that ID out with a regex. |
 | `GET /v1/convai/conversations` | Past conversations with `call_duration_secs`, which Happy sums for usage gating. |
+| `POST /livekit/webhook` | Not part of the ElevenLabs surface. LiveKit posts room lifecycle events here; `room_finished` is what gives a conversation its duration. |
 
 The agent joins each room and runs the turn loop: VAD, speech-to-text, LLM,
 text-to-speech. The LLM can call two tools that execute back in the app —
@@ -78,17 +79,32 @@ LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... OPENCONV_API_KEY=... cargo run -p ope
 ```
 
 `LIVEKIT_URL`, `OPENCONV_BIND`, and `OPENCONV_CONVERSATION_LOG` have defaults; the
-three above do not, and the process refuses to start without them. To check a running
-instance against the contract Happy's server actually depends on:
+three above do not, and the process refuses to start without them.
+
+It also serves `POST /livekit/webhook`, which is how conversations get their durations.
+The end of a call is observed rather than reported — the SFU sees the room close even
+when the agent crashed, and a conversation with no end reads to Happy as free usage.
+That makes the conversation log an event log: `started` and `finished` are two appended
+lines, and a conversation is the fold of them, so nothing is ever rewritten in place.
+
+Two acceptance scripts check a running instance against what its callers actually do,
+rather than against what this README claims:
 
 ```
 OPENCONV_API_KEY=... LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
-  node scripts/token-endpoint-acceptance.mjs http://127.0.0.1:8080
+  node scripts/token-endpoint-acceptance.mjs  http://127.0.0.1:8080
+  node scripts/conversations-acceptance.mjs   http://127.0.0.1:8080
 ```
 
-That one needs a real LiveKit deployment because parts of the contract cannot be
-observed without one — a rejected signature, a room that was never created, and a
-build with no TLS backend compiled in all look identical to a passing unit test.
+They need a real LiveKit deployment because parts of the contract cannot be observed
+without one — a rejected signature, a room that was never created, and a build with no
+TLS backend compiled in all look identical to a passing unit test.
+
+One caveat worth knowing before trusting usage numbers in production: openconv accepts
+`room_finished` deliveries, but the LiveKit deployment is not yet configured to send
+them. That is `webhook.urls` in `jobs/livekit.nomad.hcl` over in `home-infra`, and it
+needs a reachable openconv to point at. Until it is set, every conversation reads as
+in-progress and is billed for elapsed time capped at six hours.
 
 ## Where it runs
 

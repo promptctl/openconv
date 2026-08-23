@@ -4,12 +4,16 @@
 //! answer for calls long after they end, so the association between a conversation and
 //! the user who started it cannot live only on the room. This is where it outlives it.
 //!
-//! An append-only JSONL file rather than a database: one conversation is one line, a
-//! line is written once and never revised, and `GET /v1/convai/conversations` reads
-//! the file forward. That is the whole access pattern, and it needs no schema, no
+//! An append-only JSONL file rather than a database: one event is one line, a line is
+//! written once and never revised, and `GET /v1/convai/conversations` reads the file
+//! forward and folds it. That is the whole access pattern, and it needs no schema, no
 //! migration, and no process to keep running beside this one.
+//!
+//! This module knows only how to put lines in and get them back. What a run of events
+//! *means* — how long a call lasted, whose allowance it spent — belongs to
+//! [`crate::usage`], where it is a pure function and can be tested without a disk.
 
-use crate::record::ConversationRecord;
+use crate::record::ConversationEvent;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
@@ -37,8 +41,8 @@ impl ConversationLog {
     /// Records a conversation. Returns an error rather than logging and continuing:
     /// a token handed out for a conversation nobody recorded is a call that can never
     /// be billed, which is worse than a caller seeing the mint fail and retrying.
-    pub async fn append(&self, record: &ConversationRecord) -> Result<(), LogError> {
-        let mut line = serde_json::to_string(record).map_err(LogError::Serialize)?;
+    pub async fn append(&self, event: &ConversationEvent) -> Result<(), LogError> {
+        let mut line = serde_json::to_string(event).map_err(LogError::Serialize)?;
         line.push('\n');
 
         let _guard = self.writer.lock().await;
@@ -66,7 +70,7 @@ impl ConversationLog {
     ///
     /// The counterpart to [`Self::append`], and the seam
     /// `GET /v1/convai/conversations` is built on.
-    pub async fn read_all(&self) -> Result<Vec<ConversationRecord>, LogError> {
+    pub async fn read_all(&self) -> Result<Vec<ConversationEvent>, LogError> {
         let contents = match tokio::fs::read_to_string(&self.path).await {
             Ok(contents) => contents,
             // A log that does not exist yet is a service that has served no
@@ -112,7 +116,7 @@ impl std::error::Error for LogError {}
 mod tests {
     use super::*;
     use crate::conversation::ConversationId;
-    use crate::record::{AgentId, HappyUserId};
+    use crate::record::{AgentId, ConversationRecord, HappyUserId};
 
     fn temp_log() -> (ConversationLog, PathBuf) {
         let path = std::env::temp_dir().join(format!(
@@ -123,13 +127,35 @@ mod tests {
         (ConversationLog::new(&path), path)
     }
 
-    fn record(user: Option<&str>) -> ConversationRecord {
-        ConversationRecord::start(
+    fn record(user: Option<&str>) -> ConversationEvent {
+        ConversationEvent::Started(ConversationRecord::start(
             ConversationId::generate(),
             AgentId::new("agent_happy"),
             user.map(HappyUserId::new),
             1_700_000_000,
-        )
+        ))
+    }
+
+    fn ended(event: &ConversationEvent) -> ConversationEvent {
+        ConversationEvent::Finished {
+            conversation_id: event.conversation_id().clone(),
+            ended_at_unix_secs: 1_700_000_060,
+        }
+    }
+
+    /// Both kinds of line survive a round trip through the file, which is what makes
+    /// the log foldable rather than merely writable.
+    #[tokio::test]
+    async fn starts_and_ends_both_round_trip() {
+        let (log, path) = temp_log();
+        let start = record(Some("u_alice"));
+        let end = ended(&start);
+
+        log.append(&start).await.unwrap();
+        log.append(&end).await.unwrap();
+
+        assert_eq!(log.read_all().await.unwrap(), vec![start, end]);
+        tokio::fs::remove_file(path).await.unwrap();
     }
 
     #[tokio::test]

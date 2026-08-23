@@ -21,3 +21,11 @@ livekit-api = { version = "0.6", features = ["rustls-tls-native-roots"] }
 rand = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Happy sends created_after as an ISO-8601 string (Date#toISOString in voiceRoutes.ts),
+# not the unix seconds ElevenLabs documents, so the endpoint has to parse both.
+time = { version = "0.3", features = ["parsing"] }
+
+[dev-dependencies]
+# For signing webhook deliveries in tests the way LiveKit signs them.
+sha2 = "0.10"
+base64 = "0.22"
