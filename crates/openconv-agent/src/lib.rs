@@ -26,7 +26,7 @@ pub mod audio;
 pub mod control;
 
 use audio::Voice;
-use control::{PublishFailed, Unannounced};
+use control::{ControlChannel, PublishFailed, Unannounced};
 use livekit::{Room, RoomEvent, RoomOptions};
 use openconv_protocol::{
     AudioFormat, ConversationInitiationMetadataEvent, ServerEvent, VadScoreEvent,
@@ -58,34 +58,76 @@ pub async fn run(assignment: Assignment) -> Result<(), AgentError> {
 
     tracing::info!(conversation = %assignment.conversation_id, "agent joined");
 
-    // Before anything else reaches the client. See `control`'s module docs: the client
-    // hangs forever if this is not the first message, and the type system is what stops
-    // a future edit from putting something above it.
-    let control = Unannounced::new(room.clone())
-        .announce(ConversationInitiationMetadataEvent {
-            conversation_id: assignment.conversation_id.clone(),
-            agent_output_audio_format: AudioFormat::Pcm48000,
-            user_input_audio_format: AudioFormat::Pcm48000,
-        })
-        .await?;
-
+    // Published before anyone is here to hear it, which is fine and is the point: a
+    // track exists to be subscribed to, and the caller subscribes on the way in.
     let voice = Voice::publish(&room).await?;
     tokio::spawn(voice.clone().run());
 
-    // Scaffolding that ticket .8 removes: proves the track carries audio to the client
-    // before any speech pipeline exists to put words on it.
-    voice.enqueue(&audio::tone(440.0, 250, 0.2));
+    // Nothing has been said yet, because there is nobody to say it to.
+    //
+    // The agent is dispatched when the token is minted, so it is normally in the room
+    // *first* — and the data channel does not replay. Anything published into an empty
+    // room is gone, and the client's one-shot listener then never fires, hanging
+    // `startSession()` exactly as sending the wrong message first would. Both failures
+    // look identical from outside and neither logs anything on our side.
+    //
+    // So the announcement waits for an audience, and `Unannounced` is what carries
+    // "nothing has been published yet" as state rather than as an assumption.
+    let mut unannounced = Some(Unannounced::new(room.clone()));
+    // Kept past the announcement because every later ticket publishes through it —
+    // transcripts, agent responses, tool calls. Today only the VAD placeholder does.
+    let mut control: Option<ControlChannel> = None;
 
-    // Likewise a placeholder for ticket .6, which computes these from the user's audio.
-    // Sent after the announcement, which is the only ordering the client cares about.
-    control
-        .publish(&ServerEvent::VadScore { vad_score_event: VadScoreEvent { vad_score: 0.0 } })
-        .await?;
-
-    // The room is the agent's lifetime. Every event flows through here so that
-    // disconnection has one place it is noticed rather than a timeout somewhere.
     while let Some(event) = events.recv().await {
         match event {
+            // Deliberately not `ParticipantConnected`, which the SDK documents as
+            // firing *before* the participant can receive data messages. Announcing
+            // there races the client's data channel and loses often enough to matter.
+            RoomEvent::ParticipantActive(participant) => {
+                let Some(pending) = unannounced.take() else { continue };
+
+                tracing::info!(
+                    conversation = %assignment.conversation_id,
+                    participant = %participant.identity(),
+                    "caller is listening, announcing the conversation"
+                );
+
+                control = Some(
+                    pending
+                        .announce(ConversationInitiationMetadataEvent {
+                            conversation_id: assignment.conversation_id.clone(),
+                            agent_output_audio_format: AudioFormat::Pcm48000,
+                            user_input_audio_format: AudioFormat::Pcm48000,
+                        })
+                        .await?,
+                );
+
+                // A placeholder for ticket .6, which computes these from the caller's
+                // audio. Sent after the announcement, which is the ordering that
+                // matters to the client.
+                if let Some(channel) = &control {
+                    channel
+                        .publish(&ServerEvent::VadScore {
+                            vad_score_event: VadScoreEvent { vad_score: 0.0 },
+                        })
+                        .await?;
+                }
+            }
+
+            // Someone has subscribed to the agent's track, so audio published now will
+            // actually be heard. Waiting for this rather than speaking on join is the
+            // same lesson as the announcement: joining and listening are different
+            // moments, and only one of them is worth talking into.
+            RoomEvent::LocalTrackSubscribed { .. } => {
+                tracing::info!(
+                    conversation = %assignment.conversation_id,
+                    "caller subscribed to the agent's audio"
+                );
+                // Scaffolding that ticket .8 removes: proves the track carries audio
+                // end to end before any speech pipeline exists to put words on it.
+                voice.enqueue(&audio::tone(440.0, 400, 0.2));
+            }
+
             RoomEvent::ParticipantDisconnected(participant) => {
                 tracing::info!(
                     conversation = %assignment.conversation_id,
@@ -104,6 +146,16 @@ pub async fn run(assignment: Assignment) -> Result<(), AgentError> {
             }
             _ => {}
         }
+    }
+
+    // An agent that never announced is one nobody ever joined — a token minted and not
+    // used, or a caller who could not reach the SFU. It bills as a conversation either
+    // way, so it is worth being able to tell the two apart afterwards.
+    if control.is_none() {
+        tracing::warn!(
+            conversation = %assignment.conversation_id,
+            "conversation ended without a caller ever joining"
+        );
     }
 
     // Leaving explicitly rather than dropping the room: it closes the room promptly for

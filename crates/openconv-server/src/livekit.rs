@@ -194,10 +194,34 @@ pub enum LiveKitError {
     Metadata(serde_json::Error),
 }
 
+/// Renders an error together with everything underneath it.
+///
+/// `ServiceError` and `reqwest::Error` both collapse to "error sending request for url
+/// (...)", which reads the same whether the host is unreachable, the TLS handshake
+/// failed, the request timed out, or the process was denied a socket. Those call for
+/// four different responses, so the causes go in the message.
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        // Each layer tends to restate the one below it verbatim; only the layers that
+        // add something are worth the width.
+        if !rendered.contains(&text) {
+            rendered.push_str(": ");
+            rendered.push_str(&text);
+        }
+        source = cause.source();
+    }
+    rendered
+}
+
 impl fmt::Display for LiveKitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CreateRoom(error) => write!(f, "LiveKit refused to create the room: {error}"),
+            Self::CreateRoom(error) => {
+                write!(f, "LiveKit refused to create the room: {}", with_causes(error))
+            }
             Self::MintToken(error) => write!(f, "could not sign the participant token: {error}"),
             Self::Metadata(error) => write!(f, "could not serialize the room metadata: {error}"),
         }
