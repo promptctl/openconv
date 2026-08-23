@@ -125,6 +125,16 @@ async fn conversation_token(
     state.log.append(&ConversationEvent::Started(record.clone())).await?;
     let token = state.livekit.mint_participant_token(&record)?;
 
+    // Before the caller is told the room is ready, so the agent is on its way in rather
+    // than starting only once the user has already joined an empty room. It joins in
+    // the background: the agent's own failures belong in the logs, not in a response
+    // about whether a token could be minted.
+    openconv_agent::spawn(openconv_agent::Assignment {
+        url: state.livekit.signaling_url(),
+        token: state.livekit.mint_agent_token(&record.conversation_id)?.as_str().to_owned(),
+        conversation_id: record.conversation_id.as_str().to_owned(),
+    });
+
     tracing::info!(
         conversation = %record.conversation_id,
         agent = %record.agent_id,

@@ -1,0 +1,14 @@
+# libwebrtc, which the agent pulls in through the livekit crate, implements part of
+# itself as Objective-C categories (NSString+StdString and friends). Nothing references
+# those symbolically, so without -ObjC the linker drops them as dead weight and the
+# build succeeds either way. The failure lands at runtime, on the first call into the
+# encoder factory:
+#
+#   *** Terminating app due to uncaught exception 'NSInvalidArgumentException',
+#       reason: '+[NSString stringForAbslStringView:]: unrecognized selector ...'
+#
+# which aborts the entire process — so an agent joining a room takes the REST endpoints
+# down with it. Repo-wide rather than per-crate because it is a property of the final
+# link, and every binary and test in this workspace that touches the agent needs it.
+[target.'cfg(target_vendor = "apple")']
+rustflags = ["-C", "link-arg=-ObjC"]
