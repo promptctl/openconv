@@ -100,11 +100,35 @@ They need a real LiveKit deployment because parts of the contract cannot be obse
 without one — a rejected signature, a room that was never created, and a build with no
 TLS backend compiled in all look identical to a passing unit test.
 
-One caveat worth knowing before trusting usage numbers in production: openconv accepts
+`crates/openconv-agent` is the participant on the other side of the room. It runs in
+the same process as the endpoints, one task per conversation, spawned when the token is
+minted — LiveKit's explicit dispatch is not an option, because it targets a worker
+registered under an `agent_name` and that worker framework is Python and Node only. The
+seam stays narrow anyway: an agent is a function of a URL, a token, and a conversation
+id, so moving agents into their own process later changes how they receive those three
+things and nothing else.
+
+The ordering rule in `control.rs` is the part to read first. The ElevenLabs client
+resolves its connect promise from a `{once: true}` listener on the first data message,
+so if `conversation_initiation_metadata` is not first, `startSession()` never resolves —
+no error, no timeout, just a user waiting in a room. That is why `announce()` consumes
+the unannounced room and is the only way to obtain something that can publish.
+
+Note for anyone building this on macOS: `.cargo/config.toml` passes `-ObjC`, and it is
+load-bearing. libwebrtc implements part of itself as Objective-C categories that the
+linker otherwise drops, and the process aborts the first time an agent joins a room.
+
+Two further caveats before trusting any of this in production: openconv accepts
 `room_finished` deliveries, but the LiveKit deployment is not yet configured to send
 them. That is `webhook.urls` in `jobs/livekit.nomad.hcl` over in `home-infra`, and it
 needs a reachable openconv to point at. Until it is set, every conversation reads as
 in-progress and is billed for elapsed time capped at six hours.
+
+The agent has not been observed completing a call. It authenticates and opens an RTC
+session — the SFU logs it joining with the right identity and grants — but ICE has not
+been seen to finish on the development Mac, so the published track and the control
+events have not been watched arriving at a client. `scripts/agent-acceptance.mjs` is the
+check that closes that gap; it joins a room as the app would and asserts all of it.
 
 ## Where it runs
 

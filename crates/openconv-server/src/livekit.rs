@@ -33,6 +33,7 @@ const TOKEN_TTL: Duration = Duration::from_secs(6 * 3600);
 /// The far side of LiveKit, as this service uses it.
 pub struct LiveKit {
     rooms: RoomClient,
+    url: String,
     api_key: String,
     api_secret: String,
 }
@@ -45,6 +46,7 @@ impl LiveKit {
                 &config.livekit_api_key,
                 &config.livekit_api_secret,
             ),
+            url: config.livekit_url.clone(),
             api_key: config.livekit_api_key.clone(),
             api_secret: config.livekit_api_secret.clone(),
         }
@@ -87,33 +89,67 @@ impl LiveKit {
         &self,
         record: &ConversationRecord,
     ) -> Result<ConversationToken, LiveKitError> {
-        let room = record.conversation_id.as_str();
+        // The display name carries Happy's user ID when there is one. The BYO path
+        // supplies no `participant_name`, and an empty name is the honest rendering of
+        // that rather than a placeholder that would later look like a real user.
+        self.mint_token(
+            &record.conversation_id,
+            &participant_identity(&record.conversation_id),
+            record.happy_user.as_ref().map(|user| user.as_str()),
+        )
+    }
 
+    /// Signs the agent's own JWT for the same room.
+    ///
+    /// Identical grants to the human's: the agent publishes speech, subscribes to the
+    /// user's microphone, and both sends and receives control events. The two differ
+    /// only in who they say they are, which is why they are one function.
+    pub fn mint_agent_token(
+        &self,
+        conversation: &ConversationId,
+    ) -> Result<ConversationToken, LiveKitError> {
+        self.mint_token(conversation, &agent_identity(conversation), Some(AGENT_NAME))
+    }
+
+    fn mint_token(
+        &self,
+        conversation: &ConversationId,
+        identity: &str,
+        name: Option<&str>,
+    ) -> Result<ConversationToken, LiveKitError> {
         let mut token = AccessToken::with_api_key(&self.api_key, &self.api_secret)
             .with_ttl(TOKEN_TTL)
-            .with_identity(&participant_identity(&record.conversation_id))
+            .with_identity(identity)
             .with_grants(VideoGrants {
                 room_join: true,
-                room: room.to_owned(),
-                // Publish the microphone, subscribe to the agent's speech, and both
-                // send and receive control messages on the data channel — the three
-                // things the SDK does once it is in the room.
+                room: conversation.as_str().to_owned(),
+                // Publish audio, subscribe to the other side's audio, and both send and
+                // receive control messages on the data channel — everything either
+                // party does once it is in the room, and nothing more.
                 can_publish: true,
                 can_subscribe: true,
                 can_publish_data: true,
                 ..Default::default()
             });
 
-        // The display name carries Happy's user ID when there is one. The BYO path
-        // supplies no `participant_name`, and an empty name is the honest rendering of
-        // that rather than a placeholder that would later look like a real user.
-        if let Some(user) = &record.happy_user {
-            token = token.with_name(user.as_str());
+        if let Some(name) = name {
+            token = token.with_name(name);
         }
 
         token.to_jwt().map(ConversationToken).map_err(LiveKitError::MintToken)
     }
+
+    /// The signaling URL the agent dials.
+    ///
+    /// Derived from the one configured origin rather than configured separately, so the
+    /// REST calls and the agent can never end up pointed at different deployments.
+    pub fn signaling_url(&self) -> String {
+        self.url.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1)
+    }
 }
+
+/// What the client shows for the agent, and how it appears in the room.
+const AGENT_NAME: &str = "agent";
 
 /// The identity LiveKit knows the human participant by.
 ///
@@ -123,6 +159,14 @@ impl LiveKit {
 /// second conversation silently killed their first.
 fn participant_identity(conversation: &ConversationId) -> String {
     format!("user_{conversation}")
+}
+
+/// The identity the agent joins under.
+///
+/// Distinct from the human's, so the two never collide and so either side can tell who
+/// published a track without consulting anything else.
+fn agent_identity(conversation: &ConversationId) -> String {
+    format!("agent_{conversation}")
 }
 
 /// A signed LiveKit JWT, ready to hand to the client SDK.

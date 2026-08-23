@@ -1,0 +1,18 @@
+[package]
+name = "openconv-agent"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The voice agent that joins a conversation room and talks to the caller"
+
+[dependencies]
+openconv-protocol = { path = "../openconv-protocol" }
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+tracing = "0.1"
+# Brings its own libwebrtc: the first build downloads a prebuilt one and leaves a
+# multi-gigabyte target directory. Same TLS caveat as livekit-api — the defaults give
+# no TLS backend, and every wss:// connection then fails as if the host were down.
+livekit = { version = "0.8", features = ["rustls-tls-native-roots"] }
+libwebrtc = "0.3"
