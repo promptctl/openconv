@@ -246,6 +246,8 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             conversation_log: "conversations.jsonl".into(),
             whisper_model: "ggml-base.en.bin".into(),
+            anthropic_api_key: "sk-test".to_owned(),
+            llm_model: "claude-opus-5".to_owned(),
         }
     }
 

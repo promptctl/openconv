@@ -18,6 +18,9 @@ livekit = { version = "0.8", features = ["rustls-tls-native-roots"] }
 libwebrtc = "0.3"
 whisper-rs = "0.16"
 futures-util = "0.3"
+# Rust has no official Anthropic SDK, so the Claude client speaks the Messages API
+# over HTTP directly. rustls rather than the platform stack, matching livekit.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 
 # whisper-rs ships with no acceleration compiled in — its default feature set is empty,
 # so inference runs on the CPU alone and lands well behind realtime, which for a

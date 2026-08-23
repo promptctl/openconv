@@ -30,6 +30,9 @@ pub struct Config {
     /// The whisper.cpp model the agent hears with. Loaded once at startup and shared by
     /// every conversation.
     pub whisper_model: PathBuf,
+    /// Credentials and model for the LLM that decides what the agent says.
+    pub anthropic_api_key: String,
+    pub llm_model: String,
 }
 
 impl Config {
@@ -42,11 +45,16 @@ impl Config {
         let livekit_api_key = required("LIVEKIT_API_KEY");
         let livekit_api_secret = required("LIVEKIT_API_SECRET");
         let xi_api_key = required("OPENCONV_API_KEY");
+        let anthropic_api_key = required("ANTHROPIC_API_KEY");
 
         // Reporting every missing name in one pass beats failing on the first: an
         // operator bringing the service up for the first time gets the whole list.
-        let (Some(livekit_api_key), Some(livekit_api_secret), Some(xi_api_key)) =
-            (livekit_api_key, livekit_api_secret, xi_api_key)
+        let (
+            Some(livekit_api_key),
+            Some(livekit_api_secret),
+            Some(xi_api_key),
+            Some(anthropic_api_key),
+        ) = (livekit_api_key, livekit_api_secret, xi_api_key, anthropic_api_key)
         else {
             return Err(ConfigError::Missing(missing));
         };
@@ -74,6 +82,8 @@ impl Config {
                 "OPENCONV_WHISPER_MODEL",
                 &default_whisper_model(),
             )),
+            anthropic_api_key,
+            llm_model: optional("OPENCONV_LLM_MODEL", "claude-opus-5"),
         })
     }
 }

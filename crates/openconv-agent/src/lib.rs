@@ -26,6 +26,8 @@ pub mod audio;
 pub mod control;
 pub mod endpoint;
 pub mod listen;
+pub mod llm;
+pub mod session;
 pub mod transcribe;
 
 use audio::Voice;
@@ -34,12 +36,14 @@ use listen::Speech;
 use livekit::track::RemoteTrack;
 use livekit::{Room, RoomEvent, RoomOptions};
 use openconv_protocol::{
-    AudioFormat, ConversationInitiationMetadataEvent, ServerEvent,
-    TentativeUserTranscriptionEvent, UserTranscriptionEvent, VadScoreEvent,
+    AgentResponseEvent, AudioFormat, ClientEvent, ConversationInitiationMetadataEvent,
+    ServerEvent, TentativeUserTranscriptionEvent, UserTranscriptionEvent, VadScoreEvent,
 };
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use llm::{Llm, Turn};
+use session::SessionConfig;
 use transcribe::Transcriber;
 
 /// Everything an agent needs to serve one conversation.
@@ -66,6 +70,9 @@ pub struct Assignment {
 /// conversation or make the per-call value impossible to construct in a test.
 pub struct Services {
     pub transcriber: Arc<Transcriber>,
+    pub llm: Arc<dyn Llm>,
+    /// Used when the client sends no system prompt override of its own.
+    pub default_prompt: Arc<str>,
 }
 
 /// Joins the room and serves the conversation until it ends.
@@ -102,6 +109,20 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
     // loop below is the only thing that publishes, so ids and ordering stay in one place.
     let (heard, mut speech) = mpsc::channel::<Speech>(32);
 
+    // The conversation as the model will see it. Held here rather than in the LLM
+    // client because the client answers one question at a time and holds no session —
+    // making it stateless is what lets a second conversation share it.
+    let mut history: Vec<Turn> = Vec::new();
+
+    // Settled once, when the client tells us what this conversation is. Until then the
+    // default prompt stands, which matters only if the caller speaks before their SDK
+    // has sent its configuration.
+    let mut config = SessionConfig::settle(&services.default_prompt, Default::default());
+
+    // A configured greeting that arrived before there was anyone to say it to. See the
+    // `DataReceived` arm below — the client's configuration normally lands first.
+    let mut greeting_to_say: Option<String> = None;
+
     loop {
         let event = tokio::select! {
             event = events.recv() => match event {
@@ -109,7 +130,25 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                 None => break,
             },
             Some(said) = speech.recv() => {
+                // A tentative transcript is published and nothing more. Only a settled
+                // one drives a turn: partials change under you, and answering one means
+                // answering half a sentence — out loud, to someone still speaking it.
+                let settled = matches!(said, Speech::Final(_));
+                let text = said.text().to_owned();
+
                 publish_transcript(control.as_ref(), &assignment, said).await?;
+
+                if settled {
+                    take_turn(
+                        control.as_ref(),
+                        &services,
+                        &config,
+                        &mut history,
+                        &assignment,
+                        text,
+                    )
+                    .await?;
+                }
                 continue;
             }
         };
@@ -147,6 +186,11 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                         })
                         .await?;
                 }
+
+                // The channel exists now, so a greeting that was waiting on it can go.
+                if let Some(greeting) = greeting_to_say.take() {
+                    say(control.as_ref(), greeting).await?;
+                }
             }
 
             // Someone has subscribed to the agent's track, so audio published now will
@@ -178,6 +222,49 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                     services.transcriber.clone(),
                     heard.clone(),
                 ));
+            }
+
+            // The client's own control messages. The one that matters here is the
+            // conversation configuration: the system prompt override, the first
+            // message, and the dynamic variables that connect this agent to the coding
+            // session it is driving.
+            RoomEvent::DataReceived { payload, .. } => {
+                let Some(client_event) = decode_client_event(&payload, &assignment) else {
+                    continue;
+                };
+
+                let ClientEvent::ConversationInitiation(client_data) = client_event else {
+                    // Every other client message belongs to a later ticket. Logged at
+                    // debug so an unhandled one is findable rather than invisible.
+                    tracing::debug!(
+                        conversation = %assignment.conversation_id,
+                        "client message not handled yet"
+                    );
+                    continue;
+                };
+
+                config = SessionConfig::settle(&services.default_prompt, *client_data);
+                tracing::info!(
+                    conversation = %assignment.conversation_id,
+                    prompt_chars = config.system_prompt.len(),
+                    has_first_message = config.first_message.is_some(),
+                    "conversation configured by the client"
+                );
+
+                // Said before the caller says anything, which is the whole point of a
+                // first message — it opens the conversation rather than answering it.
+                //
+                // The client routinely sends its configuration *before* the agent has
+                // announced, so this greeting usually has nowhere to go yet. It waits
+                // rather than being dropped: a first message that never arrives leaves
+                // the caller listening to silence wondering whether anything is there.
+                if let Some(greeting) = config.first_message.clone() {
+                    history.push(Turn::Agent(greeting.clone()));
+                    match control.as_ref() {
+                        Some(_) => say(control.as_ref(), greeting).await?,
+                        None => greeting_to_say = Some(greeting),
+                    }
+                }
             }
 
             RoomEvent::ParticipantDisconnected(participant) => {
@@ -215,6 +302,90 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
     // bills from.
     let _ = room.close().await;
 
+    Ok(())
+}
+
+/// Reads one control message from the client.
+///
+/// Returns `None` for anything unreadable rather than ending the conversation. The data
+/// channel is shared, and a message this agent cannot parse is far more likely to be
+/// something it was never meant to read than a reason to hang up — but it is logged,
+/// because a client message being silently ignored is exactly how a configuration
+/// override goes missing.
+fn decode_client_event(payload: &[u8], assignment: &Assignment) -> Option<ClientEvent> {
+    match serde_json::from_slice(payload) {
+        Ok(event) => Some(event),
+        Err(error) => {
+            tracing::warn!(
+                conversation = %assignment.conversation_id,
+                %error,
+                raw = %String::from_utf8_lossy(payload).chars().take(200).collect::<String>(),
+                "could not read a client control message"
+            );
+            None
+        }
+    }
+}
+
+/// Answers the caller.
+///
+/// The whole turn: record what was said, ask the model, publish what comes back, and
+/// record that too so the next turn has it.
+///
+/// A turn that fails is said out loud in the logs and then dropped. The alternative —
+/// ending the conversation — would hang up on someone mid-sentence over one bad
+/// response, when the next thing they say may well work.
+async fn take_turn(
+    control: Option<&ControlChannel>,
+    services: &Services,
+    config: &SessionConfig,
+    history: &mut Vec<Turn>,
+    assignment: &Assignment,
+    said: String,
+) -> Result<(), AgentError> {
+    history.push(Turn::Caller(said));
+
+    let started = std::time::Instant::now();
+    let reply = match services.llm.respond(&config.system_prompt, history).await {
+        Ok(reply) => reply,
+        Err(error) => {
+            tracing::error!(
+                conversation = %assignment.conversation_id,
+                %error,
+                "could not answer the caller"
+            );
+            return Ok(());
+        }
+    };
+
+    tracing::info!(
+        conversation = %assignment.conversation_id,
+        took_ms = started.elapsed().as_millis(),
+        "answered"
+    );
+
+    history.push(Turn::Agent(reply.clone()));
+    say(control, reply).await
+}
+
+/// Publishes what the agent says.
+///
+/// Ticket .8 adds the other half — handing the same text to text-to-speech — which is
+/// why this exists as one place rather than inline at each call site.
+async fn say(control: Option<&ControlChannel>, text: String) -> Result<(), AgentError> {
+    let Some(channel) = control else {
+        tracing::warn!(text, "had something to say before the conversation was announced");
+        return Ok(());
+    };
+
+    channel
+        .publish(&ServerEvent::AgentResponse {
+            agent_response_event: AgentResponseEvent {
+                agent_response: text,
+                event_id: channel.next_event_id(),
+            },
+        })
+        .await?;
     Ok(())
 }
 
