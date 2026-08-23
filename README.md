@@ -73,6 +73,12 @@ Tailscale only. Both Happy clients dial that hostname directly — native passes
 `serverUrl`, web as `livekitUrl` — so it is this project's published API and should
 not change casually.
 
+That hostname has no TLS certificate yet, so it fails the handshake today: Caddy's
+Cloudflare API token is pinned to a WAN address the ISP has since changed, and the
+DNS-01 challenge cannot write its record. Tracked as `home-misc-74p` in the homelab
+repo. Until it clears, reach the SFU at `http://192.168.7.208:7880` over Tailscale —
+same server, no Caddy in front.
+
 Signaling goes through Caddy. Media does not, because WebRTC cannot cross an HTTP
 reverse proxy: the SFU advertises the runner VM's own address and clients dial it
 directly on 7881/tcp and 7882/udp, which the tailnet's `192.168.7.0/24` subnet route
@@ -85,7 +91,16 @@ and dispatched the agent; a client that skips that path fails to join rather tha
 landing in a room with nobody in it.
 
 The job spec, firewall entries, and Vault scaffolding are in `~/code/home-infra`
-(`jobs/livekit.nomad.hcl`).
+(`jobs/livekit.nomad.hcl`). To check that the deployment is up and still accepts
+these credentials:
+
+```
+LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... node scripts/livekit-smoke.mjs
+```
+
+It mints a `roomList` token and calls `ListRooms`, so a failure tells you whether
+the SFU rejected the signature or was never reachable — two things that look the
+same from inside the app.
 
 ## Backlog
 
