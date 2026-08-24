@@ -31,6 +31,14 @@ use std::pin::Pin;
 pub enum Turn {
     Caller(String),
     Agent(String),
+    /// Something the client handed the agent to know, which nobody said out loud.
+    ///
+    /// Distinct from [`Turn::Caller`] because the difference decides whether the agent
+    /// speaks: the app pushes session focus changes, new coding-agent messages and
+    /// status updates through this channel continuously, and answering them would turn a
+    /// background feed into a monologue. Folding both into one variant would put that
+    /// distinction back into whoever remembers to check it.
+    Context(String),
     /// The tools the model asked for, together with what they returned.
     ///
     /// One variant carrying both halves rather than two variants that happen to be
@@ -53,6 +61,17 @@ impl Turn {
         match self {
             Self::Caller(text) => vec![json!({"role": "user", "content": text})],
             Self::Agent(text) => vec![json!({"role": "assistant", "content": text})],
+            // The user role, tagged. The Messages API has two roles and neither of them
+            // is "things the app told me", so the only place that distinction can live on
+            // the wire is inside the text — and this is the one place it is written, so
+            // the tag cannot drift from what the model was taught to expect.
+            //
+            // The tag is not what keeps the agent quiet; not starting a turn is. What it
+            // buys is the model knowing whose words these were, so a burst of session
+            // updates is never read back as something the caller claimed.
+            Self::Context(text) => {
+                vec![json!({"role": "user", "content": format!("<session_update>\n{text}\n</session_update>")})]
+            }
             Self::Used { calls, results } => vec![
                 json!({"role": "assistant", "content": calls.iter().map(|call| json!({
                     "type": "tool_use",
@@ -495,6 +514,27 @@ mod tests {
 
         let agent = Turn::Agent("hello".into()).messages();
         assert_eq!(agent[0]["role"], "assistant");
+    }
+
+    /// The Messages API has no third role, so context has to reach the model as a user
+    /// message — but one the model can tell apart from something the caller actually
+    /// said. Without that, a burst of session updates reads back as the caller's own
+    /// claims about their code.
+    #[test]
+    fn context_reaches_the_model_marked_as_something_nobody_said() {
+        let context = Turn::Context("Claude Code finished the migration".into()).messages();
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0]["role"], "user");
+
+        let content = context[0]["content"].as_str().expect("context is plain text");
+        assert!(content.contains("Claude Code finished the migration"), "{content}");
+        assert_ne!(
+            content,
+            Turn::Caller("Claude Code finished the migration".into()).messages()[0]["content"]
+                .as_str()
+                .unwrap(),
+            "context and speech must not arrive identically"
+        );
     }
 
     /// The pairing the API insists on: an assistant message asking, and a user message

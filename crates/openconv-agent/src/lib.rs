@@ -149,10 +149,16 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
     // The agent's own turn, reporting back from the task it runs in.
     let (from_turn, mut turn_events) = mpsc::channel::<FromTurn>(4);
 
-    // Client tool calls waiting on the app. The seam between this loop, which is the
-    // only thing that reads the data channel, and the turn task, which is the only
-    // thing that waits for an answer.
-    let pending = Arc::new(Pending::default());
+    // Everything a turn is spoken through, settled once. `pending` is the seam between
+    // this loop, which is the only thing that reads the data channel, and the turn task,
+    // which is the only thing that waits for a tool to be answered.
+    let stage = Stage {
+        voice: voice.clone(),
+        services: services.clone(),
+        conversation: assignment.conversation_id.clone(),
+        pending: Arc::new(Pending::default()),
+        from_turn,
+    };
 
     // Whether the agent is currently answering, and how to stop it. `None` is an agent
     // with nothing to interrupt; holding the token rather than a bare flag is what makes
@@ -190,18 +196,14 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                         publish_score(control.as_deref(), score).await?;
                     }
 
-                    Noticed::Started => match answering.take() {
-                        // The caller is opening a turn, not cutting one off.
-                        None => {}
-                        Some(turn) => {
+                    Noticed::Started => {
+                        if stop_answering(&mut answering, control.as_deref()).await? {
                             tracing::info!(
                                 conversation = %assignment.conversation_id,
                                 "the caller spoke over the agent; stopping"
                             );
-                            turn.cancel();
-                            publish_interruption(control.as_deref()).await?;
                         }
-                    },
+                    }
 
                     // A tentative transcript is published and nothing more. Only a
                     // settled one drives a turn: partials change under you, and
@@ -216,14 +218,10 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                         if settled {
                             history.push(Turn::Caller(text));
                             answering = Some(start_turn(
-                                Says::Answer(history.clone()),
-                                &voice,
+                                &stage,
                                 control.clone(),
-                                &services,
                                 &config,
-                                &assignment,
-                                pending.clone(),
-                                from_turn.clone(),
+                                Says::Answer(history.clone()),
                             ));
                         }
                     }
@@ -273,16 +271,8 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
 
                 // The channel exists now, so a greeting that was waiting on it can go.
                 if let Some(greeting) = greeting_to_say.take() {
-                    answering = Some(start_turn(
-                        Says::Line(greeting),
-                        &voice,
-                        control.clone(),
-                        &services,
-                        &config,
-                        &assignment,
-                        pending.clone(),
-                                from_turn.clone(),
-                    ));
+                    answering =
+                        Some(start_turn(&stage, control.clone(), &config, Says::Line(greeting)));
                 }
             }
 
@@ -343,7 +333,74 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                             is_error,
                             "the app answered a tool call"
                         );
-                        pending.deliver(ToolResult { id: tool_call_id, content: result, is_error });
+                        stage.pending.deliver(ToolResult {
+                            id: tool_call_id,
+                            content: result,
+                            is_error,
+                        });
+                        continue;
+                    }
+
+                    // Context to absorb, and nothing more. The app pushes these
+                    // continuously — new coding-agent messages, session focus changes,
+                    // sessions coming and going — and the agent is meant to know them
+                    // without remarking on them.
+                    //
+                    // Silence here is structural rather than something the model is asked
+                    // for: no turn is started, so there is no reply to suppress. An agent
+                    // that answered instead would talk over its own caller every time
+                    // their session emitted anything.
+                    ClientEvent::ContextualUpdate { text } => {
+                        tracing::debug!(
+                            conversation = %assignment.conversation_id,
+                            chars = text.len(),
+                            "absorbed context from the app"
+                        );
+                        history.push(Turn::Context(text));
+                        continue;
+                    }
+
+                    // A typed turn, which the app sends when a prompt it had queued
+                    // flushes. Handled exactly as a settled transcript is, because it is
+                    // the same event arriving by a different road: the caller has taken
+                    // the turn and is owed an answer out loud.
+                    ClientEvent::UserMessage { text } => {
+                        match text.filter(|text| !text.trim().is_empty()) {
+                            // Nothing was said, so there is nothing to answer. Said out
+                            // loud because it is drift rather than routine: the SDK marks
+                            // the field optional but never omits it, so an empty one is a
+                            // client this agent has stopped understanding.
+                            None => tracing::warn!(
+                                conversation = %assignment.conversation_id,
+                                "the app sent a user_message carrying no text"
+                            ),
+                            Some(text) => {
+                                // Superseding whatever the agent was mid-sentence about,
+                                // for the same reason speaking over it does: two turns
+                                // talking at once is the one thing a caller cannot listen
+                                // through. The app queues prompts until the room is quiet,
+                                // so this is the race it loses rather than the normal path.
+                                if stop_answering(&mut answering, control.as_deref()).await? {
+                                    tracing::info!(
+                                        conversation = %assignment.conversation_id,
+                                        "a typed message arrived mid-answer; stopping"
+                                    );
+                                }
+
+                                tracing::info!(
+                                    conversation = %assignment.conversation_id,
+                                    chars = text.len(),
+                                    "the app sent a message to answer"
+                                );
+                                history.push(Turn::Caller(text));
+                                answering = Some(start_turn(
+                                    &stage,
+                                    control.clone(),
+                                    &config,
+                                    Says::Answer(history.clone()),
+                                ));
+                            }
+                        }
                         continue;
                     }
 
@@ -381,14 +438,10 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                     match control.is_some() {
                         true => {
                             answering = Some(start_turn(
-                                Says::Line(greeting),
-                                &voice,
+                                &stage,
                                 control.clone(),
-                                &services,
                                 &config,
-                                &assignment,
-                                pending.clone(),
-                                from_turn.clone(),
+                                Says::Line(greeting),
                             ));
                         }
                         false => greeting_to_say = Some(greeting),
@@ -500,6 +553,21 @@ enum FromTurn {
     Ended,
 }
 
+/// What every turn in one conversation is spoken through.
+///
+/// The mouth, the models, the room's name and the two channels a turn reports back on
+/// are all settled when the agent joins and never change after. Bundling them is what
+/// keeps the difference between the four ways a turn begins down to the two things that
+/// actually differ — what is being said, and the configuration in force when it is.
+struct Stage {
+    voice: Voice,
+    services: Arc<Services>,
+    conversation: String,
+    /// Client tool calls in flight, shared with the loop that reads their answers.
+    pending: Arc<Pending>,
+    from_turn: mpsc::Sender<FromTurn>,
+}
+
 /// Starts the agent's turn and hands back the token that stops it.
 ///
 /// Spawned rather than awaited, because a conversation loop sitting inside its own
@@ -509,25 +577,22 @@ enum FromTurn {
 /// A turn that fails is said out loud in the logs and then dropped. The alternative —
 /// ending the conversation — would hang up on someone mid-sentence over one bad
 /// response, when the next thing they say may well work.
-#[allow(clippy::too_many_arguments)]
 fn start_turn(
-    says: Says,
-    voice: &Voice,
+    stage: &Stage,
     control: Option<Arc<ControlChannel>>,
-    services: &Arc<Services>,
     config: &SessionConfig,
-    assignment: &Assignment,
-    pending: Arc<Pending>,
-    from_turn: mpsc::Sender<FromTurn>,
+    says: Says,
 ) -> CancellationToken {
     let interrupted = CancellationToken::new();
 
     tokio::spawn({
         let interrupted = interrupted.clone();
-        let voice = voice.clone();
-        let services = services.clone();
+        let voice = stage.voice.clone();
+        let services = stage.services.clone();
+        let pending = stage.pending.clone();
+        let from_turn = stage.from_turn.clone();
         let config = config.clone();
-        let conversation = assignment.conversation_id.clone();
+        let conversation = stage.conversation.clone();
 
         async move {
             let started = std::time::Instant::now();
@@ -825,6 +890,31 @@ async fn publish_score(
         })
         .await?;
     Ok(())
+}
+
+/// Stops whatever the agent is saying, because the caller has taken the turn.
+///
+/// Cancelling and telling the client are one act rather than two: the token stops the
+/// agent sending, and only the interruption event makes the client drop the audio it has
+/// already buffered. A caller who does one without the other keeps hearing a reply the
+/// agent abandoned seconds ago.
+///
+/// Reports whether there was anything to stop, so the two ways a turn gets taken — spoken
+/// over, or typed over — can say which one happened without each keeping its own idea of
+/// what stopping involves.
+async fn stop_answering(
+    answering: &mut Option<CancellationToken>,
+    control: Option<&ControlChannel>,
+) -> Result<bool, AgentError> {
+    match answering.take() {
+        // The caller is opening a turn, not cutting one off.
+        None => Ok(false),
+        Some(turn) => {
+            turn.cancel();
+            publish_interruption(control).await?;
+            Ok(true)
+        }
+    }
 }
 
 /// Tells the client its agent has been cut off.
