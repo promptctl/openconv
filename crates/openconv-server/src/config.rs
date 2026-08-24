@@ -33,6 +33,14 @@ pub struct Config {
     /// Credentials and model for the LLM that decides what the agent says.
     pub anthropic_api_key: String,
     pub llm_model: String,
+    /// Origin of elvenreader-server, which turns the agent's words into speech. Not a
+    /// credential — it is reached over the private network and takes no API key.
+    pub tts_url: String,
+    /// The voice used when the client asks for none, as an ElevenLabs voice ID.
+    ///
+    /// A default rather than a mapping: elvenreader-server resolves IDs it does not
+    /// serve, so this only decides which ID it is asked to resolve.
+    pub tts_voice: String,
 }
 
 impl Config {
@@ -84,6 +92,12 @@ impl Config {
             )),
             anthropic_api_key,
             llm_model: optional("OPENCONV_LLM_MODEL", "claude-opus-5"),
+            tts_url: optional("OPENCONV_TTS_URL", "http://127.0.0.1:11000")
+                .trim_end_matches('/')
+                .to_owned(),
+            // ElevenLabs' own default, and what Happy's settings screen starts from, so
+            // an untouched app and an untouched deployment agree on the voice.
+            tts_voice: optional("OPENCONV_TTS_VOICE", "21m00Tcm4TlvDq8ikWAM"),
         })
     }
 }

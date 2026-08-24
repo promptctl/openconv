@@ -59,6 +59,10 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             config.anthropic_api_key.clone(),
             config.llm_model.clone(),
         )),
+        tts: Arc::new(openconv_agent::tts::Tts::new(
+            config.tts_url.clone(),
+            config.tts_voice.clone(),
+        )),
         default_prompt: DEFAULT_PROMPT.into(),
     });
 
