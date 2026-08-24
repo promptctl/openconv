@@ -38,3 +38,18 @@ tokio-util = { version = "0.7.19", features = ["io"] }
 # unions it with the base dependency above.
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.16", features = ["metal"] }
+
+# The VAD's ONNX Runtime, reached only through voice_activity_detector — named here
+# solely to choose how it is linked.
+#
+# ort-sys and webrtc-sys each bundle their own protobuf and abseil. Apple's linker takes
+# the first definition of a duplicate symbol and moves on; rust-lld on Linux refuses,
+# and the build that succeeds on the development machine fails at the link step with
+# several hundred `duplicate symbol: google::protobuf::…` errors. `load-dynamic` takes
+# ONNX Runtime out of the static link entirely — it is dlopen'd from ORT_DYLIB_PATH at
+# startup instead — so only one copy of protobuf is ever linked in.
+#
+# Linux-only because the cost is a shared library that has to be shipped beside the
+# binary, which the container image does and a `cargo run` from a checkout does not.
+[target.'cfg(target_os = "linux")'.dependencies]
+ort = { version = "=2.0.0-rc.10", features = ["load-dynamic"] }
