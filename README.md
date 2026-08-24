@@ -165,9 +165,31 @@ OPENCONV_API_KEY=... node scripts/agent-acceptance.mjs http://127.0.0.1:8080 wss
 ```
 
 That one needs `npm install @livekit/rtc-node`. It joins a real room as the app would
-and asserts what the app depends on: the agent is a connected participant, its first
-control event is the announcement, a `vad_score` follows, and the published track
-carries audible samples rather than silence.
+and asserts what the app depends on in order to *connect*: the agent is a connected
+participant, its first control event is the announcement, a `vad_score` follows, and
+frames are flowing on the published track.
+
+```
+OPENCONV_API_KEY=... node scripts/live-call-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
+```
+
+That one holds a whole turn, which is the only place the assembled path is exercised:
+the caller speaks, the agent hears it, answers it, and the answer comes back as sound
+in the room. Every component is covered against its real dependency elsewhere; nothing
+but this covers them joined together.
+
+The check is causal rather than liveness. The caller asks aloud for a word drawn at
+random each run, and that word has to return — first in the transcript, then in the
+reply, and only then is the audio measured. An agent that greets everyone warmly and
+ignores them entirely passes a liveness check and fails this one. The word list is
+small and empirically chosen: `base.en` hears "penguin" as "pen win", which fails the
+script for a reason that has nothing to do with the agent, so candidates get checked
+through `transcribe_wav` before they go in.
+
+Both scripts, and any future one, are clients built on `scripts/lib/caller.mjs` —
+minting, joining, the control channel, metering the agent's audio, and speaking into
+the room live there once, so two scripts cannot drift into two different ideas of what
+a caller is.
 
 ```
 OPENCONV_API_KEY=... node scripts/stt-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
