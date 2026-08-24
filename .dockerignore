@@ -1,0 +1,12 @@
+# The build context is uploaded to the build host before a single instruction runs, so
+# what is excluded here is measured in minutes of transfer. `target` alone is tens of
+# gigabytes once libwebrtc has been unpacked into it, and none of it is usable by the
+# builder anyway — the image's target directory is a cache mount belonging to the build
+# host, and a macOS-built artifact could not link into a Linux binary regardless.
+/target
+/node_modules
+/.git
+
+# Real call data from a checkout run. It would land in the image as a layer and read
+# back as this deployment's usage history, which it is not.
+/conversations.jsonl

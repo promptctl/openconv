@@ -239,6 +239,39 @@ It mints a `roomList` token and calls `ListRooms`, so a failure tells you whethe
 the SFU rejected the signature or was never reachable — two things that look the
 same from inside the app.
 
+openconv itself is deployed beside it at `https://openconv.sanctuary.gdn`, from the
+`Dockerfile` here:
+
+```
+scripts/build-image.sh          # prints the tag it published
+```
+
+The build runs on a homelab node rather than on the development machine, which is
+arm64 and has no Docker. What it produces goes to the cluster registry, and the tag
+it prints is the value that belongs in `service-versions.auto.tfvars.json` over in
+`~/code/home-infra` — a merged PR there is what actually rolls the deployment
+(`jobs/openconv.nomad.hcl`).
+
+Two things about that image are worth knowing before changing its dependencies.
+
+The whisper model is baked into it rather than fetched at startup: the weights are
+the one thing between a started container and a container that can hear, and a cold
+start that downloads them is a cold start that fails whenever huggingface is having
+a bad day.
+
+And ONNX Runtime is loaded rather than linked on Linux. `ort-sys` and `webrtc-sys`
+each bundle their own protobuf and abseil; Apple's linker takes the first definition
+and moves on, while `rust-lld` refuses, so a workspace that builds here fails to link
+there with several hundred `duplicate symbol: google::protobuf::…` errors. The `ort`
+entry in `crates/openconv-agent/Cargo.toml` turns on `load-dynamic` for Linux alone,
+which takes it out of the static link entirely — at the price of a shared library the
+image has to carry, which is why that feature is not on for the checkout build.
+
+The agent cannot speak there yet. `OPENCONV_TTS_URL` resolves a Consul service named
+`elvenreader`, and elvenreader-server is not deployed in the cluster — so a call
+answers on the control channel and logs `a clause of the reply went unspoken` for
+every clause. Deploying it is `home-openconv-ax7.1` in `~/code/home-infra`.
+
 ## Backlog
 
 Tracked in `lit` in this repo — twelve tickets under the `openconv` epic, ranked in
