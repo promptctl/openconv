@@ -20,7 +20,10 @@ whisper-rs = "0.16"
 futures-util = "0.3"
 # Rust has no official Anthropic SDK, so the Claude client speaks the Messages API
 # over HTTP directly. rustls rather than the platform stack, matching livekit.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
+minimp3 = { version = "0.6", features = ["async_tokio"] }
+bytes = "1"
+tokio-util = { version = "0.7.19", features = ["io"] }
 
 # whisper-rs ships with no acceleration compiled in — its default feature set is empty,
 # so inference runs on the CPU alone and lands well behind realtime, which for a

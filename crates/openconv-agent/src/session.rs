@@ -20,6 +20,12 @@ pub struct SessionConfig {
     /// What the agent says before the caller says anything, if the client asked for one.
     pub first_message: Option<String>,
     pub language: Option<Language>,
+    /// The voice the client picked, as the ElevenLabs ID its settings screen stores.
+    ///
+    /// Carried through untranslated: elvenreader-server owns the table that resolves an
+    /// ID onto a voice it can serve, including the fallback for ones it has never heard
+    /// of. See [`crate::tts`] for why that table is not copied here.
+    pub voice_id: Option<String>,
 }
 
 impl SessionConfig {
@@ -44,6 +50,10 @@ impl SessionConfig {
             system_prompt: substitute(&prompt, &variables),
             first_message: agent.first_message.filter(|message| !message.trim().is_empty()),
             language: agent.language,
+            voice_id: overrides
+                .tts
+                .and_then(|tts| tts.voice_id)
+                .filter(|voice| !voice.trim().is_empty()),
         }
     }
 }
@@ -104,7 +114,8 @@ fn render(value: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use openconv_protocol::{
-        ConversationConfigOverride, ConversationConfigOverrideAgent, PromptOverride,
+        ConversationConfigOverride, ConversationConfigOverrideAgent, ConversationConfigOverrideTts,
+        PromptOverride,
     };
 
     fn client_data(agent: ConversationConfigOverrideAgent) -> ConversationInitiationClientData {
@@ -224,5 +235,42 @@ mod tests {
             }),
         );
         assert_eq!(blank.first_message, None, "whitespace is not a greeting");
+    }
+
+    fn tts_override(tts: ConversationConfigOverrideTts) -> ConversationInitiationClientData {
+        ConversationInitiationClientData {
+            conversation_config_override: Some(ConversationConfigOverride {
+                tts: Some(tts),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Carried through exactly as sent — resolving it is elvenreader-server's job, and
+    /// an ID rewritten here would be a second opinion about which voice this is.
+    #[test]
+    fn the_clients_voice_is_carried_through_untranslated() {
+        let config = SessionConfig::settle(
+            "p",
+            tts_override(ConversationConfigOverrideTts {
+                voice_id: Some("21m00Tcm4TlvDq8ikWAM".into()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(config.voice_id.as_deref(), Some("21m00Tcm4TlvDq8ikWAM"));
+    }
+
+    /// No voice and a blank voice mean the same thing — use whatever the service
+    /// defaults to — and collapsing them here saves every caller the check.
+    #[test]
+    fn an_absent_or_blank_voice_leaves_the_default_standing() {
+        assert_eq!(SessionConfig::settle("p", Default::default()).voice_id, None);
+
+        let blank = SessionConfig::settle(
+            "p",
+            tts_override(ConversationConfigOverrideTts { voice_id: Some("  ".into()), ..Default::default() }),
+        );
+        assert_eq!(blank.voice_id, None);
     }
 }

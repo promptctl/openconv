@@ -159,23 +159,26 @@ impl std::fmt::Display for VoiceError {
 
 impl std::error::Error for VoiceError {}
 
-/// A sine tone, as raw samples.
+/// Building a voice with no room behind it, so the speech path can be tested against
+/// what came out rather than against a running SFU.
 ///
-/// Scaffolding for the transport, and the thing ticket .8 deletes: it exists so a
-/// connected client has something audible to prove the track carries audio end to end,
-/// before any speech pipeline exists to put real words on it. Nothing else depends on
-/// it — speech arrives through [`Voice::enqueue`] exactly the same way.
-pub fn tone(hz: f32, millis: u64, amplitude: f32) -> Vec<i16> {
-    let samples = (SAMPLE_RATE as u64 * millis / 1000) as usize;
-    (0..samples)
-        .map(|sample| {
-            let phase = std::f32::consts::TAU * hz * sample as f32 / SAMPLE_RATE as f32;
-            // Ramp the last tenth down to zero; a tone that stops mid-cycle is a step
-            // discontinuity, which is heard as a click.
-            let fade = (1.0 - (sample as f32 / samples as f32).powi(10)).clamp(0.0, 1.0);
-            (phase.sin() * amplitude * fade * i16::MAX as f32) as i16
-        })
-        .collect()
+/// Test-only, and deliberately so: a queue nobody can read is the right shape for
+/// production, where the pump is the only reader and reading is not a thing to do to a
+/// track. It exists here because the guarantee worth testing — that clauses reach the
+/// caller in the order they were written — is invisible from outside otherwise.
+#[cfg(test)]
+impl Voice {
+    pub fn for_test() -> Self {
+        Self {
+            source: NativeAudioSource::new(AudioSourceOptions::default(), SAMPLE_RATE, CHANNELS, 0),
+            pending: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    /// Everything queued and not yet sent, in the order it will go out.
+    pub fn queued(&self) -> Vec<i16> {
+        self.pending.lock().expect("voice queue poisoned").iter().copied().collect()
+    }
 }
 
 #[cfg(test)]
@@ -231,15 +234,13 @@ mod tests {
         assert!(voice.next_frame().iter().all(|&sample| sample == 0));
     }
 
+    /// What the speech pipeline's tests read, so it is worth pinning that it reads the
+    /// queue in the order the pump will drain it.
     #[test]
-    fn a_tone_is_audible_and_ends_at_zero() {
-        let samples = tone(440.0, 200, 0.3);
-        assert_eq!(samples.len(), (SAMPLE_RATE / 5) as usize);
-        assert!(
-            samples.iter().any(|&sample| sample.abs() > i16::MAX / 10),
-            "tone is inaudible"
-        );
-        let tail = samples.last().copied().unwrap_or(0);
-        assert!(tail.abs() < i16::MAX / 100, "tone ends on a click: {tail}");
+    fn the_queue_can_be_read_back_in_send_order() {
+        let voice = voice_with(queue(&[]));
+        voice.enqueue(&[1, 2]);
+        voice.enqueue(&[3]);
+        assert_eq!(voice.queued(), vec![1, 2, 3]);
     }
 }

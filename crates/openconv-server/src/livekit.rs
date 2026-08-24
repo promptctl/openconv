@@ -248,6 +248,8 @@ mod tests {
             whisper_model: "ggml-base.en.bin".into(),
             anthropic_api_key: "sk-test".to_owned(),
             llm_model: "claude-opus-5".to_owned(),
+            tts_url: "http://127.0.0.1:11000".to_owned(),
+            tts_voice: "21m00Tcm4TlvDq8ikWAM".to_owned(),
         }
     }
 

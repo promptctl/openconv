@@ -23,15 +23,20 @@
 //! LiveKit API secret in one place rather than two.
 
 pub mod audio;
+pub mod clause;
 pub mod control;
 pub mod endpoint;
 pub mod listen;
 pub mod llm;
+pub mod resample;
 pub mod session;
+pub mod speak;
 pub mod transcribe;
+pub mod tts;
 
 use audio::Voice;
 use control::{ControlChannel, PublishFailed, Unannounced};
+use futures_util::stream;
 use listen::Speech;
 use livekit::track::RemoteTrack;
 use livekit::{Room, RoomEvent, RoomOptions};
@@ -39,10 +44,11 @@ use openconv_protocol::{
     AgentResponseEvent, AudioFormat, ClientEvent, ConversationInitiationMetadataEvent,
     ServerEvent, TentativeUserTranscriptionEvent, UserTranscriptionEvent, VadScoreEvent,
 };
+use speak::{Spoken, Synthesizer};
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use llm::{Llm, Turn};
+use llm::{Llm, Reply, Turn};
 use session::SessionConfig;
 use transcribe::Transcriber;
 
@@ -71,6 +77,9 @@ pub struct Assignment {
 pub struct Services {
     pub transcriber: Arc<Transcriber>,
     pub llm: Arc<dyn Llm>,
+    /// Turns the model's words into audio. Shared rather than per-conversation because
+    /// it is a client for a service, and one connection pool serves every call.
+    pub tts: Arc<dyn Synthesizer>,
     /// Used when the client sends no system prompt override of its own.
     pub default_prompt: Arc<str>,
 }
@@ -140,6 +149,7 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
 
                 if settled {
                     take_turn(
+                        &voice,
                         control.as_ref(),
                         &services,
                         &config,
@@ -189,7 +199,8 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
 
                 // The channel exists now, so a greeting that was waiting on it can go.
                 if let Some(greeting) = greeting_to_say.take() {
-                    say(control.as_ref(), greeting).await?;
+                    say(&voice, control.as_ref(), &services, &config, &assignment, fixed(greeting))
+                        .await?;
                 }
             }
 
@@ -202,9 +213,6 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                     conversation = %assignment.conversation_id,
                     "caller subscribed to the agent's audio"
                 );
-                // Scaffolding that ticket .8 removes: proves the track carries audio
-                // end to end before any speech pipeline exists to put words on it.
-                voice.enqueue(&audio::tone(440.0, 400, 0.2));
             }
 
             // The caller's microphone. Listening runs in its own task because
@@ -260,9 +268,19 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                 // the caller listening to silence wondering whether anything is there.
                 if let Some(greeting) = config.first_message.clone() {
                     history.push(Turn::Agent(greeting.clone()));
-                    match control.as_ref() {
-                        Some(_) => say(control.as_ref(), greeting).await?,
-                        None => greeting_to_say = Some(greeting),
+                    match control.is_some() {
+                        true => {
+                            say(
+                                &voice,
+                                control.as_ref(),
+                                &services,
+                                &config,
+                                &assignment,
+                                fixed(greeting),
+                            )
+                            .await?;
+                        }
+                        false => greeting_to_say = Some(greeting),
                     }
                 }
             }
@@ -329,13 +347,14 @@ fn decode_client_event(payload: &[u8], assignment: &Assignment) -> Option<Client
 
 /// Answers the caller.
 ///
-/// The whole turn: record what was said, ask the model, publish what comes back, and
-/// record that too so the next turn has it.
+/// The whole turn: record what was said, ask the model, speak what comes back as it is
+/// written, and record it so the next turn has it.
 ///
 /// A turn that fails is said out loud in the logs and then dropped. The alternative —
 /// ending the conversation — would hang up on someone mid-sentence over one bad
 /// response, when the next thing they say may well work.
 async fn take_turn(
+    voice: &Voice,
     control: Option<&ControlChannel>,
     services: &Services,
     config: &SessionConfig,
@@ -346,17 +365,10 @@ async fn take_turn(
     history.push(Turn::Caller(said));
 
     let started = std::time::Instant::now();
-    let reply = match services.llm.respond(&config.system_prompt, history).await {
-        Ok(reply) => reply,
-        Err(error) => {
-            tracing::error!(
-                conversation = %assignment.conversation_id,
-                %error,
-                "could not answer the caller"
-            );
-            return Ok(());
-        }
-    };
+    // Borrows `history` for as long as the reply is being read, which is why the
+    // agent's own turn is recorded after `say` returns rather than before.
+    let reply = services.llm.respond(&config.system_prompt, history);
+    let answered = say(voice, control, services, config, assignment, reply).await?;
 
     tracing::info!(
         conversation = %assignment.conversation_id,
@@ -364,15 +376,72 @@ async fn take_turn(
         "answered"
     );
 
-    history.push(Turn::Agent(reply.clone()));
-    say(control, reply).await
+    history.extend(answered.map(Turn::Agent));
+    Ok(())
 }
 
-/// Publishes what the agent says.
+/// Says a reply out loud and publishes the words, returning what was said.
 ///
-/// Ticket .8 adds the other half — handing the same text to text-to-speech — which is
-/// why this exists as one place rather than inline at each call site.
-async fn say(control: Option<&ControlChannel>, text: String) -> Result<(), AgentError> {
+/// The one path for everything the agent says. A configured greeting is a reply of a
+/// single fixed piece, so it goes through the same clause splitting, the same synthesis
+/// and the same ordering as a model's answer — rather than a second, quieter path
+/// beside them that nobody exercises until a first message is configured.
+///
+/// The transcript is published as soon as the words are known, before the audio has
+/// finished going out. Waiting would show the caller's app the agent's message several
+/// seconds after they heard it spoken.
+async fn say(
+    voice: &Voice,
+    control: Option<&ControlChannel>,
+    services: &Services,
+    config: &SessionConfig,
+    assignment: &Assignment,
+    reply: Reply<'_>,
+) -> Result<Option<String>, AgentError> {
+    let (spoken, speaking) = speak::speak(
+        voice,
+        services.tts.clone(),
+        config.voice_id.clone(),
+        reply,
+    )
+    .await;
+
+    let text = match spoken {
+        Spoken::Nothing(error) => {
+            tracing::error!(
+                conversation = %assignment.conversation_id,
+                %error,
+                "could not answer the caller"
+            );
+            None
+        }
+        Spoken::Said { text, cut_short } => {
+            // Words already going out, with the rest of the sentence missing. Worth an
+            // error even though the turn is not abandoned: the caller hears a reply
+            // that stops mid-thought and nothing else would explain why.
+            if let Some(error) = cut_short {
+                tracing::error!(
+                    conversation = %assignment.conversation_id,
+                    %error,
+                    "the reply was cut short partway through"
+                );
+            }
+            publish_response(control, &text).await?;
+            Some(text)
+        }
+    };
+
+    // Held until the audio has all been queued, so the next turn cannot start speaking
+    // over this one.
+    speaking.finish().await;
+    Ok(text)
+}
+
+/// Sends the agent's words to the client, which renders them beside the caller's own.
+async fn publish_response(
+    control: Option<&ControlChannel>,
+    text: &str,
+) -> Result<(), AgentError> {
     let Some(channel) = control else {
         tracing::warn!(text, "had something to say before the conversation was announced");
         return Ok(());
@@ -381,12 +450,20 @@ async fn say(control: Option<&ControlChannel>, text: String) -> Result<(), Agent
     channel
         .publish(&ServerEvent::AgentResponse {
             agent_response_event: AgentResponseEvent {
-                agent_response: text,
+                agent_response: text.to_owned(),
                 event_id: channel.next_event_id(),
             },
         })
         .await?;
     Ok(())
+}
+
+/// A fixed line, in the shape a reply arrives in.
+///
+/// What lets a configured greeting reuse the whole speech path rather than needing one
+/// of its own.
+fn fixed(text: String) -> Reply<'static> {
+    Box::pin(stream::once(async move { Ok(text) }))
 }
 
 /// Sends one transcript to the client.
