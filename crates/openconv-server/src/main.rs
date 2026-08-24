@@ -77,11 +77,27 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     axum::serve(listener, router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutting down");
-        })
+        .with_graceful_shutdown(shutdown_requested())
         .await?;
 
     Ok(())
+}
+
+/// Resolves when the process has been asked to stop, by either of the signals that mean
+/// it.
+///
+/// SIGINT is a developer's ctrl-c. SIGTERM is what every container runtime and service
+/// manager sends first, giving a grace period before SIGKILL — so a process that listens
+/// for only the first is killed outright on every redeploy, part-way through appending
+/// to the conversation log that decides what a call cost.
+async fn shutdown_requested() {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("the process cannot register a SIGTERM handler");
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+
+    tracing::info!("shutting down");
 }
