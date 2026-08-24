@@ -1,2 +1,5 @@
 /target
 /node_modules
+# The conversation record, written into the working directory by a server run from a
+# checkout. Real call data, and a different file on every machine.
+/conversations.jsonl

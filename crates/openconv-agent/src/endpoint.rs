@@ -7,9 +7,9 @@
 //! path — when has someone finished talking — be tested against fixed input with no
 //! microphone, no model, and no waiting.
 //!
-//! The speech/silence decision itself is deliberately the smallest replaceable piece.
-//! Ticket .6 brings a real voice-activity model; it substitutes [`SpeechDetector`] and
-//! leaves the segmentation, the pre-roll, and the partial cadence alone.
+//! Whether a frame *is* speech is not decided here. It arrives as an argument, from
+//! [`crate::vad`], which is what keeps segmentation testable against a plain sequence of
+//! verdicts rather than against audio a model has to be loaded to score.
 
 use std::collections::VecDeque;
 
@@ -60,7 +60,7 @@ const MAX_UTTERANCE: usize = frames(25_000);
 pub enum Heard {
     /// Nothing worth acting on.
     Nothing,
-    /// Speech just began. Ticket .6 turns this into barge-in.
+    /// Speech just began. What barge-in is made of: the agent stops talking here.
     SpeechStarted,
     /// The utterance so far, worth a provisional transcript. Not final: more is coming.
     Partial(Vec<f32>),
@@ -70,7 +70,6 @@ pub enum Heard {
 
 /// Splits a stream of frames into utterances.
 pub struct Endpointer {
-    detector: SpeechDetector,
     speaking: bool,
     /// Consecutive frames agreeing with the state we are *not* in — the evidence
     /// needed to switch.
@@ -89,7 +88,6 @@ impl Default for Endpointer {
 impl Endpointer {
     pub fn new() -> Self {
         Self {
-            detector: SpeechDetector::new(),
             speaking: false,
             run: 0,
             since_partial: 0,
@@ -98,10 +96,9 @@ impl Endpointer {
         }
     }
 
-    /// Feeds one frame. See [`Heard`] for what comes back.
-    pub fn push(&mut self, frame: &[f32]) -> Heard {
-        let is_speech = self.detector.observe(frame);
-
+    /// Feeds one frame and what [`crate::vad`] made of it. See [`Heard`] for what comes
+    /// back.
+    pub fn push(&mut self, frame: &[f32], is_speech: bool) -> Heard {
         match self.speaking {
             false => self.while_idle(frame, is_speech),
             true => self.while_speaking(frame, is_speech),
@@ -162,72 +159,6 @@ impl Endpointer {
     }
 }
 
-/// Decides whether a frame contains speech.
-///
-/// Energy against an adaptive noise floor rather than a fixed threshold, because the
-/// only thing known about a caller's microphone is that its level is not ours to
-/// predict — a fixed threshold either deafens a quiet headset or hears a noisy room
-/// talking constantly.
-///
-/// The whole of this type is what ticket .6 replaces.
-pub struct SpeechDetector {
-    noise_floor: f32,
-}
-
-/// Below this, treat it as digital silence regardless of the floor. Stops the adaptive
-/// floor from collapsing toward zero during a muted call and then hearing speech in the
-/// dither.
-const ABSOLUTE_FLOOR: f32 = 0.003;
-
-/// How far above the noise floor a frame must sit to count as speech.
-const SPEECH_MARGIN: f32 = 3.0;
-
-/// How fast the floor follows the room while nothing is being said.
-const FLOOR_ADAPT_QUIET: f32 = 0.02;
-
-/// How fast it follows while the frame reads as speech.
-///
-/// Not zero, and that is the whole point. Adapting only on quiet frames looks right and
-/// deadlocks: a room already louder than the opening threshold reads as speech, speech
-/// does not move the floor, so the floor never rises and the detector hears the room
-/// talking forever. Creeping upward even during speech breaks the deadlock, and it is
-/// slow enough — roughly a minute to cross a room — that no single spoken sentence can
-/// drag the floor up to meet itself and cut its own utterance short.
-const FLOOR_ADAPT_LOUD: f32 = 0.000_3;
-
-impl Default for SpeechDetector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SpeechDetector {
-    pub fn new() -> Self {
-        Self { noise_floor: ABSOLUTE_FLOOR }
-    }
-
-    /// Classifies a frame and folds it into the noise estimate.
-    pub fn observe(&mut self, frame: &[f32]) -> bool {
-        let energy = rms(frame);
-        let is_speech = energy > (self.noise_floor * SPEECH_MARGIN).max(ABSOLUTE_FLOOR);
-
-        // The floor always follows the room; only the speed depends on what was heard.
-        // Unconditional by design — see FLOOR_ADAPT_LOUD for the deadlock that a
-        // quiet-frames-only update produces.
-        let rate = if is_speech { FLOOR_ADAPT_LOUD } else { FLOOR_ADAPT_QUIET };
-        self.noise_floor += (energy - self.noise_floor) * rate;
-
-        is_speech
-    }
-}
-
-fn rms(frame: &[f32]) -> f32 {
-    if frame.is_empty() {
-        return 0.0;
-    }
-    (frame.iter().map(|sample| sample * sample).sum::<f32>() / frame.len() as f32).sqrt()
-}
-
 /// Converts LiveKit's interleaved 16-bit samples to the floats the model wants.
 ///
 /// The one place the two representations meet, so the scale factor is stated once.
@@ -239,25 +170,24 @@ pub fn to_f32(samples: &[i16]) -> Vec<f32> {
 mod tests {
     use super::*;
 
-    fn quiet() -> Vec<f32> {
-        vec![0.0; SAMPLES_PER_FRAME]
+    /// One frame of audio. What is *in* it stopped mattering when the speech verdict
+    /// became an argument — these tests drive the verdict directly.
+    fn frame() -> Vec<f32> {
+        vec![0.25; SAMPLES_PER_FRAME]
     }
 
-    /// A frame of loud-ish noise. Alternating sign so its RMS is its amplitude.
-    fn loud() -> Vec<f32> {
-        (0..SAMPLES_PER_FRAME)
-            .map(|i| if i % 2 == 0 { 0.4 } else { -0.4 })
-            .collect()
+    fn push_many(endpointer: &mut Endpointer, is_speech: bool, count: usize) -> Vec<Heard> {
+        let frame = frame();
+        (0..count).map(|_| endpointer.push(&frame, is_speech)).collect()
     }
 
-    fn push_many(endpointer: &mut Endpointer, frame: &[f32], count: usize) -> Vec<Heard> {
-        (0..count).map(|_| endpointer.push(frame)).collect()
-    }
+    const SPEECH: bool = true;
+    const SILENCE: bool = false;
 
     #[test]
     fn silence_alone_never_produces_an_utterance() {
         let mut endpointer = Endpointer::new();
-        let heard = push_many(&mut endpointer, &quiet(), 500);
+        let heard = push_many(&mut endpointer, SILENCE, 500);
         assert!(heard.iter().all(|h| *h == Heard::Nothing));
     }
 
@@ -265,7 +195,7 @@ mod tests {
     fn a_brief_noise_does_not_open_an_utterance() {
         let mut endpointer = Endpointer::new();
         // Shorter than the onset requirement — a click, not a word.
-        let heard = push_many(&mut endpointer, &loud(), SPEECH_ONSET - 1);
+        let heard = push_many(&mut endpointer, SPEECH, SPEECH_ONSET - 1);
         assert!(heard.iter().all(|h| *h == Heard::Nothing), "{heard:?}");
     }
 
@@ -273,14 +203,14 @@ mod tests {
     fn speech_then_silence_yields_one_utterance() {
         let mut endpointer = Endpointer::new();
 
-        let onset = push_many(&mut endpointer, &loud(), SPEECH_ONSET);
+        let onset = push_many(&mut endpointer, SPEECH, SPEECH_ONSET);
         assert_eq!(onset.last(), Some(&Heard::SpeechStarted));
 
         // Still talking: no utterance yet, however long.
-        let during = push_many(&mut endpointer, &loud(), 100);
+        let during = push_many(&mut endpointer, SPEECH, 100);
         assert!(during.iter().all(|h| !matches!(h, Heard::Utterance(_))));
 
-        let after = push_many(&mut endpointer, &quiet(), SILENCE_ENDPOINT + 1);
+        let after = push_many(&mut endpointer, SILENCE, SILENCE_ENDPOINT + 1);
         let finals: Vec<_> = after.iter().filter(|h| matches!(h, Heard::Utterance(_))).collect();
         assert_eq!(finals.len(), 1, "expected exactly one utterance");
     }
@@ -297,10 +227,10 @@ mod tests {
     #[test]
     fn an_utterance_includes_audio_from_before_onset_was_detected() {
         let mut endpointer = Endpointer::new();
-        push_many(&mut endpointer, &quiet(), PREROLL * 2);
-        push_many(&mut endpointer, &loud(), SPEECH_ONSET);
+        push_many(&mut endpointer, SILENCE, PREROLL * 2);
+        push_many(&mut endpointer, SPEECH, SPEECH_ONSET);
 
-        let utterance = first_utterance(push_many(&mut endpointer, &quiet(), SILENCE_ENDPOINT + 1))
+        let utterance = first_utterance(push_many(&mut endpointer, SILENCE, SILENCE_ENDPOINT + 1))
             .expect("an utterance");
 
         // Speech that triggered detection, plus the silence that ended it, plus the
@@ -316,9 +246,9 @@ mod tests {
     #[test]
     fn a_long_utterance_produces_partials_before_it_ends() {
         let mut endpointer = Endpointer::new();
-        push_many(&mut endpointer, &loud(), SPEECH_ONSET);
+        push_many(&mut endpointer, SPEECH, SPEECH_ONSET);
 
-        let during = push_many(&mut endpointer, &loud(), PARTIAL_CADENCE * 2 + 2);
+        let during = push_many(&mut endpointer, SPEECH, PARTIAL_CADENCE * 2 + 2);
         let partials: Vec<_> = during
             .iter()
             .filter_map(|h| match h {
@@ -337,7 +267,7 @@ mod tests {
     #[test]
     fn an_endless_talker_is_cut_into_utterances() {
         let mut endpointer = Endpointer::new();
-        let heard = push_many(&mut endpointer, &loud(), MAX_UTTERANCE + SPEECH_ONSET + 10);
+        let heard = push_many(&mut endpointer, SPEECH, MAX_UTTERANCE + SPEECH_ONSET + 10);
 
         let finals = heard.iter().filter(|h| matches!(h, Heard::Utterance(_))).count();
         assert!(finals >= 1, "a talker who never pauses produced no utterance");
@@ -346,29 +276,30 @@ mod tests {
     #[test]
     fn flushing_recovers_a_sentence_cut_off_by_hanging_up() {
         let mut endpointer = Endpointer::new();
-        push_many(&mut endpointer, &loud(), SPEECH_ONSET + 20);
+        push_many(&mut endpointer, SPEECH, SPEECH_ONSET + 20);
 
         let remaining = endpointer.flush().expect("audio in progress");
         assert!(!remaining.is_empty());
         assert_eq!(endpointer.flush(), None, "flushing twice yields nothing the second time");
     }
 
+    /// A pause for breath is not the end of a turn. The hangover is the number that
+    /// decides it, so it is worth an assertion of its own rather than only being implied
+    /// by the utterance tests.
     #[test]
-    fn a_loud_room_does_not_read_as_constant_speech() {
-        let mut detector = SpeechDetector::new();
-        // Steady noise well above the absolute floor. The adaptive floor should climb
-        // to meet it and stop calling it speech.
-        let room: Vec<f32> = (0..SAMPLES_PER_FRAME)
-            .map(|i| if i % 2 == 0 { 0.02 } else { -0.02 })
-            .collect();
+    fn a_pause_shorter_than_the_hangover_does_not_end_an_utterance() {
+        let mut endpointer = Endpointer::new();
+        push_many(&mut endpointer, SPEECH, SPEECH_ONSET);
 
-        // Forty seconds of it. The floor should have climbed to meet the room.
-        for _ in 0..4_000 {
-            detector.observe(&room);
-        }
-        assert!(!detector.observe(&room), "steady room noise still reads as speech");
-        // ...but real speech over that room still does.
-        assert!(detector.observe(&loud()));
+        let pause = push_many(&mut endpointer, SILENCE, SILENCE_ENDPOINT - 1);
+        assert!(
+            pause.iter().all(|h| !matches!(h, Heard::Utterance(_))),
+            "a pause for breath ended the turn"
+        );
+
+        // ...and picking the sentence back up does not open a second utterance.
+        let resumed = push_many(&mut endpointer, SPEECH, SPEECH_ONSET);
+        assert!(!resumed.contains(&Heard::SpeechStarted), "carrying on read as a new turn");
     }
 
     #[test]

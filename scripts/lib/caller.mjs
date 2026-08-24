@@ -149,8 +149,9 @@ export class Caller {
      * same zero counts as a track that was never spoken into, and only this tells them
      * apart.
      */
-    this.heard = { frames: 0, audibleFrames: 0, peak: 0, error: null };
+    this.heard = { frames: 0, audibleFrames: 0, peak: 0, lastAudibleAt: 0, error: null };
     this.agentTrack = null;
+    this.mic = null;
 
     this.room.on(RoomEvent.DataReceived, (payload) => {
       const text = new TextDecoder().decode(payload);
@@ -177,7 +178,13 @@ export class Caller {
           let peak = 0;
           for (const sample of frame.data) peak = Math.max(peak, Math.abs(sample));
           this.heard.peak = Math.max(this.heard.peak, peak);
-          if (peak > AUDIBLE) this.heard.audibleFrames += 1;
+          if (peak > AUDIBLE) {
+            this.heard.audibleFrames += 1;
+            // When the agent was last actually making a sound. What "stopped talking"
+            // is measured against — the frames keep arriving after it stops, they just
+            // carry silence, so counting frames cannot tell the two apart.
+            this.heard.lastAudibleAt = Date.now();
+          }
         }
       })().catch((error) => {
         this.heard.error = error;
@@ -210,24 +217,20 @@ export class Caller {
   }
 
   /**
-   * Says a recording into the room on a microphone track, and returns once the last
-   * sample has actually played out.
+   * The caller's microphone, published and subscribed to, ready to speak into.
+   *
+   * Opened once and kept: a caller who talks twice has one mouth, and republishing a
+   * track per utterance is both unlike any real client and unable to express the one
+   * thing barge-in needs — starting to talk while the agent still is.
    *
    * Publishing a track and being subscribed to it are different moments, and speaking
-   * into the gap loses the opening words — which looks exactly like a transcription
-   * error and is not one. So the wait here is for the subscription itself, which the
-   * room reports, rather than for a duration long enough that it has probably happened.
-   *
-   * Silence is part of the utterance, not padding around it. The agent decides a turn
-   * ended by counting 600 ms of quiet frames, so a recording that stops when the words
-   * do leaves the endpointer waiting for frames that never come, and the caller is
-   * never answered. The lead-in is what the adaptive noise floor settles against.
+   * into the gap loses the opening words, which looks exactly like a transcription error
+   * and is not one. So the wait is for the subscription itself, which the room reports,
+   * rather than for a duration long enough that it has probably happened.
    */
-  async speak(recording, { leadInMs = 1000, tailOffMs = 1500 } = {}) {
-    const { sampleRate, samples } = recording;
-    const silence = (ms) => new Int16Array((sampleRate * ms) / 1000);
+  async microphone(sampleRate = 48_000) {
+    if (this.mic) return this.mic;
 
-    const utterance = concat([silence(leadInMs), samples, silence(tailOffMs)]);
     const source = new AudioSource(sampleRate, 1);
     const track = LocalAudioTrack.createAudioTrack("caller-mic", source);
 
@@ -244,20 +247,22 @@ export class Caller {
     );
     await Promise.race([subscribed, rejectAfter(20_000, "the agent to subscribe to the caller")]);
 
-    // `captureFrame` resolves when the queue has room, so awaiting it is what paces the
-    // track at real time — there is no sleep here guessing at the frame rate.
-    const perFrame = sampleRate / FRAMES_PER_SECOND;
-    for (let at = 0; at < utterance.length; at += perFrame) {
-      // Copied, not sliced. `AudioFrame.protoInfo` hands the FFI `this.data.buffer` and
-      // ignores the view's byteOffset, so a subarray sends the start of the whole
-      // recording every time — a track that carries the opening silence for its entire
-      // length, and an agent that reports hearing nothing at all.
-      const chunk = Int16Array.from(utterance.subarray(at, Math.min(at + perFrame, utterance.length)));
-      await source.captureFrame(new AudioFrame(chunk, sampleRate, 1, chunk.length));
-    }
-    await source.waitForPlayout();
+    this.mic = new Microphone(source, sampleRate);
+    return this.mic;
+  }
 
-    return utterance.length / sampleRate;
+  /**
+   * Says a recording into the room, and returns once the last sample has played out.
+   *
+   * Silence is part of the utterance, not padding around it. The agent decides a turn
+   * ended by counting 600 ms of quiet frames, so a recording that stops when the words
+   * do leaves the endpointer waiting for frames that never come, and the caller is never
+   * answered. The lead-in gives the agent a stretch of established silence to open an
+   * utterance against.
+   */
+  async speak(recording, options = {}) {
+    const mic = await this.microphone(recording.sampleRate);
+    return mic.say(recording, options);
   }
 
   async leave() {
@@ -283,6 +288,55 @@ export class Caller {
     }
     console.error(`  (gave up after ${ms / 1000}s waiting for ${what})`);
     return false;
+  }
+}
+
+/**
+ * A published microphone track. Everything said into the room goes through one.
+ *
+ * Separate from `Caller` because a caller has one and a script may hold it across
+ * several utterances — which is what talking over the agent requires.
+ */
+class Microphone {
+  constructor(source, sampleRate) {
+    this.source = source;
+    this.sampleRate = sampleRate;
+  }
+
+  /** Speaks one recording, and resolves when the last sample has played out. */
+  async say(recording, { leadInMs = 1000, tailOffMs = 1500 } = {}) {
+    if (recording.sampleRate !== this.sampleRate) {
+      throw new Error(
+        `recording is ${recording.sampleRate} Hz but the microphone is ${this.sampleRate} Hz`,
+      );
+    }
+    await this.emit(
+      concat([this.silence(leadInMs), recording.samples, this.silence(tailOffMs)]),
+    );
+    return recording.samples.length / this.sampleRate;
+  }
+
+  silence(ms) {
+    return new Int16Array((this.sampleRate * ms) / 1000);
+  }
+
+  /**
+   * Pushes samples onto the track in real time.
+   *
+   * `captureFrame` resolves when the queue has room, so awaiting it is what paces the
+   * track — there is no sleep here guessing at the frame rate.
+   */
+  async emit(samples) {
+    const perFrame = this.sampleRate / FRAMES_PER_SECOND;
+    for (let at = 0; at < samples.length; at += perFrame) {
+      // Copied, not sliced. `AudioFrame.protoInfo` hands the FFI `this.data.buffer` and
+      // ignores the view's byteOffset, so a subarray sends the start of the whole
+      // recording every time — a track that carries the opening silence for its entire
+      // length, and an agent that reports hearing nothing at all.
+      const chunk = Int16Array.from(samples.subarray(at, Math.min(at + perFrame, samples.length)));
+      await this.source.captureFrame(new AudioFrame(chunk, this.sampleRate, 1, chunk.length));
+    }
+    await this.source.waitForPlayout();
   }
 }
 

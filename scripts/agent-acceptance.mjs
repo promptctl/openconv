@@ -33,7 +33,7 @@ checks.record(
 );
 
 // ---- the control channel ----
-await caller.waitFor(() => caller.controlEvents.length >= 2, 15_000, "control events");
+await caller.waitFor(() => caller.controlEvents.length >= 1, 15_000, "control events");
 
 checks.record(
   "control events arrived",
@@ -65,6 +65,14 @@ checks.record(
 );
 
 // This is what fires the app's onVadScore callback.
+//
+// Scores are computed from the caller's own audio, so they follow the microphone rather
+// than the announcement — publishing one is what the real SDK does on startSession, and
+// a client with no microphone has nothing to score and no indicator to drive. What the
+// scores are *worth* is `vad-acceptance.mjs`; this only asserts they start.
+await caller.microphone();
+await caller.waitFor(() => caller.control("vad_score"), 15_000, "a vad_score");
+
 const vad = caller.control("vad_score");
 checks.record("a vad_score event arrived", Boolean(vad), JSON.stringify(vad?.vad_score_event ?? null));
 

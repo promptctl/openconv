@@ -23,16 +23,27 @@
 //! moment — the app would otherwise show the agent's words several seconds after the
 //! caller heard them — and awaits the [`Speaking`] before starting another turn, which
 //! is what keeps two replies from talking over each other.
+//!
+//! # Being talked over
+//!
+//! A caller who starts speaking has decided not to hear the rest of this reply, and the
+//! audio already queued has to go. The drain is what does it, rather than whoever
+//! noticed the interruption: the drain is the only writer to the track's queue, so it is
+//! the only thing that can throw the queue away without racing another write into it.
+//! Cancellation reaches it as a value — the token handed to [`speak`] — for the same
+//! reason.
 
 use crate::audio::Voice;
 use crate::clause::Clauses;
 use crate::llm::{LlmError, Reply};
 use crate::tts::TtsError;
 use futures_util::{Stream, StreamExt};
+use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// How many clauses may be synthesized at once.
 ///
@@ -77,17 +88,30 @@ pub async fn collect(mut speech: Speech) -> Result<Vec<i16>, TtsError> {
     Ok(samples)
 }
 
+/// Why a reply ended before the model had finished writing it.
+///
+/// Two different facts that a bare error would collapse into one: a reply that broke is
+/// a fault worth an alarm, and a reply the caller talked over is the product working.
+/// Reported at the same level, the first becomes invisible in a log full of the second.
+#[derive(Debug)]
+pub enum Stopped {
+    /// The reply stream broke, or the model had nothing to say.
+    Failed(LlmError),
+    /// The caller started talking, so the rest was never going to be heard.
+    Interrupted,
+}
+
 /// What the model managed to say.
 ///
-/// Two variants rather than a string that might be empty beside an error that might be
+/// Two variants rather than a string that might be empty beside a reason that might be
 /// absent: a turn either produced words — possibly fewer than a whole answer — or it
 /// produced a reason it did not.
 #[derive(Debug)]
 pub enum Spoken {
     /// Everything the model wrote, with the reason it stopped if it stopped early.
-    Said { text: String, cut_short: Option<LlmError> },
+    Said { text: String, cut_short: Option<Stopped> },
     /// The turn yielded nothing to say, and why.
-    Nothing(LlmError),
+    Nothing(Stopped),
 }
 
 /// Audio still on its way out.
@@ -101,6 +125,15 @@ pub struct Speaking {
     drain: JoinHandle<()>,
 }
 
+impl fmt::Display for Stopped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Failed(error) => write!(f, "{error}"),
+            Self::Interrupted => write!(f, "the caller started talking"),
+        }
+    }
+}
+
 impl Speaking {
     /// Waits until every clause of this reply has been queued onto the track.
     pub async fn finish(self) {
@@ -111,49 +144,56 @@ impl Speaking {
 }
 
 /// Speaks a reply as it is written.
+///
+/// Cancelling `interrupted` stops the audio and drops whatever of this reply had been
+/// queued and not yet heard.
 pub async fn speak(
     voice: &Voice,
     synthesizer: Arc<dyn Synthesizer>,
     voice_id: Option<String>,
+    interrupted: CancellationToken,
     mut reply: Reply<'_>,
 ) -> (Spoken, Speaking) {
     let (dispatch, mut pending) =
         mpsc::channel::<mpsc::Receiver<Result<Vec<i16>, TtsError>>>(IN_FLIGHT);
 
-    // The single owner of what the caller hears, in the order they hear it. Draining
-    // each clause to its end before taking the next is the whole ordering guarantee —
-    // and the clauses behind it keep decoding into their own queues meanwhile, so
-    // waiting here costs nothing but the order it enforces.
+    // The single owner of what the caller hears, in the order they hear it, and the
+    // single writer to the queue behind it — which is what lets it also be the thing
+    // that throws the queue away when the caller talks over the reply.
     let drain = tokio::spawn({
         let voice = voice.clone();
+        let interrupted = interrupted.clone();
         async move {
-            while let Some(mut clause) = pending.recv().await {
-                while let Some(chunk) = clause.recv().await {
-                    match chunk {
-                        Ok(samples) => voice.enqueue(&samples),
-                        // A clause that cannot be synthesized leaves a hole in a
-                        // sentence the caller is already hearing. Saying so and carrying
-                        // on beats dropping the rest of the reply, but it is never
-                        // silent about it — the published transcript will claim words
-                        // that were not spoken.
-                        Err(error) => {
-                            tracing::error!(%error, "a clause of the reply went unspoken");
-                        }
-                    }
-                }
+            tokio::select! {
+                _ = interrupted.cancelled() => voice.silence(),
+                _ = queue_in_order(&voice, &mut pending) => {}
             }
         }
     });
 
     let mut clauses = Clauses::new();
     let mut said = String::new();
-    let mut cut_short = None;
+    let mut cut_short: Option<Stopped> = None;
 
-    while let Some(piece) = reply.next().await {
+    loop {
+        // Reading stops the moment the caller cuts in. The words already written stay
+        // in `said` and are still reported: the caller heard some of them, and a
+        // transcript that omits what was spoken is worse than one that includes it.
+        let piece = tokio::select! {
+            _ = interrupted.cancelled() => {
+                cut_short = Some(Stopped::Interrupted);
+                break;
+            }
+            piece = reply.next() => match piece {
+                Some(piece) => piece,
+                None => break,
+            },
+        };
+
         let piece = match piece {
             Ok(piece) => piece,
             Err(error) => {
-                cut_short = Some(error);
+                cut_short = Some(Stopped::Failed(error));
                 break;
             }
         };
@@ -176,12 +216,38 @@ pub async fn speak(
 
     let spoken = match (said.is_empty(), cut_short) {
         // The stream's contract: a turn that says nothing ends with a reason.
-        (true, Some(error)) => Spoken::Nothing(error),
-        (true, None) => Spoken::Nothing(LlmError::Empty),
+        (true, Some(reason)) => Spoken::Nothing(reason),
+        (true, None) => Spoken::Nothing(Stopped::Failed(LlmError::Empty)),
         (false, cut_short) => Spoken::Said { text: said, cut_short },
     };
 
     (spoken, Speaking { drain })
+}
+
+/// Queues every clause onto the track, each one drained to its end before the next is
+/// taken.
+///
+/// The whole ordering guarantee, in one place. The clauses behind the one being drained
+/// keep decoding into their own queues meanwhile, so waiting here costs nothing but the
+/// order it enforces.
+async fn queue_in_order(
+    voice: &Voice,
+    pending: &mut mpsc::Receiver<mpsc::Receiver<Result<Vec<i16>, TtsError>>>,
+) {
+    while let Some(mut clause) = pending.recv().await {
+        while let Some(chunk) = clause.recv().await {
+            match chunk {
+                Ok(samples) => voice.enqueue(&samples),
+                // A clause that cannot be synthesized leaves a hole in a sentence the
+                // caller is already hearing. Saying so and carrying on beats dropping
+                // the rest of the reply, but it is never silent about it — the published
+                // transcript will claim words that were not spoken.
+                Err(error) => {
+                    tracing::error!(%error, "a clause of the reply went unspoken");
+                }
+            }
+        }
+    }
 }
 
 /// Starts synthesizing one clause and queues it behind the ones before it.
@@ -276,6 +342,68 @@ mod tests {
         Box::pin(stream::iter(items))
     }
 
+    /// Waits until the reply has actually reached the track.
+    ///
+    /// Polled rather than slept on: a sleep long enough to be safe is a bet on a machine
+    /// nobody has run this on yet, and this returns the instant the condition holds.
+    async fn wait_until_speaking(voice: &Voice) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while voice.queued().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reply never reached the track");
+    }
+
+    /// The single most noticeable failure in a voice product: the agent keeps talking
+    /// after the caller has started.
+    #[tokio::test]
+    async fn an_interrupted_reply_stops_being_heard() {
+        let synthesizer = Arc::new(Fake {
+            // The second clause is slow, so it is still in flight when the caller cuts in.
+            script: vec![("first sentence", 1, 1), ("second sentence", 300, 2)],
+            asked: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        let voice = test_voice();
+        let interrupted = CancellationToken::new();
+        let reply = reply_of(&[
+            "This is the first sentence of the reply. ",
+            "And this is the second sentence of it.",
+        ]);
+
+        let (_, speaking) =
+            speak(&voice, synthesizer, None, interrupted.clone(), reply).await;
+        wait_until_speaking(&voice).await;
+
+        interrupted.cancel();
+        speaking.finish().await;
+
+        assert!(
+            voice.queued().is_empty(),
+            "the caller was still being talked at after interrupting: {:?}",
+            voice.queued()
+        );
+    }
+
+    /// A turn cut off before the model wrote anything is not a turn that failed, and the
+    /// two must not arrive as the same value: barge-in happens constantly in a working
+    /// conversation, and reported as a fault it buries the real ones.
+    #[tokio::test]
+    async fn being_cut_off_before_the_first_word_is_not_a_failure() {
+        let synthesizer = Arc::new(Fake { script: vec![], asked: Arc::new(Mutex::new(Vec::new())) });
+        let interrupted = CancellationToken::new();
+        interrupted.cancel();
+
+        let reply = reply_of(&["This reply is never read."]);
+        let (spoken, speaking) =
+            speak(&test_voice(), synthesizer, None, interrupted, reply).await;
+        speaking.finish().await;
+
+        assert!(matches!(spoken, Spoken::Nothing(Stopped::Interrupted)), "{spoken:?}");
+    }
+
     /// The failure this module is built around: the second clause synthesizes far faster
     /// than the first, and must still be heard second.
     #[tokio::test]
@@ -292,7 +420,7 @@ mod tests {
             "And this is the second sentence of it.",
         ]);
 
-        let (spoken, speaking) = speak(&voice, synthesizer, None, reply).await;
+        let (spoken, speaking) = speak(&voice, synthesizer, None, CancellationToken::new(), reply).await;
         speaking.finish().await;
 
         assert!(matches!(spoken, Spoken::Said { cut_short: None, .. }));
@@ -319,7 +447,7 @@ mod tests {
         ]);
 
         let started = std::time::Instant::now();
-        let (_, speaking) = speak(&voice, synthesizer, None, reply).await;
+        let (_, speaking) = speak(&voice, synthesizer, None, CancellationToken::new(), reply).await;
         speaking.finish().await;
 
         assert!(
@@ -341,7 +469,7 @@ mod tests {
             "This is the first sentence of the reply. ",
             "And this is the second sentence of it.",
         ]);
-        let (spoken, speaking) = speak(&test_voice(), synthesizer, None, reply).await;
+        let (spoken, speaking) = speak(&test_voice(), synthesizer, None, CancellationToken::new(), reply).await;
         speaking.finish().await;
 
         match spoken {
@@ -359,10 +487,10 @@ mod tests {
         let synthesizer = Arc::new(Fake { script: vec![], asked: Arc::new(Mutex::new(Vec::new())) });
         let reply: Reply<'static> = Box::pin(stream::iter(vec![Err(LlmError::Declined)]));
 
-        let (spoken, speaking) = speak(&test_voice(), synthesizer, None, reply).await;
+        let (spoken, speaking) = speak(&test_voice(), synthesizer, None, CancellationToken::new(), reply).await;
         speaking.finish().await;
 
-        assert!(matches!(spoken, Spoken::Nothing(LlmError::Declined)), "{spoken:?}");
+        assert!(matches!(spoken, Spoken::Nothing(Stopped::Failed(LlmError::Declined))), "{spoken:?}");
     }
 
     /// A turn that broke halfway still says what it had, and still reports the break.
@@ -379,13 +507,13 @@ mod tests {
             LlmError::Transport("connection reset".to_owned()),
         );
 
-        let (spoken, speaking) = speak(&voice, synthesizer, None, reply).await;
+        let (spoken, speaking) = speak(&voice, synthesizer, None, CancellationToken::new(), reply).await;
         speaking.finish().await;
 
         match spoken {
             Spoken::Said { text, cut_short } => {
                 assert_eq!(text, "This is the first sentence of the reply.");
-                assert!(matches!(cut_short, Some(LlmError::Transport(_))), "{cut_short:?}");
+                assert!(matches!(cut_short, Some(Stopped::Failed(LlmError::Transport(_)))), "{cut_short:?}");
             }
             other => panic!("expected the partial reply, got {other:?}"),
         }
@@ -407,7 +535,7 @@ mod tests {
             "And this is the second sentence of it.",
         ]);
 
-        let (_, speaking) = speak(&voice, synthesizer, None, reply).await;
+        let (_, speaking) = speak(&voice, synthesizer, None, CancellationToken::new(), reply).await;
         speaking.finish().await;
 
         assert_eq!(voice.queued(), vec![2, 2, 2, 2], "the surviving clause was dropped too");
