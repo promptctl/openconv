@@ -31,6 +31,7 @@ pub mod llm;
 pub mod resample;
 pub mod session;
 pub mod speak;
+pub mod tools;
 pub mod transcribe;
 pub mod tts;
 pub mod vad;
@@ -42,19 +43,39 @@ use listen::{Noticed, Speech};
 use livekit::track::RemoteTrack;
 use livekit::{Room, RoomEvent, RoomOptions};
 use openconv_protocol::{
-    AgentResponseEvent, AudioFormat, ClientEvent, ConversationInitiationMetadataEvent,
-    InterruptionEvent, ServerEvent, TentativeUserTranscriptionEvent, UserTranscriptionEvent,
-    VadScoreEvent,
+    AgentResponseEvent, AudioFormat, ClientEvent, ClientToolCall,
+    ConversationInitiationMetadataEvent, InterruptionEvent, ServerEvent,
+    TentativeUserTranscriptionEvent, UserTranscriptionEvent, VadScoreEvent,
 };
-use speak::{Spoken, Stopped, Synthesizer};
+use speak::{Made, Spoken, Stopped, Synthesizer};
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use llm::{Llm, Reply, Turn};
+use llm::{Llm, Piece, Reply, Turn};
 use session::SessionConfig;
+use tools::{Pending, Run, Then, ToolCall, ToolResult};
 use transcribe::Transcriber;
 use vad::{Score, SpeechDetector, VadUnavailable};
+
+/// How long the agent waits for the app to answer a client tool call.
+///
+/// Generous on purpose. `sendMessageToSession` reaches a coding agent and Happy's own
+/// prompt warns that it "may take a long time to return", so a tight bound here would
+/// abandon calls that were going to succeed. Bounded all the same: a call that never
+/// comes back would otherwise hold the turn open for the rest of the conversation, and
+/// the caller would hear nothing while it did.
+const TOOL_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How many times one turn may call tools and be asked again.
+///
+/// A turn that calls a tool is asked once more so it can say what came back, and that
+/// answer may itself call another tool — a permission approved, then a message sent. The
+/// ceiling exists because nothing else bounds it: a model that keeps calling would keep
+/// being asked, and every pass costs a request to the model and another round trip
+/// through the app. Unbounded, that is a caller sitting in silence while their coding
+/// session receives the same message over and over.
+const MOST_PASSES: usize = 6;
 
 /// Everything an agent needs to serve one conversation.
 ///
@@ -128,6 +149,11 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
     // The agent's own turn, reporting back from the task it runs in.
     let (from_turn, mut turn_events) = mpsc::channel::<FromTurn>(4);
 
+    // Client tool calls waiting on the app. The seam between this loop, which is the
+    // only thing that reads the data channel, and the turn task, which is the only
+    // thing that waits for an answer.
+    let pending = Arc::new(Pending::default());
+
     // Whether the agent is currently answering, and how to stop it. `None` is an agent
     // with nothing to interrupt; holding the token rather than a bare flag is what makes
     // barge-in one call rather than a hunt for whatever happens to be speaking.
@@ -196,6 +222,7 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                                 &services,
                                 &config,
                                 &assignment,
+                                pending.clone(),
                                 from_turn.clone(),
                             ));
                         }
@@ -210,6 +237,11 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                     // finished, so an answer the caller cuts off is still remembered as
                     // far as it got.
                     FromTurn::Said(text) => history.push(Turn::Agent(text)),
+                    // Both halves at once, so the canonical history can never hold a
+                    // call the API will reject for having no answer.
+                    FromTurn::Used { calls, results } => {
+                        history.push(Turn::Used { calls, results });
+                    }
                     FromTurn::Ended => answering = None,
                 }
                 continue;
@@ -221,7 +253,7 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
             // firing *before* the participant can receive data messages. Announcing
             // there races the client's data channel and loses often enough to matter.
             RoomEvent::ParticipantActive(participant) => {
-                let Some(pending) = unannounced.take() else { continue };
+                let Some(announcement) = unannounced.take() else { continue };
 
                 tracing::info!(
                     conversation = %assignment.conversation_id,
@@ -230,7 +262,7 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                 );
 
                 control = Some(Arc::new(
-                    pending
+                    announcement
                         .announce(ConversationInitiationMetadataEvent {
                             conversation_id: assignment.conversation_id.clone(),
                             agent_output_audio_format: AudioFormat::Pcm48000,
@@ -248,7 +280,8 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                         &services,
                         &config,
                         &assignment,
-                        from_turn.clone(),
+                        pending.clone(),
+                                from_turn.clone(),
                     ));
                 }
             }
@@ -297,14 +330,32 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                     continue;
                 };
 
-                let ClientEvent::ConversationInitiation(client_data) = client_event else {
+                let client_data = match client_event {
+                    ClientEvent::ConversationInitiation(client_data) => client_data,
+
+                    // The app has finished running a tool the agent asked for. Handed
+                    // straight to whoever is waiting on it — this loop must not block on
+                    // a tool, which is exactly why the turn does the waiting.
+                    ClientEvent::ClientToolResult { tool_call_id, result, is_error } => {
+                        tracing::info!(
+                            conversation = %assignment.conversation_id,
+                            %tool_call_id,
+                            is_error,
+                            "the app answered a tool call"
+                        );
+                        pending.deliver(ToolResult { id: tool_call_id, content: result, is_error });
+                        continue;
+                    }
+
                     // Every other client message belongs to a later ticket. Logged at
                     // debug so an unhandled one is findable rather than invisible.
-                    tracing::debug!(
-                        conversation = %assignment.conversation_id,
-                        "client message not handled yet"
-                    );
-                    continue;
+                    _ => {
+                        tracing::debug!(
+                            conversation = %assignment.conversation_id,
+                            "client message not handled yet"
+                        );
+                        continue;
+                    }
                 };
 
                 config = SessionConfig::settle(&services.default_prompt, *client_data);
@@ -336,6 +387,7 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                                 &services,
                                 &config,
                                 &assignment,
+                                pending.clone(),
                                 from_turn.clone(),
                             ));
                         }
@@ -430,10 +482,20 @@ enum Says {
 }
 
 /// What the agent's turn reports back to the conversation.
+///
+/// The conversation loop owns history; the turn runs elsewhere and can only tell it
+/// what happened. Every variant here is one thing to append.
 #[derive(Debug)]
 enum FromTurn {
     /// What the model wrote, as soon as it had written it.
     Said(String),
+    /// Tools the model asked for and what they returned — never one without the other.
+    ///
+    /// Reported once the results are in hand rather than when the calls were made, so
+    /// history cannot come to hold a `tool_use` with nothing answering it. The API
+    /// rejects the whole conversation in that state, so a turn cut off mid-call would
+    /// otherwise break every turn after it.
+    Used { calls: Vec<ToolCall>, results: Vec<ToolResult> },
     /// The turn is over: every clause queued, or the caller cut it off.
     Ended,
 }
@@ -455,6 +517,7 @@ fn start_turn(
     services: &Arc<Services>,
     config: &SessionConfig,
     assignment: &Assignment,
+    pending: Arc<Pending>,
     from_turn: mpsc::Sender<FromTurn>,
 ) -> CancellationToken {
     let interrupted = CancellationToken::new();
@@ -469,43 +532,106 @@ fn start_turn(
         async move {
             let started = std::time::Instant::now();
 
-            let reply: Reply<'_> = match &says {
-                Says::Line(text) => fixed(text.clone()),
-                Says::Answer(history) => services.llm.respond(&config.system_prompt, history),
+            // The turn's own copy of the conversation, which it extends as it goes. The
+            // loop below owns the real one and is told about every addition — a turn
+            // that ran two tools has to ask the model again with their results in hand,
+            // and it cannot reach into history to put them there.
+            let (mut history, mut opening) = match says {
+                Says::Answer(history) => (history, None),
+                Says::Line(text) => (Vec::new(), Some(text)),
             };
 
-            let (spoken, speaking) = speak::speak(
-                &voice,
-                services.tts.clone(),
-                config.voice_id.clone(),
-                interrupted.clone(),
-                reply,
-            )
-            .await;
+            // One pass per thing the model has to say. Most turns take one; a turn that
+            // calls a tool takes another to say what came back, which is the whole
+            // point — "sent" is only worth saying once the message actually went.
+            for pass in 1..=MOST_PASSES {
+                let (spoken, speaking) = {
+                    let reply: Reply<'_> = match opening.take() {
+                        // A configured greeting has no conversation behind it and
+                        // nothing to call, so it never reaches the model at all.
+                        Some(text) => fixed(text),
+                        None => services.llm.respond(
+                            &config.system_prompt,
+                            &history,
+                            tools::declarations(),
+                        ),
+                    };
 
-            // Reported the moment the words are known, before the audio has finished
-            // going out. Waiting would show the caller's app the agent's message several
-            // seconds after they heard it spoken — and would lose it entirely when they
-            // interrupt.
-            if let Some(text) = words_of(spoken, &conversation) {
-                if let Err(error) = publish_response(control.as_deref(), &text).await {
-                    // A cancelled turn publishing into a room that is closing is what
-                    // hanging up mid-answer looks like from here, and it is not a fault.
-                    // The state is carried rather than guessed at, so the same message
-                    // at the same level does not mean two different things.
-                    tracing::warn!(
+                    speak::speak(
+                        &voice,
+                        services.tts.clone(),
+                        config.voice_id.clone(),
+                        interrupted.clone(),
+                        reply,
+                    )
+                    .await
+                };
+
+                let Some(made) = made_of(spoken, &conversation) else { break };
+
+                // Reported the moment the words are known, before the audio has finished
+                // going out. Waiting would show the caller's app the agent's message
+                // several seconds after they heard it spoken — and would lose it
+                // entirely when they interrupt.
+                if let Some(text) = made.text {
+                    if let Err(error) = publish_response(control.as_deref(), &text).await {
+                        // A cancelled turn publishing into a room that is closing is
+                        // what hanging up mid-answer looks like from here, and it is not
+                        // a fault. The state is carried rather than guessed at, so the
+                        // same message at the same level does not mean two different
+                        // things.
+                        tracing::warn!(
+                            conversation = %conversation,
+                            %error,
+                            interrupted = interrupted.is_cancelled(),
+                            "could not publish the agent's reply"
+                        );
+                    }
+                    history.push(Turn::Agent(text.clone()));
+                    let _ = from_turn.send(FromTurn::Said(text)).await;
+                }
+
+                // Held until this pass's audio has all been queued — or until the caller
+                // talks over it — so the next pass cannot start speaking on top of it.
+                speaking.finish().await;
+
+                if made.calls.is_empty() {
+                    break;
+                }
+
+                // Deliberately not cancelled with the rest of the turn. By the time a
+                // call is out, the app has been asked to do the thing — a message has
+                // gone to a coding session, a permission has been answered — and
+                // stopping the wait cannot un-do it. Dropping the answer would leave the
+                // model believing the tool never ran, so it would call it again: the
+                // caller's session gets the same message twice for having interrupted.
+                let (results, then) =
+                    run_tools(&pending, control.as_deref(), &made.calls, &conversation).await;
+
+                history.push(Turn::Used { calls: made.calls.clone(), results: results.clone() });
+                let _ = from_turn
+                    .send(FromTurn::Used { calls: made.calls, results })
+                    .await;
+
+                // `Stop` is `skip_turn`: the model has decided this turn was not the
+                // agent's to take, so there is nothing further to say. Interruption ends
+                // the turn here too — the results are recorded, and the caller who talked
+                // over the agent is not owed a reply to a question they moved on from.
+                if then == Then::Stop || interrupted.is_cancelled() {
+                    break;
+                }
+
+                // Loud, because it is not a thing that should happen: the model is
+                // calling tools without ever settling on something to say, and the
+                // caller has been listening to nothing while it did.
+                if pass == MOST_PASSES {
+                    tracing::error!(
                         conversation = %conversation,
-                        %error,
-                        interrupted = interrupted.is_cancelled(),
-                        "could not publish the agent's reply"
+                        passes = MOST_PASSES,
+                        "the model kept calling tools; giving up on this turn"
                     );
                 }
-                let _ = from_turn.send(FromTurn::Said(text)).await;
             }
-
-            // Held until the audio has all been queued — or until the caller talks over
-            // it — so the next turn cannot start speaking on top of this one.
-            speaking.finish().await;
 
             tracing::info!(
                 conversation = %conversation,
@@ -521,12 +647,139 @@ fn start_turn(
     interrupted
 }
 
-/// What the agent actually said, with anything that went wrong said out loud.
+/// Runs every tool the model asked for, and says whether the turn goes on.
+///
+/// The calls go out together rather than one after another: the model may ask for
+/// several at once, and `sendMessageToSession` is slow enough that running two in
+/// sequence would be heard as a pause twice as long as it needs to be. Results come
+/// back in the order they were asked for, which is the order the API pairs them in.
+async fn run_tools(
+    pending: &Pending,
+    control: Option<&ControlChannel>,
+    calls: &[ToolCall],
+    conversation: &str,
+) -> (Vec<ToolResult>, Then) {
+    let running = calls
+        .iter()
+        .map(|call| run_one(pending, control, call, conversation));
+    let ran: Vec<(ToolResult, Then)> = futures_util::future::join_all(running).await;
+
+    // One tool that ends the turn ends it. There is no sensible way to both fall silent
+    // and go on talking, and `skip_turn` alongside anything else is the model hedging.
+    let then = match ran.iter().any(|(_, then)| *then == Then::Stop) {
+        true => Then::Stop,
+        false => Then::Answer,
+    };
+
+    (ran.into_iter().map(|(result, _)| result).collect(), then)
+}
+
+/// Runs one tool wherever it runs.
+async fn run_one(
+    pending: &Pending,
+    control: Option<&ControlChannel>,
+    call: &ToolCall,
+    conversation: &str,
+) -> (ToolResult, Then) {
+    // A name this agent does not have is the model inventing a tool, or a prompt naming
+    // one that was never declared. Told rather than dropped: a call that vanishes leaves
+    // the model waiting on an answer that is never coming.
+    let Some(tool) = tools::named(&call.name) else {
+        tracing::warn!(conversation, tool = %call.name, "the model asked for a tool that does not exist");
+        return (
+            ToolResult {
+                id: call.id.clone(),
+                content: format!("There is no tool called {}.", call.name),
+                is_error: true,
+            },
+            Then::Answer,
+        );
+    };
+
+    let content = match tool.run {
+        Run::Here(answer) => {
+            tracing::info!(conversation, tool = %tool.name, "answered without the client");
+            Ok(answer.to_owned())
+        }
+        Run::OnTheClient => ask_the_client(pending, control, call, conversation).await,
+    };
+
+    let result = match content {
+        Ok(content) => ToolResult { id: call.id.clone(), content, is_error: false },
+        Err(why) => ToolResult { id: call.id.clone(), content: why, is_error: true },
+    };
+
+    (result, tool.then)
+}
+
+/// Publishes one tool call and waits for the app to answer it.
+///
+/// Interest is registered before the call goes out, because the app can answer faster
+/// than this task is next scheduled and an answer nobody is waiting for is one that is
+/// lost.
+async fn ask_the_client(
+    pending: &Pending,
+    control: Option<&ControlChannel>,
+    call: &ToolCall,
+    conversation: &str,
+) -> Result<String, String> {
+    let Some(channel) = control else {
+        // Nothing has been announced, so there is nobody to run it. Only reachable if
+        // the model calls a tool before the caller has joined, which the greeting path
+        // makes possible.
+        return Err("The app is not connected, so this could not be run.".to_owned());
+    };
+
+    let awaited = pending.expect(&call.id);
+
+    let published = channel
+        .publish(&ServerEvent::ClientToolCall {
+            client_tool_call: ClientToolCall {
+                tool_name: call.name.clone(),
+                tool_call_id: call.id.clone(),
+                parameters: call.input.clone(),
+                event_id: channel.next_event_id(),
+            },
+        })
+        .await;
+
+    if let Err(error) = published {
+        pending.give_up(&call.id);
+        tracing::error!(conversation, tool = %call.name, %error, "could not send a tool call to the app");
+        return Err(format!("This could not be sent to the app: {error}"));
+    }
+
+    tracing::info!(conversation, tool = %call.name, tool_call_id = %call.id, "asked the app to run a tool");
+
+    match tokio::time::timeout(TOOL_ANSWER_TIMEOUT, awaited).await {
+        Ok(Ok(result)) => match result.is_error {
+            true => Err(result.content),
+            false => Ok(result.content),
+        },
+        // The conversation ended underneath the wait.
+        Ok(Err(_)) => {
+            tracing::warn!(conversation, tool = %call.name, "the conversation ended before the app answered");
+            Err("The conversation ended before this finished.".to_owned())
+        }
+        Err(_) => {
+            pending.give_up(&call.id);
+            tracing::error!(
+                conversation,
+                tool = %call.name,
+                seconds = TOOL_ANSWER_TIMEOUT.as_secs(),
+                "the app never answered a tool call"
+            );
+            Err("The app did not answer in time, so this may not have run.".to_owned())
+        }
+    }
+}
+
+/// What one pass of the model produced, with anything that went wrong said out loud.
 ///
 /// A reply that broke and a reply the caller talked over both end early, and only one of
 /// them is a fault. Logging them alike is how the fault gets lost: barge-in is routine
 /// in a working conversation, so an error level shared with it stops meaning anything.
-fn words_of(spoken: Spoken, conversation: &str) -> Option<String> {
+fn made_of(spoken: Spoken, conversation: &str) -> Option<Made> {
     match spoken {
         Spoken::Nothing(Stopped::Interrupted) => {
             tracing::info!(conversation, "the caller cut in before the agent had an answer");
@@ -536,8 +789,8 @@ fn words_of(spoken: Spoken, conversation: &str) -> Option<String> {
             tracing::error!(conversation, %error, "could not answer the caller");
             None
         }
-        Spoken::Said { text, cut_short } => {
-            match cut_short {
+        Spoken::Did(made) => {
+            match &made.cut_short {
                 None | Some(Stopped::Interrupted) => {}
                 // Words already going out, with the rest of the sentence missing. Worth
                 // an error even though the turn is not abandoned: the caller hears a
@@ -546,7 +799,7 @@ fn words_of(spoken: Spoken, conversation: &str) -> Option<String> {
                     tracing::error!(conversation, %error, "the reply was cut short partway through");
                 }
             }
-            Some(text)
+            Some(made)
         }
     }
 }
@@ -619,7 +872,7 @@ async fn publish_response(
 /// What lets a configured greeting reuse the whole speech path rather than needing one
 /// of its own.
 fn fixed(text: String) -> Reply<'static> {
-    Box::pin(stream::once(async move { Ok(text) }))
+    Box::pin(stream::once(async move { Ok(Piece::Say(text)) }))
 }
 
 /// Sends one transcript to the client.

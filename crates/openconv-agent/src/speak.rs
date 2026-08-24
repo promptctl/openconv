@@ -35,7 +35,8 @@
 
 use crate::audio::Voice;
 use crate::clause::Clauses;
-use crate::llm::{LlmError, Reply};
+use crate::llm::{LlmError, Piece, Reply};
+use crate::tools::ToolCall;
 use crate::tts::TtsError;
 use futures_util::{Stream, StreamExt};
 use std::fmt;
@@ -101,17 +102,37 @@ pub enum Stopped {
     Interrupted,
 }
 
-/// What the model managed to say.
+/// What the model produced.
 ///
-/// Two variants rather than a string that might be empty beside a reason that might be
-/// absent: a turn either produced words — possibly fewer than a whole answer — or it
-/// produced a reason it did not.
+/// Two variants rather than a bag of maybes: a turn either produced something — words,
+/// tool calls, or both — or it produced a reason it did not. Splitting those apart is
+/// what stops "nothing happened" and "nothing happened *because*" from being the same
+/// value, which is how a broken turn comes to look like a quiet one.
 #[derive(Debug)]
 pub enum Spoken {
-    /// Everything the model wrote, with the reason it stopped if it stopped early.
-    Said { text: String, cut_short: Option<Stopped> },
-    /// The turn yielded nothing to say, and why.
+    /// Words, calls, or both, with the reason it stopped if it stopped early.
+    Did(Made),
+    /// The turn yielded neither words nor calls, and why.
     Nothing(Stopped),
+}
+
+/// Everything one pass of the model produced.
+///
+/// At least one of `text` and `calls` is always present: a pass that produced neither
+/// is [`Spoken::Nothing`] instead. That is settled once, where [`speak`] returns, and
+/// nothing downstream re-checks it.
+#[derive(Debug)]
+pub struct Made {
+    /// The words said out loud, absent when the model only asked for tools.
+    ///
+    /// Optional rather than empty-string, because a turn that spoke nothing and a turn
+    /// that spoke an empty string mean different things to the caller's transcript —
+    /// one shows no bubble at all, the other shows a blank one.
+    pub text: Option<String>,
+    /// The tools the model asked for, in the order it asked for them.
+    pub calls: Vec<ToolCall>,
+    /// Why it ended before the model had finished, if it did.
+    pub cut_short: Option<Stopped>,
 }
 
 /// Audio still on its way out.
@@ -173,6 +194,7 @@ pub async fn speak(
 
     let mut clauses = Clauses::new();
     let mut said = String::new();
+    let mut calls: Vec<ToolCall> = Vec::new();
     let mut cut_short: Option<Stopped> = None;
 
     loop {
@@ -198,9 +220,17 @@ pub async fn speak(
             }
         };
 
-        said.push_str(&piece);
-        for clause in clauses.push(&piece) {
-            send(&dispatch, &synthesizer, voice_id.as_deref(), clause).await;
+        match piece {
+            Piece::Say(text) => {
+                said.push_str(&text);
+                for clause in clauses.push(&text) {
+                    send(&dispatch, &synthesizer, voice_id.as_deref(), clause).await;
+                }
+            }
+            // Gathered, never synthesized. A tool call is the model addressing the
+            // agent, not the caller, and reading one out loud is the failure this
+            // separation exists to make impossible.
+            Piece::Call(call) => calls.push(call),
         }
     }
 
@@ -214,11 +244,19 @@ pub async fn speak(
     // Closes the drain once it has taken everything already dispatched.
     drop(dispatch);
 
-    let spoken = match (said.is_empty(), cut_short) {
-        // The stream's contract: a turn that says nothing ends with a reason.
-        (true, Some(reason)) => Spoken::Nothing(reason),
-        (true, None) => Spoken::Nothing(Stopped::Failed(LlmError::Empty)),
-        (false, cut_short) => Spoken::Said { text: said, cut_short },
+    // The one place the "at least one of words or calls" invariant on [`Made`] is
+    // settled. A pass that only called a tool is not empty — `skip_turn` is exactly
+    // that, and it is the model working, not failing.
+    let produced = !said.is_empty() || !calls.is_empty();
+    let spoken = match (produced, cut_short) {
+        (true, cut_short) => Spoken::Did(Made {
+            text: (!said.is_empty()).then_some(said),
+            calls,
+            cut_short,
+        }),
+        // The stream's contract: a pass that produced nothing ends with a reason.
+        (false, Some(reason)) => Spoken::Nothing(reason),
+        (false, None) => Spoken::Nothing(Stopped::Failed(LlmError::Empty)),
     };
 
     (spoken, Speaking { drain })
@@ -331,14 +369,32 @@ mod tests {
 
     fn reply_of(pieces: &[&'static str]) -> Reply<'static> {
         Box::pin(stream::iter(
-            pieces.iter().map(|piece| Ok((*piece).to_owned())).collect::<Vec<_>>(),
+            pieces
+                .iter()
+                .map(|piece| Ok(Piece::Say((*piece).to_owned())))
+                .collect::<Vec<_>>(),
         ))
     }
 
     fn failing_reply(pieces: &[&'static str], error: LlmError) -> Reply<'static> {
-        let mut items: Vec<Result<String, LlmError>> =
-            pieces.iter().map(|p| Ok((*p).to_owned())).collect();
+        let mut items: Vec<Result<Piece, LlmError>> =
+            pieces.iter().map(|p| Ok(Piece::Say((*p).to_owned()))).collect();
         items.push(Err(error));
+        Box::pin(stream::iter(items))
+    }
+
+    /// A reply that says something and then asks for a tool, the way a turn that acts
+    /// on what the caller said actually arrives.
+    fn reply_calling(text: &str, name: &str) -> Reply<'static> {
+        let call = ToolCall {
+            id: format!("toolu_{name}"),
+            name: name.to_owned(),
+            input: serde_json::Map::new(),
+        };
+        let mut items = vec![Ok(Piece::Call(call))];
+        if !text.is_empty() {
+            items.insert(0, Ok(Piece::Say(text.to_owned())));
+        }
         Box::pin(stream::iter(items))
     }
 
@@ -423,12 +479,70 @@ mod tests {
         let (spoken, speaking) = speak(&voice, synthesizer, None, CancellationToken::new(), reply).await;
         speaking.finish().await;
 
-        assert!(matches!(spoken, Spoken::Said { cut_short: None, .. }));
+        assert!(matches!(spoken, Spoken::Did(Made { cut_short: None, .. })));
         assert_eq!(asked.lock().unwrap().len(), 2, "expected one request per sentence");
 
         // The slow clause first, despite finishing last.
         let queued = voice.queued();
         assert_eq!(queued, vec![1, 1, 1, 1, 2, 2, 2, 2], "clauses came out shuffled");
+    }
+
+    /// A tool call must never reach synthesis. Reading `sendMessageToSession` aloud is
+    /// the failure the piece type exists to make impossible, and the way to prove it is
+    /// to check that nothing was asked of the synthesizer at all.
+    #[tokio::test]
+    async fn a_tool_call_is_carried_out_of_the_turn_rather_than_synthesized() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let synthesizer = Arc::new(Fake { script: vec![], asked: asked.clone() });
+
+        let (spoken, speaking) = speak(
+            &test_voice(),
+            synthesizer,
+            None,
+            CancellationToken::new(),
+            reply_calling("", "skip_turn"),
+        )
+        .await;
+        speaking.finish().await;
+
+        match spoken {
+            Spoken::Did(Made { text, calls, .. }) => {
+                assert_eq!(text, None, "a turn that only called a tool said nothing");
+                assert_eq!(calls.len(), 1, "{calls:?}");
+                assert_eq!(calls[0].name, "skip_turn");
+            }
+            other => panic!("a turn that called a tool produced something, got {other:?}"),
+        }
+
+        assert!(asked.lock().unwrap().is_empty(), "a tool call was sent to synthesis");
+    }
+
+    /// The ordinary shape of an acted-on turn: a sentence for the caller to hear and a
+    /// call for the agent to run, from the same pass.
+    #[tokio::test]
+    async fn words_and_a_call_from_one_pass_both_come_back() {
+        let synthesizer = Arc::new(Fake {
+            script: vec![("Sending that now.", 1, 1)],
+            asked: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        let (spoken, speaking) = speak(
+            &test_voice(),
+            synthesizer,
+            None,
+            CancellationToken::new(),
+            reply_calling("Sending that now.", "sendMessageToSession"),
+        )
+        .await;
+        speaking.finish().await;
+
+        match spoken {
+            Spoken::Did(Made { text, calls, .. }) => {
+                assert_eq!(text.as_deref(), Some("Sending that now."));
+                assert_eq!(calls.len(), 1, "{calls:?}");
+            }
+            other => panic!("expected words and a call, got {other:?}"),
+        }
     }
 
     /// Overlapping is the point of the ordering machinery — sequential synthesis would
@@ -473,9 +587,9 @@ mod tests {
         speaking.finish().await;
 
         match spoken {
-            Spoken::Said { text, .. } => assert_eq!(
-                text,
-                "This is the first sentence of the reply. And this is the second sentence of it."
+            Spoken::Did(Made { text, .. }) => assert_eq!(
+                text.as_deref(),
+                Some("This is the first sentence of the reply. And this is the second sentence of it.")
             ),
             other => panic!("expected words, got {other:?}"),
         }
@@ -511,8 +625,8 @@ mod tests {
         speaking.finish().await;
 
         match spoken {
-            Spoken::Said { text, cut_short } => {
-                assert_eq!(text, "This is the first sentence of the reply.");
+            Spoken::Did(Made { text, cut_short, .. }) => {
+                assert_eq!(text.as_deref(), Some("This is the first sentence of the reply."));
                 assert!(matches!(cut_short, Some(Stopped::Failed(LlmError::Transport(_)))), "{cut_short:?}");
             }
             other => panic!("expected the partial reply, got {other:?}"),
