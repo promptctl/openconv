@@ -14,7 +14,7 @@
 
 use openconv_agent::audio::SAMPLE_RATE;
 use openconv_agent::clause::Clauses;
-use openconv_agent::llm::{Claude, Llm, Turn};
+use openconv_agent::llm::{Claude, Llm, Piece, Turn};
 use openconv_agent::speak::collect;
 use openconv_agent::tts::Tts;
 use futures_util::StreamExt;
@@ -42,7 +42,9 @@ async fn main() {
 
     let turns = [Turn::Caller(line.clone())];
     let started = Instant::now();
-    let mut reply = llm.respond(PROMPT, &turns);
+    // No tools: this example measures how fast the first clause is spoken, and a model
+    // that answered by calling something would have nothing to say.
+    let mut reply = llm.respond(PROMPT, &turns, &[]);
 
     let mut clauses = Clauses::new();
     let mut synthesis = Vec::new();
@@ -50,10 +52,10 @@ async fn main() {
     let mut first_clause_at = None;
 
     while let Some(piece) = reply.next().await {
-        let piece = piece.expect("the model answered");
-        text.push_str(&piece);
+        let Piece::Say(said) = piece.expect("the model answered") else { continue };
+        text.push_str(&said);
 
-        for clause in clauses.push(&piece) {
+        for clause in clauses.push(&said) {
             first_clause_at.get_or_insert_with(|| started.elapsed());
             println!("[{:>6.2}s] clause: {clause}", started.elapsed().as_secs_f32());
             synthesis.push(spawn(&tts, voice.clone(), clause));
