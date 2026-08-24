@@ -22,6 +22,12 @@ futures-util = "0.3"
 # over HTTP directly. rustls rather than the platform stack, matching livekit.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
 minimp3 = { version = "0.6", features = ["async_tokio"] }
+# Silero VAD, weights and all, over an ONNX runtime the crate downloads at build time.
+# The pure-Rust alternatives were tried first and one of them — silero-vad-pure, which
+# advertises bit-faithfulness against this same model — scored 0.001 on every window of
+# real speech that this scores 0.99 on. Verify any replacement against a recording
+# before swapping it in; the seam for doing so is crates/openconv-agent/src/vad.rs.
+voice_activity_detector = "0.2"
 bytes = "1"
 tokio-util = { version = "0.7.19", features = ["io"] }
 
