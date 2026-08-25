@@ -267,6 +267,20 @@ entry in `crates/openconv-agent/Cargo.toml` turns on `load-dynamic` for Linux al
 which takes it out of the static link entirely — at the price of a shared library the
 image has to carry, which is why that feature is not on for the checkout build.
 
+The SFU is configured to post `room_finished` back to the deployment, which is the only
+way a conversation ever gets a duration. `conversations-acceptance.mjs` signs its own
+deliveries and so passes whether or not anything is sending them; this one closes a real
+room through the room service and waits for the number to come back:
+
+```
+OPENCONV_API_KEY=... LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
+  node scripts/webhook-delivery-acceptance.mjs https://openconv.sanctuary.gdn
+```
+
+It holds the room open for three seconds first, because a room created and closed inside
+one second reports a duration of zero — which would satisfy a "has a duration" check
+while proving nothing about it.
+
 The agent cannot speak there yet. `OPENCONV_TTS_URL` resolves a Consul service named
 `elvenreader`, and elvenreader-server is not deployed in the cluster — so a call
 answers on the control channel and logs `a clause of the reply went unspoken` for
