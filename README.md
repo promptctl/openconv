@@ -26,9 +26,16 @@ SDK picks its transport with `connectionType ?? (conversationToken ? "webrtc" :
 "websocket")`, and both of Happy's paths supply a token. Its proprietary WebSocket
 signaling protocol never comes into play, so there is nothing to reverse-engineer.
 
-**Text-to-speech comes from elvenreader-server** (`~/code/elvenread/server`), which
-already serves the ElevenLabs `/v1/text-to-speech` surface. The agent fetches speech
-from it over HTTP, so no TTS engine is needed here and voices match the reader.
+**Text-to-speech is an HTTP client against `OPENCONV_TTS_URL`, not a fixed engine.**
+It started against elvenreader-server (`~/code/elvenread/server`), which serves the
+ElevenLabs `/v1/text-to-speech` surface. That single upstream account was disabled by
+ElevenLabs for "unusual activity" and took every deployed call's audio down with it —
+see `openconv-openconv-bwy.17` — so the settled design is local, dependency-free TTS:
+point the same URL at a small service under this project's own control instead. Piper
+(`~/code/piper-server`) is that service today: MIT-licensed, ONNX-based, CPU-only, and
+it answers the identical `/v1/text-to-speech/{voice_id}/stream` shape, so this crate
+needed no code change to switch. `crates/openconv-agent/src/tts.rs` has no opinion on
+which server is behind the URL, by design.
 
 **Rust**, matching elvenreader-server: axum for the REST endpoints, `livekit-api`
 to mint tokens, `livekit` for the agent's room participation. The cost is that
@@ -282,9 +289,13 @@ one second reports a duration of zero — which would satisfy a "has a duration"
 while proving nothing about it.
 
 The agent cannot speak there yet. `OPENCONV_TTS_URL` resolves a Consul service named
-`elvenreader`, and elvenreader-server is not deployed in the cluster — so a call
+`elvenreader`, and nothing is deployed under that name in the cluster — so a call
 answers on the control channel and logs `a clause of the reply went unspoken` for
-every clause. Deploying it is `home-openconv-ax7.1` in `~/code/home-infra`.
+every clause. That target is stale regardless: `elvenreader` proxied a single
+ElevenLabs account that ElevenLabs has since disabled, so deploying it would only
+trade a silent agent for a 502ing one (`openconv-openconv-bwy.17`). Piper (see above)
+is proven end to end against this crate's own TTS client, locally — see `piper-server`
+— but deploying *it* into the cluster and repointing `OPENCONV_TTS_URL` is still open.
 
 ## Backlog
 
