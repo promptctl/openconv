@@ -4,12 +4,45 @@ import { Call } from "./caller.js";
 import { cell, log, render, show } from "./transcript.js";
 
 const els = {
-  apiKey: document.getElementById("api-key"),
-  agentId: document.getElementById("agent-id"),
-  participantName: document.getElementById("participant-name"),
   join: document.getElementById("join"),
   audio: document.getElementById("agent-audio"),
 };
+
+/** What each field is called when the page has to say it is empty. */
+const FIELDS = {
+  apiKey: { element: document.getElementById("api-key"), called: "the api key" },
+  agentId: { element: document.getElementById("agent-id"), called: "an agent" },
+  participantName: {
+    element: document.getElementById("participant-name"),
+    called: "a participant",
+  },
+};
+
+/**
+ * Reads the form, refusing anything blank.
+ *
+ * The boundary between what somebody typed and what gets minted, and a parser rather
+ * than a check: everything downstream runs on values known to be non-empty, so nothing
+ * asks again.
+ *
+ * Blank is refused rather than passed through, because the server takes each of these
+ * as a string it does not police. An empty participant mints a metered conversation
+ * attributed to nobody; an empty agent names an agent that does not exist. Dropping the
+ * parameter instead would be worse than either — an absent participant is the unmetered
+ * bring-your-own-key path, and choosing it by clearing a text box is a mode switch
+ * nobody asked for.
+ */
+function requireFields() {
+  const typed = Object.entries(FIELDS).map(([name, field]) => [name, field.element.value.trim()]);
+  const blank = typed.filter(([, value]) => value === "");
+
+  if (blank.length > 0) {
+    const missing = blank.map(([name]) => FIELDS[name].called);
+    throw new Error(`fill in ${missing.join(" and ")} before joining`);
+  }
+
+  return Object.fromEntries(typed);
+}
 
 /**
  * The call this page is in, and the only mutable state it has.
@@ -42,24 +75,19 @@ async function livekitUrl() {
 }
 
 async function join() {
+  const fields = requireFields();
   showButton("joining…", false);
+
   call = await Call.join({
+    ...fields,
     livekitUrl: await livekitUrl(),
-    apiKey: els.apiKey.value,
-    agentId: els.agentId.value,
-    participantName: els.participantName.value,
     onEvent: show,
     onTrack: (track) => track.attach(els.audio),
     onState: (state) => render(cell("room", state)),
   });
 
   render(cell("call", call.conversationId));
-
-  // Reported rather than assumed: a browser refusing to play audio is the one failure
-  // that looks exactly like an agent with nothing to say.
-  const audible = await call.allowPlayback();
-  render(cell("audio", audible ? "playing" : "BLOCKED — click the page"));
-
+  render(cell("audio", call.audible ? "playing" : "BLOCKED — click the page"));
   showButton("leave", true);
 }
 
@@ -78,7 +106,12 @@ els.join.addEventListener("click", async () => {
     // something is wrong, and a failure only devtools can see is a page that appears to
     // do nothing at all.
     render(log("error", String(error)));
-    call = null;
-    showButton("join", true);
+
+    // The button is derived from whether a call is still held, not assumed to be gone.
+    // A `leave` that failed is still in its call, and a page that says "join" over a
+    // room the caller is in tells them they hung up when they did not — while
+    // `Call.join` tears its own half-built call down, so a failure there really has
+    // left nothing behind.
+    showButton(call ? "leave" : "join", true);
   }
 });

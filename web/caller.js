@@ -13,14 +13,17 @@
 // rather than buried in a different design. The Node scripts remain the acceptance
 // authority; this page is for hearing what they can only assert.
 
-// Pinned, not floating. `@latest` would let a CDN change what this page is running
-// between two reloads, which turns "it worked yesterday" into an unanswerable question.
+// Vendored rather than fetched from a CDN at load time. An ES module import has no
+// Subresource Integrity mechanism, so a pinned URL constrains which release is asked
+// for and not which bytes come back — and this page holds an API key and an open
+// microphone. It also means a deployment with no route to the public internet serves a
+// page that works. See `vendor/PROVENANCE.md` for the version, source and digest.
 import {
   createLocalAudioTrack,
   Room,
   RoomEvent,
   Track,
-} from "https://cdn.jsdelivr.net/npm/livekit-client@2.22.1/+esm";
+} from "./vendor/livekit-client.js";
 
 /**
  * Mints a conversation token, which is also what dispatches the agent into the room.
@@ -67,7 +70,7 @@ function decodeClaims(token) {
 /** A conversation this browser has joined. Holding one means the join worked. */
 export class Call {
   /**
-   * Opens the microphone, mints, joins, and starts talking.
+   * Opens the microphone, mints, joins, starts talking, and starts listening.
    *
    * Either returns a joined call or throws, so the page never has a half-joined state
    * to ask about.
@@ -98,35 +101,49 @@ export class Call {
       await room.localParticipant.publishTrack(microphone, {
         source: Track.Source.Microphone,
       });
-      return new Call(room, microphone, conversationId);
+
+      // Letting the agent's audio out of the browser's autoplay jail belongs inside the
+      // join, on the click that caused it, which is the gesture browsers require.
+      // Outside it there is a window in which a call is joined but not yet audible, and
+      // a failure in that window leaves a live room nobody holds a handle to.
+      //
+      // A refusal is a value rather than a failure: a call whose transcript works and
+      // whose audio is muted is still a call, and the page says which it got.
+      const audible = await room.startAudio().then(() => room.canPlaybackAudio, () => false);
+
+      return new Call(room, microphone, conversationId, audible);
     } catch (error) {
       // The room and the microphone are both live by now on some paths and not others,
       // and a page left holding either one has an open capture light and a participant
-      // in a room it believes it left. Both are released unconditionally, and the
-      // failure still travels.
+      // in a room it believes it left. Both are released unconditionally.
       microphone.stop();
-      await room.disconnect();
-      throw error;
+
+      // A disconnect that fails while cleaning up must not become the story — "mint
+      // failed: HTTP 401" is the useful sentence, not something about a socket, and a
+      // room that never connected rejects here rather than being inert. So its outcome
+      // is a value, empty when it worked, appended to the cause that actually brought
+      // us here. Neither failure is dropped and neither hides the other.
+      const alsoFailed = await room.disconnect().then(
+        () => "",
+        (failure) => ` (the room also failed to disconnect: ${failure.message})`,
+      );
+      throw new Error(`${error.message}${alsoFailed}`, { cause: error });
     }
   }
 
-  constructor(room, microphone, conversationId) {
+  constructor(room, microphone, conversationId, audible) {
     this.room = room;
     this.microphone = microphone;
     /** What the server logs this call under, so a call on screen can be found in a log. */
     this.conversationId = conversationId;
-  }
-
-  /**
-   * Lets the agent's audio out of the browser's autoplay jail.
-   *
-   * Called from the click that joined, which is the gesture browsers require. Reported
-   * rather than assumed: `canPlaybackAudio` false is precisely the state where every
-   * track is arriving correctly and the room is silent.
-   */
-  async allowPlayback() {
-    await this.room.startAudio();
-    return this.room.canPlaybackAudio;
+    /**
+     * Whether the browser will actually play what arrives.
+     *
+     * Carried rather than assumed: false here is precisely the state where every track
+     * is arriving correctly and the room is silent, which is indistinguishable from an
+     * agent with nothing to say unless the page reports it.
+     */
+    this.audible = audible;
   }
 
   async leave() {

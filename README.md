@@ -310,11 +310,15 @@ open http://127.0.0.1:8080/call
 ```
 
 Type the API key, press join, and talk. The transcript builds on screen as the control
-channel carries it and the agent's reply plays out of the page. It is three static files
-under `web/` — no build step and no framework, so what is served is what is in the
-repository — compiled into the binary with `include_str!`, because a static directory
-left out of a container image is a 404 discovered by someone who was debugging something
-else.
+channel carries it and the agent's reply plays out of the page. It is four static files
+under `web/` plus a vendored copy of `livekit-client` — no build step and no framework,
+so what is served is what is in the repository — all of it compiled into the binary with
+`include_str!`, because a static directory left out of a container image is a 404
+discovered by someone who was debugging something else. The SDK is vendored for the same
+reason and one more: an ES module `import` has no Subresource Integrity mechanism, so a
+pinned CDN URL constrains which release is requested and not which bytes come back, and
+this page holds an API key and an open microphone. `web/vendor/PROVENANCE.md` records the
+version, source and digest, and how to re-verify them.
 
 Two decisions in it are worth knowing. The page is served by openconv rather than by any
 static file server, which makes the token mint same-origin and means no CORS layer has to

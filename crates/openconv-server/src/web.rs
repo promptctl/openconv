@@ -12,7 +12,7 @@
 //! and offered to a different deployment's SFU does not error: the client joins a room
 //! the agent is not in and the caller hears silence.
 
-use crate::api::AppState;
+use crate::state::AppState;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Redirect};
@@ -57,6 +57,15 @@ const ASSETS: &[Asset] = &[
         path: "/call/caller.js",
         content_type: "text/javascript; charset=utf-8",
         body: include_str!("../../../web/caller.js"),
+    },
+    // Vendored, not fetched from a CDN at load time: an ES module import carries no
+    // Subresource Integrity, and a page holding an API key and an open microphone is
+    // worth pinning to bytes rather than to a version string. `web/vendor/PROVENANCE.md`
+    // records where it came from and its digest.
+    Asset {
+        path: "/call/vendor/livekit-client.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: include_str!("../../../web/vendor/livekit-client.js"),
     },
 ];
 
