@@ -295,14 +295,34 @@ impl Claude {
     }
 }
 
-/// Roughly three bytes of request JSON per token.
+/// Two bytes of request JSON per token — under what any language actually costs, so the
+/// estimate reads high and the trim happens early.
 ///
-/// English runs nearer three and a half to four, so this reads high and the trim
-/// therefore happens early — the direction to be wrong in, since being wrong the other
-/// way is a request the API rejects. It is an estimate and nothing here pretends
-/// otherwise: an exact count is a `count_tokens` round trip, and this sits on the
-/// latency path of a spoken turn, where a full turn today is well under two seconds.
-const BYTES_PER_TOKEN: usize = 3;
+/// That is the direction to be wrong in: reading low means a request the API rejects,
+/// which is the failure this whole budget exists to prevent. The number is the measured
+/// floor rather than a recollection about English. Real sentences through
+/// `/v1/messages/count_tokens`, divided by UTF-8 byte length because that is what
+/// `estimated_tokens` counts:
+///
+/// | script | bytes/token |
+/// |---|---|
+/// | Cyrillic | 4.04 |
+/// | English | 3.79 |
+/// | Japanese | 2.78 |
+/// | Arabic | 2.43 |
+/// | Chinese | 2.21 |
+/// | Korean | 2.06 |
+///
+/// Most of the tokenizer's inefficiency outside Latin script is paid back by the
+/// multi-byte encoding, which is why Cyrillic comes out ahead of English and why the
+/// spread is nothing like as wide as it first looks. CJK and Arabic are still the floor,
+/// and nothing upstream promises they will not turn up: Whisper transcribes whatever the
+/// caller happens to speak.
+///
+/// It remains an estimate, and nothing here pretends otherwise — an exact count is a
+/// `count_tokens` round trip, and this sits on the latency path of a spoken turn, where
+/// a full turn today is well under two seconds.
+const BYTES_PER_TOKEN: usize = 2;
 
 fn estimated_tokens(message: &Value) -> usize {
     message.to_string().len() / BYTES_PER_TOKEN
