@@ -1,0 +1,242 @@
+//! The browser client, served by the same process that mints its tokens.
+//!
+//! Every other way to exercise a live call is a Node script: they can assert that a
+//! conversation happened but never tell you what it sounded like. This is the page that
+//! lets someone open a URL, talk, and hear the answer.
+//!
+//! Served from here rather than from a static file server, for two reasons that are
+//! both about the page being *this* deployment's client rather than a client in
+//! general. Same-origin means the token mint is an ordinary `fetch` — no CORS layer
+//! widened across a credentialed API for a page's sake. And the SFU to dial comes from
+//! [`LiveKit::signaling_url`] rather than from a text box, because a token minted here
+//! and offered to a different deployment's SFU does not error: the client joins a room
+//! the agent is not in and the caller hears silence.
+
+use crate::state::AppState;
+use axum::extract::State;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::{IntoResponse, Redirect};
+use axum::routing::get;
+use axum::{Json, Router};
+use serde::Serialize;
+
+/// Where the page lives. The trailing slash is load-bearing: the page imports its own
+/// files by relative path, which is what lets `web/` also be opened from a plain file
+/// server, and `./app.js` under `/call` resolves to `/app.js`.
+const MOUNT: &str = "/call/";
+
+/// One file of the page, embedded at build time.
+struct Asset {
+    path: &'static str,
+    content_type: &'static str,
+    body: &'static str,
+}
+
+/// The page, in the order a browser asks for it.
+///
+/// Compiled in rather than read from disk, so the page cannot be missing from a build
+/// that exists — a static directory left out of a container image is a 404 discovered
+/// in a browser, in production, by someone who was trying to debug something else.
+const ASSETS: &[Asset] = &[
+    Asset {
+        path: "/call/",
+        content_type: "text/html; charset=utf-8",
+        body: include_str!("../../../web/index.html"),
+    },
+    Asset {
+        path: "/call/app.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: include_str!("../../../web/app.js"),
+    },
+    Asset {
+        path: "/call/transcript.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: include_str!("../../../web/transcript.js"),
+    },
+    Asset {
+        path: "/call/caller.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: include_str!("../../../web/caller.js"),
+    },
+    // Vendored, not fetched from a CDN at load time: an ES module import carries no
+    // Subresource Integrity, and a page holding an API key and an open microphone is
+    // worth pinning to bytes rather than to a version string. `web/vendor/PROVENANCE.md`
+    // records where it came from and its digest.
+    Asset {
+        path: "/call/vendor/livekit-client.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: include_str!("../../../web/vendor/livekit-client.js"),
+    },
+];
+
+pub fn router() -> Router<AppState> {
+    let assets = ASSETS.iter().fold(Router::new(), |router, asset| {
+        router.route(
+            asset.path,
+            get(|| async { ([(CONTENT_TYPE, asset.content_type)], asset.body) }),
+        )
+    });
+
+    assets
+        // Without this, `/call` serves the page and then resolves `./app.js` against
+        // `/`, so the browser fetches `/app.js` and the page loads as unstyled markup
+        // that does nothing.
+        .route("/call", get(|| async { Redirect::permanent(MOUNT) }))
+        .route("/call/config", get(config))
+}
+
+/// What the page cannot know about the deployment serving it.
+#[derive(Debug, Serialize)]
+struct CallConfig {
+    livekit_url: String,
+}
+
+/// Unauthenticated, like `/health`: the SFU hostname is what every client dials and is
+/// not a credential. The token is the credential, and that mint is authenticated.
+async fn config(State(state): State<AppState>) -> impl IntoResponse {
+    Json(CallConfig { livekit_url: state.livekit.signaling_url() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openconv_protocol::*;
+
+    /// Every relative path one file of the page names, as a browser would resolve them
+    /// against [`MOUNT`].
+    fn referenced_by(body: &str) -> Vec<&str> {
+        body.match_indices("\"./")
+            .map(|(at, _)| {
+                let rest = &body[at + 3..];
+                &rest[..rest.find('"').expect("an unterminated reference")]
+            })
+            .collect()
+    }
+
+    /// A name with no route behind it is a blank page whose only symptom is a 404 in
+    /// devtools. Read out of the files themselves rather than listed here, so adding a
+    /// module to `web/` and forgetting to serve it fails at `cargo test` instead of in
+    /// somebody's browser — and read out of *every* file, because the page loads
+    /// `app.js`, which loads the rest.
+    #[test]
+    fn every_file_the_page_asks_for_is_served() {
+        let mut found = 0;
+
+        for asset in ASSETS {
+            for name in referenced_by(asset.body) {
+                found += 1;
+
+                // A route rather than a file. That it answers is asserted by the
+                // `config` handler existing at all, which the router below wires.
+                if name == "config" {
+                    continue;
+                }
+
+                assert!(
+                    ASSETS.iter().any(|served| served.path == format!("{MOUNT}{name}")),
+                    "{} asks for {name}, which nothing serves",
+                    asset.path
+                );
+            }
+        }
+
+        // Otherwise a page that stopped referencing anything at all — its module tag
+        // deleted, say — would pass this test by having nothing to check.
+        assert!(found > 0, "the page references none of its own files");
+    }
+
+    /// A JavaScript module served as `text/html` is refused outright by every browser,
+    /// and the page fails with a MIME error that says nothing about voice.
+    #[test]
+    fn scripts_are_served_as_javascript() {
+        for asset in ASSETS.iter().filter(|asset| asset.path.ends_with(".js")) {
+            assert_eq!(asset.content_type, "text/javascript; charset=utf-8");
+        }
+    }
+
+    /// The page reads each message by field name, and a renamed field does not fail —
+    /// it renders `undefined`, or drops to the raw view, in a browser nobody is running
+    /// during the change that caused it.
+    ///
+    /// The names come from serializing the real types rather than from being typed out
+    /// here, so this compares the page against the protocol itself. The list is what
+    /// `openconv-agent` publishes today (`grep 'ServerEvent::' crates/openconv-agent`);
+    /// a variant added there and not here is not caught, but a variant *renamed* is.
+    #[test]
+    fn the_page_reads_the_field_names_the_protocol_actually_uses() {
+        let published = [
+            ServerEvent::ConversationMetadata {
+                conversation_initiation_metadata_event: ConversationInitiationMetadataEvent {
+                    conversation_id: "conv_x".to_owned(),
+                    agent_output_audio_format: AudioFormat::Pcm48000,
+                    user_input_audio_format: AudioFormat::Pcm48000,
+                },
+            },
+            ServerEvent::UserTranscript {
+                user_transcription_event: UserTranscriptionEvent {
+                    user_transcript: "run the tests".to_owned(),
+                    event_id: EventId(1),
+                },
+            },
+            ServerEvent::TentativeUserTranscript {
+                tentative_user_transcription_event: TentativeUserTranscriptionEvent {
+                    user_transcript: "run the".to_owned(),
+                    event_id: EventId(2),
+                },
+            },
+            ServerEvent::AgentResponse {
+                agent_response_event: AgentResponseEvent {
+                    agent_response: "Running them now.".to_owned(),
+                    event_id: EventId(3),
+                },
+            },
+            ServerEvent::Interruption {
+                interruption_event: InterruptionEvent { event_id: EventId(4) },
+            },
+            ServerEvent::VadScore { vad_score_event: VadScoreEvent { vad_score: 0.9 } },
+            ServerEvent::ClientToolCall {
+                client_tool_call: ClientToolCall {
+                    tool_name: "sendMessageToSession".to_owned(),
+                    tool_call_id: "call_1".to_owned(),
+                    parameters: Default::default(),
+                    event_id: EventId(5),
+                },
+            },
+        ];
+
+        let views = ASSETS
+            .iter()
+            .find(|asset| asset.path.ends_with("transcript.js"))
+            .expect("the page has no view module")
+            .body;
+
+        for event in published {
+            let serde_json::Value::Object(message) =
+                serde_json::to_value(&event).expect("serializes")
+            else {
+                panic!("a control message is not a JSON object");
+            };
+
+            let kind = message["type"].as_str().expect("a message with no type");
+            assert!(
+                views.contains(kind),
+                "the agent publishes {kind:?} messages, which the page has no view for"
+            );
+
+            for (name, payload) in &message {
+                // A payload carrying nothing but its own `event_id` has nothing for a
+                // view to read — an interruption is entirely said by having happened —
+                // so the page is right not to name it. Decided from the value rather
+                // than from a list of exceptions, which would go stale silently.
+                let carries_content = payload
+                    .as_object()
+                    .is_some_and(|fields| fields.keys().any(|field| field != "event_id"));
+
+                assert!(
+                    !carries_content || views.contains(name.as_str()),
+                    "the agent publishes {name:?}, which the page never reads"
+                );
+            }
+        }
+    }
+}

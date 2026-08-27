@@ -134,9 +134,8 @@ needs a reachable openconv to point at. Until it is set, every conversation read
 in-progress and is billed for elapsed time capped at six hours.
 
 The agent holds a conversation. It joins, announces, transcribes what the caller says,
-answers with an LLM, and publishes the reply as `agent_response`. What it cannot do yet
-is *speak* the reply — the words go out as text on the control channel, and giving them
-a voice is the TTS ticket.
+answers with an LLM, publishes the reply as `agent_response`, and speaks it into the
+room through whatever `OPENCONV_TTS_URL` names.
 
 The part worth knowing is the session configuration. The client sends a system prompt
 override, a first message, and dynamic variables; Happy puts the coding session's id and
@@ -301,6 +300,38 @@ is proven end to end against this crate's own TTS client, locally — see `piper
 
 Tracked in `lit` in this repo — twelve tickets under the `openconv` epic, ranked in
 build order. `lit backlog` to see them.
+
+Those scripts can prove a conversation happened. They cannot tell you what it sounded
+like, and for a voice service that is most of the question. So the server also serves a
+browser client:
+
+```
+open http://127.0.0.1:8080/call
+```
+
+Type the API key, press join, and talk. The transcript builds on screen as the control
+channel carries it and the agent's reply plays out of the page. It is four static files
+under `web/` plus a vendored copy of `livekit-client` — no build step and no framework,
+so what is served is what is in the repository — all of it compiled into the binary with
+`include_str!`, because a static directory left out of a container image is a 404
+discovered by someone who was debugging something else. The SDK is vendored for the same
+reason and one more: an ES module `import` has no Subresource Integrity mechanism, so a
+pinned CDN URL constrains which release is requested and not which bytes come back, and
+this page holds an API key and an open microphone. `web/vendor/PROVENANCE.md` records the
+version, source and digest, and how to re-verify them.
+
+Two decisions in it are worth knowing. The page is served by openconv rather than by any
+static file server, which makes the token mint same-origin and means no CORS layer has to
+be opened across a credentialed API for a test page's sake. And the SFU it dials comes
+from `GET /call/config`, not from a field someone fills in: a token minted by one
+deployment and offered to another deployment's SFU does not error — the client joins a
+room the agent is not in, and the caller hears silence with nothing reporting a problem.
+
+It is a second implementation of `scripts/lib/caller.mjs`'s handshake, which that file
+warns against being. The two SDKs make it unavoidable — `livekit-client` runs in a
+browser and `@livekit/rtc-node` does not — so `web/caller.js` follows the Node caller
+step for step rather than finding its own way, and the Node scripts stay the acceptance
+authority. This page is for hearing what they can only assert.
 
 ## Background
 
