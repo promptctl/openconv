@@ -93,13 +93,35 @@ export class Call {
     const microphone = await createLocalAudioTrack();
     const room = new Room();
 
+    // Who is in the room has one source — the room's own roster — and the presence rows
+    // are its diff. [LAW:one-source-of-truth] The events say *when* to look, never what
+    // is true: livekit mutates the roster before it emits, `set` then
+    // `emitWhenConnected` on arrival and `delete` then `emit` on departure, so the
+    // roster is already correct inside every handler.
+    //
+    // Reporting from the event's own payload instead would announce twice: anyone
+    // arriving while `publishTrack` and `startAudio` are awaited — both real round
+    // trips — is seen by the handler and again by the sweep those awaits precede.
+    // [LAW:no-ambient-temporal-coupling] A diff is right whatever the arrival order,
+    // where a snapshot taken sooner would only make the overlap rarer.
+    let reported = new Set();
+    const reportPresence = () => {
+      const present = new Set(room.remoteParticipants.keys());
+      const arrived = [...present].filter((identity) => !reported.has(identity));
+      const left = [...reported].filter((identity) => !present.has(identity));
+
+      for (const identity of arrived) onPresence(identity, "joined");
+      for (const identity of left) onPresence(identity, "left");
+      reported = present;
+    };
+
     // Listeners are attached before connecting: a track can be subscribed and a control
     // event delivered during `connect`, and a handler registered afterwards waits for
     // events that have already fired — which reads as an agent that never spoke.
     room.on(RoomEvent.DataReceived, (payload) => onEvent(decodeEvent(payload)));
     room.on(RoomEvent.ConnectionStateChanged, onState);
-    room.on(RoomEvent.ParticipantConnected, (who) => onPresence(who.identity, "joined"));
-    room.on(RoomEvent.ParticipantDisconnected, (who) => onPresence(who.identity, "left"));
+    room.on(RoomEvent.ParticipantConnected, reportPresence);
+    room.on(RoomEvent.ParticipantDisconnected, reportPresence);
     room.on(RoomEvent.TrackSubscribed, (track) => {
       // Video is not part of this protocol, but subscribing to one and attaching it to
       // an `<audio>` element would silently play nothing at all.
@@ -123,10 +145,10 @@ export class Call {
       const audible = await room.startAudio().then(() => room.canPlaybackAudio, () => false);
 
       // The agent is dispatched by the mint, so it is usually in the room *before* this
-      // client is — and `ParticipantConnected` only fires for arrivals after the
-      // connect. Reported from the roster as well as the event, or the common case is
-      // the one that never announces itself.
-      for (const who of room.remoteParticipants.values()) onPresence(who.identity, "joined");
+      // client is — and livekit suppresses `ParticipantConnected` until the connection
+      // is established, so the common case never announces itself through the event.
+      // Swept once here, which is the same diff the events take.
+      reportPresence();
 
       return new Call(room, microphone, conversationId, audible);
     } catch (error) {
