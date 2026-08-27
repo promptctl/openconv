@@ -168,6 +168,11 @@ impl Speaking {
 ///
 /// Cancelling `interrupted` stops the audio and drops whatever of this reply had been
 /// queued and not yet heard.
+///
+/// Cancellation always beats the model, never sometimes: a token already cancelled when
+/// `speak` is called is a turn that never starts, and comes back as
+/// [`Spoken::Nothing`] carrying [`Stopped::Interrupted`], never as a reply nobody was
+/// ever going to hear.
 pub async fn speak(
     voice: &Voice,
     synthesizer: Arc<dyn Synthesizer>,
@@ -185,7 +190,11 @@ pub async fn speak(
         let voice = voice.clone();
         let interrupted = interrupted.clone();
         async move {
+            // `biased`, so cancellation is read before the queue rather than alongside
+            // it. Both are ready together whenever the caller cuts in as the last clause
+            // lands, and there the caller's decision is the one that counts.
             tokio::select! {
+                biased;
                 _ = interrupted.cancelled() => voice.silence(),
                 _ = queue_in_order(&voice, &mut pending) => {}
             }
@@ -201,7 +210,16 @@ pub async fn speak(
         // Reading stops the moment the caller cuts in. The words already written stay
         // in `said` and are still reported: the caller heard some of them, and a
         // transcript that omits what was spoken is worse than one that includes it.
+        //
+        // `biased`, so cancellation is checked before the next piece rather than
+        // alongside it. The two are ready in the same poll whenever the caller cut in
+        // while a piece was already waiting — and, for a token cancelled before `speak`
+        // was called, on the first pass of every such turn. An unbiased select picks
+        // between ready branches at random, which would leave "the caller is talking"
+        // meaning *stop* on some runs and *read one more piece* on others. Biased, it
+        // means stop, always.
         let piece = tokio::select! {
+            biased;
             _ = interrupted.cancelled() => {
                 cut_short = Some(Stopped::Interrupted);
                 break;
