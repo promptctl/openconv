@@ -2,9 +2,10 @@
 //! missing — a voice call failing at 2am should never be the first sign that a
 //! credential was never set.
 
-use openconv_server::api::{router, AppState};
+use openconv_server::app::router;
 use openconv_server::config::Config;
 use openconv_server::livekit::LiveKit;
+use openconv_server::state::AppState;
 use openconv_server::store::ConversationLog;
 use std::process::ExitCode;
 use std::sync::Arc;

@@ -2,56 +2,27 @@
 //! closely enough that pointing Happy at this host is a base-URL change and nothing
 //! else.
 
-use crate::config::{Config, XiApiKey};
+use crate::config::XiApiKey;
 use crate::conversation::ConversationId;
-use crate::livekit::{ConversationToken, LiveKit, LiveKitError};
+use crate::livekit::{ConversationToken, LiveKitError};
 use crate::record::{now_unix_secs, AgentId, ConversationEvent, ConversationRecord, HappyUserId};
-use crate::store::{ConversationLog, LogError};
+use crate::state::AppState;
+use crate::store::LogError;
 use crate::usage::{self, ConversationPage, UsageQuery};
-use crate::webhook::{WebhookRejected, Webhooks};
+use crate::webhook::WebhookRejected;
 use axum::extract::{FromRequestParts, Query, State};
 use axum::http::{request::Parts, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 /// The header ElevenLabs authenticates with, and therefore the one Happy sends.
 const API_KEY_HEADER: &str = "xi-api-key";
 
-#[derive(Clone)]
-pub struct AppState {
-    pub livekit: Arc<LiveKit>,
-    pub log: Arc<ConversationLog>,
-    pub webhooks: Arc<Webhooks>,
-    /// Handed to every agent this process starts. Loaded once — see
-    /// [`openconv_agent::Services`].
-    pub agents: Arc<openconv_agent::Services>,
-    pub xi_api_key: XiApiKey,
-}
-
-impl AppState {
-    pub fn new(
-        config: &Config,
-        livekit: LiveKit,
-        log: ConversationLog,
-        agents: Arc<openconv_agent::Services>,
-    ) -> Self {
-        Self {
-            livekit: Arc::new(livekit),
-            log: Arc::new(log),
-            agents,
-            webhooks: Arc::new(Webhooks::new(
-                &config.livekit_api_key,
-                &config.livekit_api_secret,
-            )),
-            xi_api_key: config.xi_api_key.clone(),
-        }
-    }
-}
-
-pub fn router(state: AppState) -> Router {
+/// Everything Happy's server and the SFU call. Joined with the browser client's routes
+/// by [`crate::app::router`], which is the only place that knows both exist.
+pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/convai/conversation/token", get(conversation_token))
         .route("/v1/convai/conversations", get(conversations))
@@ -61,7 +32,6 @@ pub fn router(state: AppState) -> Router {
         // Unauthenticated on purpose: a liveness probe that needs a credential tells
         // you the credential is good, not that the service is up.
         .route("/health", get(|| async { "ok" }))
-        .with_state(state)
 }
 
 /// Proof that the request carried the right `xi-api-key`.
