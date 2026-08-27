@@ -80,7 +80,16 @@ export class Call {
    * against — so prompting for the microphone afterwards means a denied permission
    * leaves an agent sitting alone in a room that will be charged for.
    */
-  static async join({ livekitUrl, apiKey, agentId, participantName, onEvent, onTrack, onState }) {
+  static async join({
+    livekitUrl,
+    apiKey,
+    agentId,
+    participantName,
+    onEvent,
+    onTrack,
+    onState,
+    onPresence,
+  }) {
     const microphone = await createLocalAudioTrack();
     const room = new Room();
 
@@ -89,6 +98,8 @@ export class Call {
     // events that have already fired — which reads as an agent that never spoke.
     room.on(RoomEvent.DataReceived, (payload) => onEvent(decodeEvent(payload)));
     room.on(RoomEvent.ConnectionStateChanged, onState);
+    room.on(RoomEvent.ParticipantConnected, (who) => onPresence(who.identity, "joined"));
+    room.on(RoomEvent.ParticipantDisconnected, (who) => onPresence(who.identity, "left"));
     room.on(RoomEvent.TrackSubscribed, (track) => {
       // Video is not part of this protocol, but subscribing to one and attaching it to
       // an `<audio>` element would silently play nothing at all.
@@ -110,6 +121,12 @@ export class Call {
       // A refusal is a value rather than a failure: a call whose transcript works and
       // whose audio is muted is still a call, and the page says which it got.
       const audible = await room.startAudio().then(() => room.canPlaybackAudio, () => false);
+
+      // The agent is dispatched by the mint, so it is usually in the room *before* this
+      // client is — and `ParticipantConnected` only fires for arrivals after the
+      // connect. Reported from the roster as well as the event, or the common case is
+      // the one that never announces itself.
+      for (const who of room.remoteParticipants.values()) onPresence(who.identity, "joined");
 
       return new Call(room, microphone, conversationId, audible);
     } catch (error) {

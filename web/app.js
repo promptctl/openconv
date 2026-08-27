@@ -45,6 +45,85 @@ function requireFields() {
 }
 
 /**
+ * What to do about the failures a browser reports by name instead of by sentence.
+ *
+ * `NotAllowedError` is the one that will happen most, and it is genuinely ambiguous:
+ * the browser raises the identical error for a refused permission prompt and for an
+ * origin it considers insecure, without saying which. Safari treats `http://127.0.0.1`
+ * as insecure and Chrome does not, so the same page works in one browser and is refused
+ * by the other with this same word — which is a bad ten minutes unless the page says so.
+ */
+const ADVICE = {
+  NotAllowedError:
+    " — the microphone was refused. Chrome and Firefox treat http://127.0.0.1 as a secure" +
+    " origin and will prompt for it; Safari does not, and refuses without asking. If you" +
+    " are already in Chrome, check macOS Settings › Privacy & Security › Microphone.",
+  NotFoundError: " — this machine has no microphone the browser can see.",
+  NotReadableError: " — the microphone is held by another application.",
+};
+
+/** Where the last visit's settings are kept. */
+const REMEMBERED = "openconv.call";
+
+/**
+ * The settings from last time, or none.
+ *
+ * A browser that refuses storage — private windows do — says so and carries on with the
+ * markup's defaults rather than taking the page down over a convenience.
+ */
+function remembered() {
+  try {
+    return JSON.parse(localStorage.getItem(REMEMBERED) ?? "{}");
+  } catch (error) {
+    render(log("error", `could not read remembered settings: ${error.message}`));
+    return {};
+  }
+}
+
+/**
+ * Fills the form from the URL or from the last visit, so that joining costs one click.
+ *
+ * These three values change rarely and the shared secret never, so retyping them every
+ * visit is friction carrying no information.
+ *
+ * Seeds are written *into the fields* rather than read at mint time, which keeps the
+ * form the only thing deciding what gets minted — a page whose box shows one key while
+ * the request sends another is a bad hour. It also means `requireFields` stays the
+ * single boundary: nothing routes around the parser.
+ *
+ * Precedence is URL, then remembered, then whatever the markup shipped, so a link can
+ * always override a stale stored value.
+ */
+function seedFields() {
+  const fromUrl = new URLSearchParams(location.search);
+  const stored = remembered();
+
+  for (const [name, field] of Object.entries(FIELDS)) {
+    field.element.value = fromUrl.get(name) ?? stored[name] ?? field.element.value;
+  }
+
+  // The key does not stay in the address bar once it is in the box. A URL is the one
+  // place a secret gets bookmarked, screenshotted and pasted into chat.
+  history.replaceState(null, "", location.pathname);
+}
+
+/**
+ * Keeps the current settings for next time.
+ *
+ * Called only after a join that worked, so what is remembered is a set of values known
+ * to mint. Note this does put the shared secret in `localStorage`: acceptable for a
+ * client whose whole purpose is a fast development loop, and worth knowing before
+ * pointing this page at anything you would not paste into a browser console.
+ */
+function remember(fields) {
+  try {
+    localStorage.setItem(REMEMBERED, JSON.stringify(fields));
+  } catch (error) {
+    render(log("error", `could not remember these settings: ${error.message}`));
+  }
+}
+
+/**
  * The call this page is in, and the only mutable state it has.
  *
  * Written by `join` and `leave` and nowhere else, and the button is derived from it, so
@@ -84,8 +163,13 @@ async function join() {
     onEvent: show,
     onTrack: (track) => track.attach(els.audio),
     onState: (state) => render(cell("room", state)),
+    // Who else is in the room, which is otherwise invisible: "I pressed join and
+    // nothing happened" is almost always an agent that never arrived, and that is a
+    // different problem from one that arrived and stayed quiet.
+    onPresence: (identity, presence) => render(log("system", `${identity} ${presence}`)),
   });
 
+  remember(fields);
   render(cell("call", call.conversationId));
   render(cell("audio", call.audible ? "playing" : "BLOCKED — click the page"));
   showButton("leave", true);
@@ -105,7 +189,9 @@ els.join.addEventListener("click", async () => {
     // On screen, not in the console alone. Someone is looking at this page *because*
     // something is wrong, and a failure only devtools can see is a page that appears to
     // do nothing at all.
-    render(log("error", String(error)));
+    // The advice is a lookup with an empty default, so an error the page has nothing
+    // extra to say about still prints its own message in full.
+    render(log("error", `${error}${ADVICE[error.name] ?? ""}`));
 
     // The button is derived from whether a call is still held, not assumed to be gone.
     // A `leave` that failed is still in its call, and a page that says "join" over a
@@ -115,3 +201,5 @@ els.join.addEventListener("click", async () => {
     showButton(call ? "leave" : "join", true);
   }
 });
+
+seedFields();
