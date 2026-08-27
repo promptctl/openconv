@@ -66,14 +66,34 @@ const ADVICE = {
 const REMEMBERED = "openconv.call";
 
 /**
- * The settings from last time, or none.
+ * The settings from last time: string values, for field names this page actually has.
  *
- * A browser that refuses storage — private windows do — says so and carries on with the
- * markup's defaults rather than taking the page down over a convenience.
+ * This is the parser for the one input on the page nobody typed, and everything about
+ * it is untrusted — an older version of this page wrote it, or a second tab, or an
+ * extension, or somebody in devtools. So it returns the shape `seedFields` needs on
+ * every path rather than whatever `JSON.parse` happened to produce.
+ * [LAW:parse-dont-validate]
+ *
+ * That matters more than it looks. `JSON.parse("null")` succeeds, and indexing the
+ * result for a field name throws — at module scope, before the form is ever seeded.
+ * A stored number or object does not throw; it stringifies into the box as `42` or
+ * `[object Object]`, and since seeds are written *into the fields*, `requireFields`
+ * sees a non-empty string and mints with it.
+ *
+ * An unusable stored value is dropped quietly, because it is not a failure: it is
+ * indistinguishable from a first visit, the field falls through to the markup's
+ * default, and an empty box on screen is the whole of the consequence. A browser that
+ * refuses storage outright is a different matter and still says so.
  */
 function remembered() {
   try {
-    return JSON.parse(localStorage.getItem(REMEMBERED) ?? "{}");
+    const stored = JSON.parse(localStorage.getItem(REMEMBERED) ?? "{}");
+
+    return Object.fromEntries(
+      Object.keys(FIELDS)
+        .filter((name) => typeof stored?.[name] === "string")
+        .map((name) => [name, stored[name]]),
+    );
   } catch (error) {
     render(log("error", `could not read remembered settings: ${error.message}`));
     return {};
