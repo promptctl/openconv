@@ -1,0 +1,249 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>openconv call</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+<!--
+  The fastest possible sanity check for a conversation: open a URL, talk, hear the
+  agent back. Everything else that exercises a live call is a Node script driving
+  @livekit/rtc-node, which can prove a conversation happened but can never tell you
+  what it sounded like.
+
+  Plain files on purpose — no build step and no framework — so that what is served is
+  what is in the repository, and a page that misbehaves is debugged by reading it.
+-->
+
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #14161a;
+    --panel: #1c1f26;
+    --edge: #2c313b;
+    --text: #e6e8ec;
+    --dim: #8b93a3;
+    --you: #6fb2ff;
+    --agent: #7ee0a8;
+    --system: #c9a0ff;
+    --tool: #ffc46b;
+    --raw: #6b7280;
+  }
+
+  body {
+    margin: 0;
+    padding: 1.5rem;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    height: 100vh;
+    box-sizing: border-box;
+  }
+
+  h1 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin: 0;
+    letter-spacing: 0.04em;
+  }
+
+  fieldset {
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    background: var(--panel);
+    padding: 0.75rem 1rem;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: end;
+    gap: 0.75rem;
+    margin: 0;
+  }
+
+  label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 0.75rem;
+    color: var(--dim);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  input {
+    font: inherit;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--edge);
+    border-radius: 4px;
+    padding: 0.4rem 0.6rem;
+    min-width: 16ch;
+  }
+
+  button {
+    font: inherit;
+    padding: 0.45rem 1.2rem;
+    border-radius: 4px;
+    border: 1px solid var(--edge);
+    background: var(--you);
+    color: #0b1220;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  button:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  /* The status strip: named cells, each replaced in place, for the facts that change
+     faster than a transcript can carry them. */
+  #cells {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.5rem;
+    align-items: center;
+    min-height: 1.5rem;
+    color: var(--dim);
+    font-size: 0.85rem;
+  }
+
+  .cell {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .cell-name {
+    text-transform: uppercase;
+    font-size: 0.7rem;
+    letter-spacing: 0.08em;
+  }
+
+  .cell-text {
+    color: var(--text);
+  }
+
+  /* Width is set from the event's own value, so a cell with nothing to meter simply
+     draws nothing rather than needing a second kind of cell. */
+  .cell-bar {
+    height: 4px;
+    width: 0;
+    background: var(--agent);
+    border-radius: 2px;
+    transition: width 60ms linear;
+  }
+
+  #failure {
+    margin: 0;
+    padding: 0.75rem 1rem;
+    border: 1px solid #ff8080;
+    border-radius: 6px;
+    color: #ff8080;
+    white-space: pre-wrap;
+    font: inherit;
+  }
+
+  #transcript {
+    flex: 1;
+    overflow-y: auto;
+    border: 1px solid var(--edge);
+    border-radius: 6px;
+    background: var(--panel);
+    padding: 0.75rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .row {
+    display: flex;
+    gap: 0.75rem;
+    align-items: baseline;
+  }
+
+  .who {
+    flex: none;
+    width: 7ch;
+    text-align: right;
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  .text {
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .who-you { color: var(--you); }
+  .who-agent { color: var(--agent); }
+  .who-system { color: var(--system); }
+  .who-tool { color: var(--tool); }
+  .who-raw { color: var(--raw); }
+  .who-error { color: #ff8080; }
+  .row-raw .text { color: var(--raw); }
+  .row-error .text { color: #ff8080; }
+</style>
+
+<h1>openconv &mdash; talk to the agent</h1>
+
+<fieldset>
+  <label>
+    api key
+    <input id="api-key" type="password" placeholder="OPENCONV_API_KEY" autocomplete="off" />
+  </label>
+  <label>
+    agent
+    <input id="agent-id" value="agent_happy" />
+  </label>
+  <label>
+    participant
+    <input id="participant-name" value="u_browser" />
+  </label>
+  <button id="join">join</button>
+</fieldset>
+
+<!--
+  The page failed to start, as opposed to a call that failed — a distinct fact with a
+  distinct home on screen.
+-->
+<pre id="failure" hidden></pre>
+
+<div id="cells"></div>
+
+<div id="transcript"></div>
+
+<!--
+  The agent's track is attached here. Autoplay is allowed because joining is a click,
+  and every route into a call goes through that click.
+-->
+<audio id="agent-audio" autoplay></audio>
+
+<script>
+  // Classic and ahead of the module on purpose. A module that fails to load never runs
+  // its own code, so a reporter living inside `app.js` cannot report the failure most
+  // likely to strand this page: the pinned import not arriving. Capturing, because a
+  // script that 404s fires an error event that does not bubble.
+  addEventListener(
+    "error",
+    (event) =>
+      reportFailure(
+        event.message ||
+          // Named as a pair because the browser reports a module and its failed
+          // imports identically, with the outer URL both times — blaming this file
+          // alone would send someone looking in the wrong place.
+          `${event.target.src} did not load, nor did something it imports`,
+      ),
+    true,
+  );
+  addEventListener("unhandledrejection", (event) => reportFailure(event.reason));
+
+  function reportFailure(what) {
+    const banner = document.getElementById("failure");
+    banner.hidden = false;
+    banner.textContent += `${what}\n`;
+  }
+</script>
+
+<script type="module" src="./app.js"></script>

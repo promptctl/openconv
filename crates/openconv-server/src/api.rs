@@ -61,6 +61,9 @@ pub fn router(state: AppState) -> Router {
         // Unauthenticated on purpose: a liveness probe that needs a credential tells
         // you the credential is good, not that the service is up.
         .route("/health", get(|| async { "ok" }))
+        // The browser client, which mints against the routes above rather than against
+        // anything of its own.
+        .merge(crate::web::router())
         .with_state(state)
 }
 
