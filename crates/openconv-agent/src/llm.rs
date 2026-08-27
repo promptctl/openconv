@@ -208,10 +208,16 @@ impl Claude {
     ///
     /// Async and fallible because the window is not knowable without asking, and the
     /// models this service is configured with today differ in it by a factor of five —
-    /// a constant would be silently wrong for four of them. This adds no startup
-    /// dependency the process did not already have: it cannot answer a single call
-    /// without api.anthropic.com, so this only moves the discovery of that from
-    /// mid-sentence to boot, where the rest of this binary already puts it.
+    /// a constant would be silently wrong for four of them.
+    ///
+    /// The dependency on api.anthropic.com is not new, but where it bites is: an outage
+    /// during a restart now stops the process, where before it would only have failed
+    /// the calls the process took while it lasted. That is the trade `serve()` already
+    /// makes for the conversation log and the whisper model, and for the same reason —
+    /// a voice agent that comes up unable to answer connects callers to silence. Trying
+    /// again after a transient failure is the supervisor's to decide, not this
+    /// function's: the Nomad job that runs this restarts a task that failed to start,
+    /// with a backoff an operator can see and change.
     pub async fn new(api_key: String, model: String) -> Result<Self, LlmError> {
         let http = reqwest::Client::builder()
             // Bounds the whole turn, not the wait for the first word: a streaming
