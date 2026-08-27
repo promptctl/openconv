@@ -174,20 +174,33 @@ impl Model {
             return Err(LlmError::Refused { status: status.as_u16(), body });
         }
 
-        let described: Value =
-            serde_json::from_str(&body).map_err(|error| LlmError::Malformed(error.to_string()))?;
-
-        // `max_input_tokens` is the whole context window, despite reading like an
-        // input-only allowance sitting on top of `max_tokens`. Opus 4.5 reports 200000
-        // here and documents a 200K window with a 64K output cap; were the two additive
-        // the window would have to be 264K. Everything the budget in `open` does rests
-        // on reading it this way, which is why the reply is reserved out of it.
-        let context_window = described["max_input_tokens"].as_u64().ok_or_else(|| {
-            LlmError::Malformed(format!("model {id} was described without max_input_tokens: {body}"))
-        })? as usize;
+        let context_window = window_described_in(&body, &id)?;
 
         Ok(Self { id, context_window })
     }
+}
+
+/// How much the model in this description holds, read out of the API's answer.
+///
+/// Separated from the request that fetched `body` so it can be run against a canned
+/// description with no network in the way — the whole budget rests on this one field
+/// being read correctly, and a field the API renames or moves should fail here rather
+/// than at somebody's next startup. [LAW:effects-at-boundaries]
+///
+/// `max_input_tokens` is the whole context window, despite reading like an input-only
+/// allowance sitting on top of `max_tokens`. Opus 4.5 reports 200000 here and documents
+/// a 200K window with a 64K output cap; were the two additive the window would have to
+/// be 264K. That reading is why `open` reserves the reply out of what it finds here.
+fn window_described_in(body: &str, id: &str) -> Result<usize, LlmError> {
+    let described: Value = serde_json::from_str(body)
+        .map_err(|error| LlmError::Malformed(format!("model {id} was described as {body}, which does not read as JSON: {error}")))?;
+
+    described["max_input_tokens"]
+        .as_u64()
+        .map(|window| window as usize)
+        .ok_or_else(|| {
+            LlmError::Malformed(format!("model {id} was described without max_input_tokens: {body}"))
+        })
 }
 
 impl Claude {
@@ -894,6 +907,32 @@ mod tests {
     fn a_turn_larger_than_the_window_is_still_sent() {
         let turns = exchange(100_000);
         assert_eq!(recent(&turns, 10), turns.as_slice());
+    }
+
+    /// The one field the whole budget rests on, read off a description shaped like the
+    /// API's own answer.
+    #[test]
+    fn a_described_model_says_how_much_it_holds() {
+        let described = r#"{"type":"model","id":"claude-opus-4-5","max_input_tokens":200000}"#;
+        assert_eq!(window_described_in(described, "claude-opus-4-5").unwrap(), 200_000);
+    }
+
+    /// A renamed or moved field must be loud here rather than at the next startup, which
+    /// is the whole reason this is a function and not a step inside the request.
+    #[test]
+    fn a_description_without_the_field_is_an_error_naming_the_model() {
+        let described = r#"{"type":"model","id":"claude-opus-4-5","max_tokens":64000}"#;
+        let read = window_described_in(described, "claude-opus-4-5");
+        assert!(
+            matches!(&read, Err(LlmError::Malformed(explanation)) if explanation.contains("claude-opus-4-5")),
+            "{read:?}"
+        );
+    }
+
+    #[test]
+    fn a_description_that_is_not_json_is_an_error() {
+        let read = window_described_in("<html>gateway timeout</html>", "claude-opus-4-5");
+        assert!(matches!(read, Err(LlmError::Malformed(_))), "{read:?}");
     }
 
     /// The ticket's own bar: a conversation long past where the window used to run out
