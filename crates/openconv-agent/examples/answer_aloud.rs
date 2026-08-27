@@ -33,7 +33,9 @@ async fn main() {
     let llm = Claude::new(
         std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY"),
         std::env::var("OPENCONV_LLM_MODEL").unwrap_or_else(|_| "claude-opus-5".to_owned()),
-    );
+    )
+    .await
+    .expect("the API describes the configured model");
     let tts = Arc::new(Tts::new(
         std::env::var("OPENCONV_TTS_URL").unwrap_or_else(|_| "http://127.0.0.1:11000".to_owned()),
         std::env::var("OPENCONV_TTS_VOICE").unwrap_or_else(|_| "21m00Tcm4TlvDq8ikWAM".to_owned()),
