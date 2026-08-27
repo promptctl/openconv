@@ -7,18 +7,21 @@
 //!
 //! # The shape of a request
 //!
-//! [`api`] holds the HTTP surface; everything below it is arranged so that the request
-//! path has nothing left to check. [`config`] turns the environment into values known
+//! [`app`] joins the two halves of the HTTP surface — [`api`], which Happy calls, and
+//! [`web`], the browser client — over the shared [`state`]. Everything below them is
+//! arranged so that the request path has nothing left to check. [`config`] turns the environment into values known
 //! to exist, [`conversation`] makes a badly-named room unrepresentable, [`record`] is
 //! the single value describing a started conversation, [`livekit`] is the only place
 //! that performs I/O against the SFU or signs a token, and [`store`] is where a
 //! conversation outlives the room it happened in.
 
 pub mod api;
+pub mod app;
 pub mod config;
 pub mod conversation;
 pub mod livekit;
 pub mod record;
+pub mod state;
 pub mod store;
 pub mod usage;
 pub mod web;
