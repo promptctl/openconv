@@ -56,10 +56,13 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         transcriber: Arc::new(openconv_agent::transcribe::Transcriber::load(
             &config.whisper_model,
         )?),
-        llm: Arc::new(openconv_agent::llm::Claude::new(
-            config.anthropic_api_key.clone(),
-            config.llm_model.clone(),
-        )),
+        llm: Arc::new(
+            openconv_agent::llm::Claude::new(
+                config.anthropic_api_key.clone(),
+                config.llm_model.clone(),
+            )
+            .await?,
+        ),
         tts: Arc::new(openconv_agent::tts::Tts::new(
             config.tts_url.clone(),
             config.tts_voice.clone(),

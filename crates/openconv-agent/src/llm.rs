@@ -125,7 +125,19 @@ pub trait Llm: Send + Sync {
 pub struct Claude {
     http: reqwest::Client,
     api_key: String,
-    model: String,
+    model: Model,
+}
+
+/// A model the API has confirmed, and how much conversation it can hold.
+///
+/// Private fields and no constructor but the lookup, so the only way to hold one of
+/// these is to have asked: the id that goes out on the wire and the window the history
+/// is trimmed to arrived together, from one answer, and cannot come to disagree. A
+/// window written into config beside the id would be the second clock.
+/// [LAW:one-source-of-truth]
+struct Model {
+    id: String,
+    context_window: usize,
 }
 
 /// Covers thinking as well as spoken words — the two share this budget, and the model
@@ -137,19 +149,86 @@ const MAX_TOKENS: u32 = 4096;
 /// The Messages API version this code is written against.
 const API_VERSION: &str = "2023-06-01";
 
-impl Claude {
-    pub fn new(api_key: String, model: String) -> Self {
-        Self {
-            http: reqwest::Client::builder()
-                // Bounds the whole turn, not the wait for the first word: a streaming
-                // response only completes when the model stops writing. Better to fail
-                // the turn and say so than to leave a caller listening to nothing.
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
-                .expect("HTTP client with only a timeout configured cannot fail to build"),
-            api_key,
-            model,
+impl Model {
+    /// Asks the API what this model is, and returns nothing for one it has never heard of.
+    ///
+    /// The checkpoint the raw config string crosses. A typo in `llm_model` is
+    /// indistinguishable from a real id until someone asks, and this is the one place
+    /// that asks — everything downstream takes a `Model` and is past the question.
+    /// [LAW:parse-dont-validate]
+    async fn look_up(http: &reqwest::Client, api_key: &str, id: String) -> Result<Self, LlmError> {
+        let response = http
+            .get(format!("https://api.anthropic.com/v1/models/{id}"))
+            .header("x-api-key", api_key)
+            .header("anthropic-version", API_VERSION)
+            .send()
+            .await
+            .map_err(|error| LlmError::Transport(with_cause(&error)))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| LlmError::Transport(with_cause(&error)))?;
+        if !status.is_success() {
+            return Err(LlmError::Refused { status: status.as_u16(), body });
         }
+
+        let context_window = window_described_in(&body, &id)?;
+
+        Ok(Self { id, context_window })
+    }
+}
+
+/// How much the model in this description holds, read out of the API's answer.
+///
+/// Separated from the request that fetched `body` so it can be run against a canned
+/// description with no network in the way — the whole budget rests on this one field
+/// being read correctly, and a field the API renames or moves should fail here rather
+/// than at somebody's next startup. [LAW:effects-at-boundaries]
+///
+/// `max_input_tokens` is the whole context window, despite reading like an input-only
+/// allowance sitting on top of `max_tokens`. Opus 4.5 reports 200000 here and documents
+/// a 200K window with a 64K output cap; were the two additive the window would have to
+/// be 264K. That reading is why `open` reserves the reply out of what it finds here.
+fn window_described_in(body: &str, id: &str) -> Result<usize, LlmError> {
+    let described: Value = serde_json::from_str(body)
+        .map_err(|error| LlmError::Malformed(format!("model {id} was described as {body}, which does not read as JSON: {error}")))?;
+
+    described["max_input_tokens"]
+        .as_u64()
+        .map(|window| window as usize)
+        .ok_or_else(|| {
+            LlmError::Malformed(format!("model {id} was described without max_input_tokens: {body}"))
+        })
+}
+
+impl Claude {
+    /// Builds a client for `model`, having asked the API how much that model holds.
+    ///
+    /// Async and fallible because the window is not knowable without asking, and the
+    /// models this service is configured with today differ in it by a factor of five —
+    /// a constant would be silently wrong for four of them.
+    ///
+    /// The dependency on api.anthropic.com is not new, but where it bites is: an outage
+    /// during a restart now stops the process, where before it would only have failed
+    /// the calls the process took while it lasted. That is the trade `serve()` already
+    /// makes for the conversation log and the whisper model, and for the same reason —
+    /// a voice agent that comes up unable to answer connects callers to silence. Trying
+    /// again after a transient failure is the supervisor's to decide, not this
+    /// function's: the Nomad job that runs this restarts a task that failed to start,
+    /// with a backoff an operator can see and change.
+    pub async fn new(api_key: String, model: String) -> Result<Self, LlmError> {
+        let http = reqwest::Client::builder()
+            // Bounds the whole turn, not the wait for the first word: a streaming
+            // response only completes when the model stops writing. Better to fail
+            // the turn and say so than to leave a caller listening to nothing.
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .expect("HTTP client with only a timeout configured cannot fail to build");
+        let model = Model::look_up(&http, &api_key, model).await?;
+
+        Ok(Self { http, api_key, model })
     }
 
     /// Opens the stream, or explains why it could not be opened.
@@ -159,10 +238,18 @@ impl Claude {
         turns: &[Turn],
         tools: &[Value],
     ) -> Result<reqwest::Response, LlmError> {
-        let messages: Vec<_> = turns.iter().flat_map(Turn::messages).collect();
+        // What is left of the window once the reply and the parts of the request that
+        // go out every turn regardless have been paid for. The system prompt and the
+        // tool list are resent each time and are charged against the same window as the
+        // conversation, and `max_tokens` has to be reserved because the window covers
+        // the reply too.
+        let overhead =
+            estimated_tokens(&json!(system)) + tools.iter().map(estimated_tokens).sum::<usize>();
+        let budget = self.model.context_window.saturating_sub(MAX_TOKENS as usize + overhead);
+        let messages: Vec<_> = recent(turns, budget).iter().flat_map(Turn::messages).collect();
 
         let body = serde_json::json!({
-            "model": self.model,
+            "model": self.model.id,
             "max_tokens": MAX_TOKENS,
             "system": system,
             "messages": messages,
@@ -206,6 +293,88 @@ impl Claude {
         let explanation = response.text().await.unwrap_or_default();
         Err(LlmError::Refused { status: status.as_u16(), body: explanation })
     }
+}
+
+/// Two bytes of request JSON per token — under what any language actually costs, so the
+/// estimate reads high and the trim happens early.
+///
+/// That is the direction to be wrong in: reading low means a request the API rejects,
+/// which is the failure this whole budget exists to prevent. The number is the measured
+/// floor rather than a recollection about English. Real sentences through
+/// `/v1/messages/count_tokens`, divided by UTF-8 byte length because that is what
+/// `estimated_tokens` counts:
+///
+/// | script | bytes/token |
+/// |---|---|
+/// | Cyrillic | 4.04 |
+/// | English | 3.79 |
+/// | Japanese | 2.78 |
+/// | Arabic | 2.43 |
+/// | Chinese | 2.21 |
+/// | Korean | 2.06 |
+///
+/// Most of the tokenizer's inefficiency outside Latin script is paid back by the
+/// multi-byte encoding, which is why Cyrillic comes out ahead of English and why the
+/// spread is nothing like as wide as it first looks. CJK and Arabic are still the floor,
+/// and nothing upstream promises they will not turn up: Whisper transcribes whatever the
+/// caller happens to speak.
+///
+/// It remains an estimate, and nothing here pretends otherwise — an exact count is a
+/// `count_tokens` round trip, and this sits on the latency path of a spoken turn, where
+/// a full turn today is well under two seconds.
+const BYTES_PER_TOKEN: usize = 2;
+
+fn estimated_tokens(message: &Value) -> usize {
+    message.to_string().len() / BYTES_PER_TOKEN
+}
+
+/// Whether a request may legally begin at this turn.
+///
+/// The Messages API requires the first message to be a user message, so the cut cannot
+/// land just anywhere: a [`Turn::Agent`] renders as `assistant` and a [`Turn::Used`]
+/// renders assistant-then-user, and starting on either is a 400. Read off what
+/// `messages()` actually renders rather than matched against the variants, so a variant
+/// added later cannot disagree with its own wire shape. [LAW:one-source-of-truth]
+fn begins_a_conversation(messages: &[Value]) -> bool {
+    messages.first().is_some_and(|message| message["role"] == "user")
+}
+
+/// The longest run of the most recent turns that fits `budget` and can legally open a
+/// request.
+///
+/// Whole turns, oldest evicted first. [`Turn::Used`] carries the call and its result in
+/// one variant, so dropping a turn cannot leave a `tool_use` unanswered — the state the
+/// API rejects the entire conversation over is one this history cannot represent.
+fn recent(turns: &[Turn], budget: usize) -> &[Turn] {
+    let mut spent = 0;
+    let mut start = None;
+
+    for (index, turn) in turns.iter().enumerate().rev() {
+        let messages = turn.messages();
+        spent += messages.iter().map(estimated_tokens).sum::<usize>();
+        let fits = spent <= budget;
+
+        // `|| start.is_none()` keeps the newest turn that could open a request even when
+        // that turn alone busts the budget. Returning nothing there would be an
+        // answer-shaped void — shaped exactly like "the conversation is empty" while
+        // meaning "nothing fit" — and the API would then refuse for the wrong reason.
+        // One over-long turn instead produces a loud error naming the real problem.
+        // [LAW:no-silent-failure]
+        if begins_a_conversation(&messages) && (fits || start.is_none()) {
+            start = Some(index);
+        }
+
+        // Overrunning is only a reason to stop once somewhere legal to start has been
+        // found. The newest turn is often an [`Turn::Agent`] or a [`Turn::Used`], and
+        // stopping on it would walk away with nothing to send.
+        if !fits && start.is_some() {
+            break;
+        }
+    }
+
+    // No turn in the whole history can open a request, which is not a thing to paper
+    // over: an empty body draws an error that says so.
+    &turns[start.unwrap_or(turns.len())..]
 }
 
 impl Llm for Claude {
@@ -712,5 +881,96 @@ mod tests {
     async fn an_error_event_surfaces_rather_than_reading_as_the_end() {
         let items = read(&["data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n"]).await;
         assert!(matches!(items.first(), Some(Err(LlmError::Malformed(_)))), "{items:?}");
+    }
+
+    /// A caller turn and the answer to it, sized so that a budget can be written in
+    /// whole exchanges rather than in bytes nobody can read.
+    fn exchange(bytes: usize) -> [Turn; 2] {
+        [Turn::Caller("c".repeat(bytes)), Turn::Agent("a".repeat(bytes))]
+    }
+
+    /// What `recent` would cost to send, by the same estimate it trims with.
+    fn cost(turns: &[Turn]) -> usize {
+        turns.iter().flat_map(Turn::messages).map(|m| estimated_tokens(&m)).sum()
+    }
+
+    #[test]
+    fn a_conversation_that_fits_is_sent_whole() {
+        let turns: Vec<Turn> = (0..4).flat_map(|_| exchange(300)).collect();
+        assert_eq!(recent(&turns, 100_000), turns.as_slice());
+    }
+
+    #[test]
+    fn the_oldest_turns_are_the_ones_dropped() {
+        let turns: Vec<Turn> = (0..8).flat_map(|_| exchange(300)).collect();
+        let budget = cost(&turns) / 2;
+        let kept = recent(&turns, budget);
+
+        assert!(cost(kept) <= budget, "kept {} for a budget of {budget}", cost(kept));
+        assert!(!kept.is_empty() && kept.len() < turns.len(), "kept {} of {}", kept.len(), turns.len());
+        assert_eq!(kept.last(), turns.last(), "the newest turn is the one that must survive");
+    }
+
+    /// The cut is what makes eviction legal at all: the API refuses a conversation that
+    /// opens on an assistant message, so a budget that happens to land mid-exchange
+    /// must fall back to the caller turn before it rather than cutting where it likes.
+    #[test]
+    fn a_trimmed_conversation_still_opens_with_the_caller() {
+        let turns: Vec<Turn> = (0..8).flat_map(|_| exchange(300)).collect();
+
+        for budget in 1..cost(&turns) {
+            let opening = recent(&turns, budget).first().map(Turn::messages);
+            assert!(
+                opening.is_some_and(|messages| begins_a_conversation(&messages)),
+                "a budget of {budget} cut onto a turn no request can open with"
+            );
+        }
+    }
+
+    /// One turn too big for the whole window is a loud API error about that turn, not a
+    /// silently empty conversation that fails for a reason nobody can act on.
+    #[test]
+    fn a_turn_larger_than_the_window_is_still_sent() {
+        let turns = exchange(100_000);
+        assert_eq!(recent(&turns, 10), turns.as_slice());
+    }
+
+    /// The one field the whole budget rests on, read off a description shaped like the
+    /// API's own answer.
+    #[test]
+    fn a_described_model_says_how_much_it_holds() {
+        let described = r#"{"type":"model","id":"claude-opus-4-5","max_input_tokens":200000}"#;
+        assert_eq!(window_described_in(described, "claude-opus-4-5").unwrap(), 200_000);
+    }
+
+    /// A renamed or moved field must be loud here rather than at the next startup, which
+    /// is the whole reason this is a function and not a step inside the request.
+    #[test]
+    fn a_description_without_the_field_is_an_error_naming_the_model() {
+        let described = r#"{"type":"model","id":"claude-opus-4-5","max_tokens":64000}"#;
+        let read = window_described_in(described, "claude-opus-4-5");
+        assert!(
+            matches!(&read, Err(LlmError::Malformed(explanation)) if explanation.contains("claude-opus-4-5")),
+            "{read:?}"
+        );
+    }
+
+    #[test]
+    fn a_description_that_is_not_json_is_an_error() {
+        let read = window_described_in("<html>gateway timeout</html>", "claude-opus-4-5");
+        assert!(matches!(read, Err(LlmError::Malformed(_))), "{read:?}");
+    }
+
+    /// The ticket's own bar: a conversation long past where the window used to run out
+    /// is cut to something the API will accept, instead of failing the turn outright.
+    #[test]
+    fn a_call_long_enough_to_have_overflowed_is_cut_down_to_fit() {
+        let turns: Vec<Turn> = (0..2_000).flat_map(|_| exchange(400)).collect();
+        let budget = 200_000 - MAX_TOKENS as usize;
+        assert!(cost(&turns) > 200_000, "the fixture has to overflow to prove anything");
+
+        let kept = recent(&turns, budget);
+        assert!(cost(kept) <= budget, "sent {} against a budget of {budget}", cost(kept));
+        assert_eq!(kept.last(), turns.last());
     }
 }
