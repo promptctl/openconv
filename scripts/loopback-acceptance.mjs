@@ -28,7 +28,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { Caller, Checks, SPOKEN, millis, recordSpeech, sounding } from "./lib/caller.mjs";
-import { Rooms, joinToken } from "./lib/livekit.mjs";
+import { Rooms, joinToken, livekitCredentials } from "./lib/livekit.mjs";
 
 // `SPOKEN` is imported rather than repeated: a tone would survive encodings that speech
 // does not — Opus, voice activity detection and noise suppression all treat a steady sine
@@ -127,15 +127,16 @@ function audible(published) {
   );
 }
 
-/** The one boundary: everything below runs on values known to exist. */
+/**
+ * The one boundary: everything below runs on values known to exist.
+ *
+ * The credential check is `livekitCredentials`, shared with `livekit-smoke` — one fact, one
+ * home. The URL is this script's own: it dials as a client, so it defaults to `wss://` and
+ * strips a trailing slash, neither of which the room-service-only sibling wants.
+ */
 function readConfig(env, argv) {
-  const missing = ["LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"].filter((name) => !env[name]);
-  if (missing.length > 0) {
-    throw new Error(`missing ${missing.join(" and ")} — read them from Vault at secret/livekit`);
-  }
   return {
-    apiKey: env.LIVEKIT_API_KEY,
-    apiSecret: env.LIVEKIT_API_SECRET,
+    ...livekitCredentials(env),
     livekitUrl: (argv[2] ?? "wss://livekit.sanctuary.gdn").replace(/\/$/, ""),
   };
 }

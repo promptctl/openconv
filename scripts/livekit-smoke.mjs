@@ -12,17 +12,17 @@
 // A failure here separates two things that otherwise look alike from the app: the
 // SFU rejecting our signature, and the SFU not being reachable at all.
 
-import { Rooms } from "./lib/livekit.mjs";
+import { Rooms, livekitCredentials } from "./lib/livekit.mjs";
 
-// The one boundary: everything below runs on values that are known to exist.
+// The one boundary: everything below runs on values that are known to exist. The credential
+// half is `livekitCredentials`, shared with `loopback-acceptance` because it is one fact —
+// which variables, and where they live. The URL default is not shared: this script talks to
+// the room service and defaults to `https://`, where a script that also dials as a client
+// defaults to `wss://`, and a flag to pick between them would be a mode where there is
+// currently just a different script. [LAW:no-mode-explosion]
 function readConfig(env, argv) {
-  const missing = ["LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"].filter((name) => !env[name]);
-  if (missing.length > 0) {
-    throw new Error(`missing ${missing.join(" and ")} — read them from Vault at secret/livekit`);
-  }
   return {
-    apiKey: env.LIVEKIT_API_KEY,
-    apiSecret: env.LIVEKIT_API_SECRET,
+    ...livekitCredentials(env),
     url: argv[2] ?? "https://livekit.sanctuary.gdn",
   };
 }

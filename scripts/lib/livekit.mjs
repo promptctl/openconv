@@ -40,6 +40,36 @@ const b64url = (buf) =>
 /// script's stdout is worthless by the time anyone reads the log.
 const TTL_SECONDS = 600;
 
+/// Far outside a healthy Twirp round-trip and far inside a reader's patience. Every other
+/// wait in these scripts is bounded — `SETUP_MS`, `SETTLE_MS`, `rejectAfter` — and an
+/// unbounded one here is the worst place for it: `loopback-acceptance` calls `CreateRoom`
+/// just before its `try` and `DeleteRoom` inside its `finally`, so an SFU that accepts the
+/// connection and never answers hangs the run either before the cleanup is armed or inside
+/// it, past the point anything is printed. A probe that hangs silently is worse than one
+/// that fails. [LAW:no-silent-failure]
+const REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * The LiveKit credentials, or a refusal naming what is missing and where to get it.
+ *
+ * One fact — these two variables must exist, and they live in Vault at secret/livekit —
+ * held once. `livekit-smoke` and `loopback-acceptance` both need exactly it and had
+ * separate copies of the check.
+ *
+ * `token-endpoint-acceptance` deliberately does NOT use this. Its check covers
+ * `OPENCONV_API_KEY` as well and reports every missing variable in a single message, so
+ * routing the LiveKit half through here would split that into two throws — an operator
+ * missing both would learn about one, fix it, rerun, and learn about the other. Same
+ * shape, different fact, and the diagnostic is the reason the difference is worth keeping.
+ */
+export function livekitCredentials(env) {
+  const missing = ["LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"].filter((name) => !env[name]);
+  if (missing.length > 0) {
+    throw new Error(`missing ${missing.join(" and ")} — read them from Vault at secret/livekit`);
+  }
+  return { apiKey: env.LIVEKIT_API_KEY, apiSecret: env.LIVEKIT_API_SECRET };
+}
+
 /**
  * Signs one token for LiveKit.
  *
@@ -127,6 +157,8 @@ export class Rooms {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      // An SFU that accepts the connection and then says nothing is otherwise indefinite.
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
 
     const text = await response.text();
