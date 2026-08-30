@@ -286,8 +286,8 @@ export class Caller {
    * [LAW:one-source-of-truth] `user_transcription_event` is spelled here and nowhere
    * else, so a rename on the Rust side has one place to break. Handing back the payload
    * rather than one field of it means a script asserting on some other part of it needs
-   * nothing new here. `vad-`, `tools-`, and `inbound-text-acceptance` still reach through
-   * `controlEvents` themselves and are the remaining copies.
+   * nothing new here. `inbound-text-acceptance` also selects transcript events, but only
+   * on `type` — it never reaches into the payload, so this key genuinely has one owner.
    *
    * Unparsed, unlike `transcripts()`: whether a transcript carries an `event_id` is a
    * claim `stt-acceptance` exists to make, and refusing here would crash the script that
@@ -307,6 +307,10 @@ export class Caller {
    *
    * Published before the words are synthesized, so this answers "did it reply" and never
    * "was the reply audible" — that claim is `heard`, and the two fail separately.
+   *
+   * [LAW:one-source-of-truth] `tools-` and `inbound-text-acceptance` still spell
+   * `agent_response_event.agent_response` out themselves and are the remaining copies of
+   * this read.
    */
   replies() {
     return this.events("agent_response").map((event) =>
@@ -317,8 +321,14 @@ export class Caller {
   /**
    * Polls until `predicate` holds, and says so when it never does.
    *
-   * Returns a boolean rather than throwing because every caller is a check: a script
-   * reports "the agent never answered" as a failed assertion, not as a stack trace.
+   * The thing not happening returns `false` rather than throwing, because every caller is
+   * a check: a script reports "the agent never answered" as a failed assertion, not as a
+   * stack trace.
+   *
+   * A predicate that meets a malformed control event still throws, and is meant to. That
+   * is a different fact with a different cause — openconv published something the
+   * protocol does not allow, rather than the agent staying quiet — and reporting it as a
+   * failed check would send the next reader to the wrong end of the system.
    */
   async waitFor(predicate, ms, what) {
     const until = Date.now() + ms;

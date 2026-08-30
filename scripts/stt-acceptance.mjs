@@ -60,16 +60,36 @@ const spoken = await mic.say(recording);
 checks.record("finished speaking", true, `${spoken.toFixed(2)}s of audio`);
 
 // ---- did it hear? ----
+//
+// The wait is for the words to stop arriving, not to start. The endpointer decides where
+// an utterance stops, and one sentence spoken with a breath in it settles as two finals a
+// moment apart — this deployment has returned ["Hello", "Bye."] for a single spoken line.
+// Reading on the first one would score half a sentence and blame speech-to-text for it.
+//
+// Quiescence rather than an arrival event because there is no arrival event: nothing in
+// the protocol announces that a segment was the last one, so holding still is the only
+// signal there is, and it is named here rather than approximated with a sleep.
+const QUIET_MS = 1500;
+let counted = 0;
+let lastArrivedAt = Date.now();
+const stoppedArriving = () => {
+  const finals = caller.transcriptEvents().length;
+  if (finals !== counted) {
+    counted = finals;
+    lastArrivedAt = Date.now();
+  }
+  return finals > 0 && Date.now() - lastArrivedAt >= QUIET_MS;
+};
+
 checks.record(
   "a user_transcript event arrived",
-  await caller.waitFor(() => caller.transcriptEvents().length > 0, 45_000, "a final transcript"),
+  await caller.waitFor(stoppedArriving, 45_000, "the caller's words to stop arriving"),
   `${caller.events("tentative_user_transcript").length} tentative, ` +
     `${caller.transcriptEvents().length} final`,
 );
 
-// Every settled transcript, not the last one: the endpointer decides where an utterance
-// stops, and one sentence spoken with a breath in it settles as two. Both halves were
-// heard, so a claim about what reached speech-to-text has to count both — and with no
+// Every settled transcript joined, not the last one: both halves of a split utterance
+// were heard, so a claim about what reached speech-to-text has to count both. With no
 // transcripts at all this is "", which the accuracy below reports as zero.
 const heard = caller.transcripts().join(" ");
 console.log(`  agent heard: ${JSON.stringify(caller.transcripts())}`);
