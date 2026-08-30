@@ -100,6 +100,122 @@ export function sounding(samples, sampleRate) {
 }
 
 /**
+ * What the peer connection says about a call: the path the media took, and what arrived
+ * over it.
+ *
+ * A third account of the same track, independent of the two that already exist. `sounding`
+ * reports what this client's decoder produced; `reportedSpeaking` reports what the SFU
+ * thought of the publisher. Neither can say *why* a track arrived silent, and the three
+ * candidate causes leave different marks here: a network that dropped the audio raises
+ * `packetsLost`, a jitter buffer that gave up and filled with silence raises
+ * `concealedSamples`, and a connection that carried every packet intact and still decoded
+ * to nothing leaves both at zero — which puts the silence upstream of this client
+ * entirely. Those are three different bugs and `heard.peak` reads the same for all of them.
+ *
+ * A parser rather than a reader. `getRtcStats` returns one flat array of variants in which
+ * every field is optional and every 64-bit counter is a string, so a caller left holding it
+ * re-derives which entry is the selected pair and how to compare "0" against zero.
+ *
+ * [LAW:parse-dont-validate] Stats carrying no transport are refused rather than summarized.
+ * A reading built from them would report zero loss and zero concealment — the exact shape
+ * of a flawless call — when what happened is that nothing was measured. That is this
+ * module's own documented failure mode, an answer-shaped void, and the boundary is the one
+ * place it can still be told from the healthy run it imitates.
+ */
+export function delivery(stats) {
+  // Both arrays, concatenated rather than chosen between. Observed on @livekit/rtc-node
+  // 0.13: a client that only subscribes still reports its inbound audio under
+  // `publisherStats`, with `subscriberStats` empty — so a reading that picked the array by
+  // the client's role would go blind on exactly the listener whose loss is being measured.
+  // Merging asks no question about which peer connection produced an entry, because
+  // nothing below depends on the answer. [LAW:dataflow-not-control-flow]
+  const entries = [...(stats.publisherStats ?? []), ...(stats.subscriberStats ?? [])];
+  const of = (kind) => entries.filter((entry) => entry[kind]).map((entry) => entry[kind]);
+
+  // Candidates are referenced by id from the pair that selected them, so they are indexed
+  // before anything looks one up.
+  const candidates = new Map(
+    [...of("localCandidate"), ...of("remoteCandidate")].map((entry) => [
+      entry.rtc.id,
+      entry.candidate,
+    ]),
+  );
+  const pairs = new Map(of("candidatePair").map((entry) => [entry.rtc.id, entry.candidatePair]));
+
+  const transports = of("transport").map((entry) => {
+    const transport = entry.transport;
+    // The connection's own answer, not one re-derived by scanning for a nominated pair in
+    // a succeeded state. Two ways to name the selected pair is two ways to disagree about
+    // which one carried the audio. [LAW:one-source-of-truth]
+    const pair = pairs.get(transport.selectedCandidatePairId);
+
+    return {
+      id: entry.rtc.id,
+      iceState: transport.iceState,
+      dtlsState: transport.dtlsState,
+      // How many times ICE changed its mind. A pair that was re-selected mid-call is a
+      // path that moved under the audio, which no single-sample reading of the pair shows.
+      pairChanges: transport.selectedCandidatePairChanges,
+      // Null where ICE has not settled on a pair — a real state of a connecting transport,
+      // and deliberately not collapsed into a pair-shaped default that would name a path
+      // the media never took.
+      selected: pair
+        ? {
+            protocol: candidates.get(pair.localCandidateId)?.protocol,
+            rttMs: pair.currentRoundTripTime * 1000,
+            bytesReceived: Number(pair.bytesReceived),
+            local: endpoint(candidates.get(pair.localCandidateId)),
+            remote: endpoint(candidates.get(pair.remoteCandidateId)),
+          }
+        : null,
+    };
+  });
+
+  if (transports.length === 0) {
+    throw new Error(
+      "these RTC stats hold no transport — refusing to report a call that was never " +
+        "measured as one with no loss, since the two are the same numbers",
+    );
+  }
+
+  return {
+    transports,
+    inboundAudio: of("inboundRtp")
+      .filter((entry) => entry.stream.kind === "audio")
+      .map((entry) => ({
+        ssrc: entry.stream.ssrc,
+        packetsReceived: Number(entry.received.packetsReceived),
+        packetsLost: Number(entry.received.packetsLost),
+        packetsDiscarded: Number(entry.inbound.packetsDiscarded),
+        jitterMs: entry.received.jitter * 1000,
+        // What the jitter buffer invented when the network did not deliver in time. This
+        // is what "the frames kept arriving on the 10 ms cadence, they just carried
+        // silence" looks like from inside the decoder.
+        concealedSamples: Number(entry.inbound.concealedSamples),
+        silentConcealedSamples: Number(entry.inbound.silentConcealedSamples),
+        concealmentEvents: Number(entry.inbound.concealmentEvents),
+        samplesReceived: Number(entry.inbound.totalSamplesReceived),
+        // The decoder's own loudness, on the same scale the agent logs as `loudest`:
+        // 6.1e-5 is two least significant bits of an i16, i.e. digital silence.
+        audioLevel: entry.inbound.audioLevel,
+      })),
+  };
+}
+
+/// One end of the selected pair, flattened to what a reader of a transport question needs.
+/// `tcpType` is absent on every UDP candidate, so its presence is itself the answer to
+/// whether this connection fell back to TCP.
+function endpoint(candidate) {
+  return {
+    address: candidate?.address,
+    port: candidate?.port,
+    type: candidate?.candidateType,
+    tcpType: candidate?.tcpType,
+    relayProtocol: candidate?.relayProtocol,
+  };
+}
+
+/**
  * A 16-bit mono PCM recording, which is the only thing that can be spoken into a room.
  *
  * A parser rather than a check: a `Recording` cannot be built out of a stereo file, a
@@ -300,6 +416,17 @@ export class Caller {
    */
   subscribed() {
     return this.remoteTrack !== null;
+  }
+
+  /**
+   * What this client's peer connection says about the call, parsed.
+   *
+   * Must be asked while still connected: `leave()` tears the peer connection down, and
+   * the stats go with it. The fetch lives here rather than in each script so that the one
+   * incantation — get the stats, render them out of protobuf — has a single home.
+   */
+  async delivered() {
+    return delivery((await this.room.getRtcStats()).toJson());
   }
 
   /** The remote participants currently in the room. */
