@@ -12,26 +12,7 @@
 // from the endpoint's own documentation, so this fails when openconv stops satisfying
 // its caller — not when it stops matching what we believed its caller wanted.
 
-import { createHmac } from "node:crypto";
-
-const b64url = (buf) =>
-  Buffer.from(buf).toString("base64").replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
-
-function mintRoomListToken(apiKey, apiSecret) {
-  const now = Math.floor(Date.now() / 1000);
-  const header = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-  const payload = b64url(
-    JSON.stringify({
-      iss: apiKey,
-      sub: "openconv-acceptance",
-      nbf: now,
-      exp: now + 600,
-      video: { roomList: true },
-    }),
-  );
-  const signature = b64url(createHmac("sha256", apiSecret).update(`${header}.${payload}`).digest());
-  return `${header}.${payload}.${signature}`;
-}
+import { Rooms } from "./lib/livekit.mjs";
 
 // The one boundary: everything below runs on values known to exist.
 function readConfig(env, argv) {
@@ -102,18 +83,12 @@ check("token is signed by the configured key", claims.iss === config.apiKey, cla
 check("token outlives a long call", claims.exp - claims.nbf >= 5 * 3600, `${claims.exp - claims.nbf}s`);
 
 // ---- the room exists on the SFU, because auto_create is off and joining would fail ----
-const roomsResponse = await fetch(`${config.livekit}/twirp/livekit.RoomService/ListRooms`, {
-  method: "POST",
-  headers: {
-    Authorization: `Bearer ${mintRoomListToken(config.apiKey, config.apiSecret)}`,
-    "Content-Type": "application/json",
-  },
-  body: "{}",
+const roomService = new Rooms({
+  url: config.livekit,
+  apiKey: config.apiKey,
+  apiSecret: config.apiSecret,
 });
-if (!roomsResponse.ok) {
-  throw new Error(`ListRooms failed: HTTP ${roomsResponse.status} ${await roomsResponse.text()}`);
-}
-const rooms = (await roomsResponse.json()).rooms ?? [];
+const { rooms = [] } = await roomService.call("ListRooms", {});
 const room = rooms.find((candidate) => candidate.name === conversationId);
 
 check("the room was actually created on the SFU", Boolean(room), `${rooms.length} room(s) open`);
