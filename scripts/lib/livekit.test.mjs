@@ -124,3 +124,84 @@ test("a trailing slash is dropped, so a method path never doubles it", () => {
   // `https://host//twirp/...`, which some proxies serve and some 404.
   assert.equal(new Rooms({ url: "wss://sfu.example/", apiKey: KEY, apiSecret: SECRET }).url, "https://sfu.example");
 });
+
+/// Replaces `globalThis.fetch` and records what it was handed. Every test that installs one
+/// restores it in a `finally`: a stub that survived a failing assertion would make every
+/// later test in the file measure the stub instead of the module, and the suite would go on
+/// reporting confidently about nothing.
+const stubFetch = (respond) => {
+  const original = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return respond();
+  };
+  return { calls, restore: () => (globalThis.fetch = original) };
+};
+
+const sfu = () => new Rooms({ url: "wss://sfu.example", apiKey: KEY, apiSecret: SECRET });
+
+test("call() hands back the parsed body of a 2xx", async () => {
+  const stub = stubFetch(() => ({ ok: true, status: 200, text: async () => '{"rooms":[{"name":"probe_1"}]}' }));
+  try {
+    // The shape `livekit-smoke` destructures: `const { rooms = [] } = await ...call("ListRooms", {})`.
+    assert.deepEqual(await sfu().call("ListRooms", {}), { rooms: [{ name: "probe_1" }] });
+  } finally {
+    stub.restore();
+  }
+});
+
+test("call() addresses the Twirp method and authorizes it with a room-service token", async () => {
+  const stub = stubFetch(() => ({ ok: true, status: 200, text: async () => "{}" }));
+  try {
+    await sfu().call("DeleteRoom", { room: "probe_1" });
+  } finally {
+    stub.restore();
+  }
+
+  assert.equal(stub.calls.length, 1);
+  const { url, init } = stub.calls[0];
+  assert.equal(url, "https://sfu.example/twirp/livekit.RoomService/DeleteRoom");
+  assert.equal(init.method, "POST");
+  assert.equal(init.headers["Content-Type"], "application/json");
+  assert.equal(init.body, JSON.stringify({ room: "probe_1" }));
+
+  // The token is the one `sign()` builds, not a second rendering of it: same issuer, the
+  // operator subject, and only the grants the room service needs.
+  const { payload, signature, signingInput } = parse(init.headers.Authorization.replace(/^Bearer /, ""));
+  assert.equal(payload.iss, KEY);
+  assert.equal(payload.sub, "openconv-scripts");
+  assert.deepEqual(payload.video, { roomCreate: true, roomList: true });
+  assert.equal(signature, createHmac("sha256", SECRET).update(signingInput).digest("base64url"));
+});
+
+test("call() throws on a non-2xx, naming the method, the origin, the status and the reason", async () => {
+  let bodyRead = false;
+  const stub = stubFetch(() => ({
+    ok: false,
+    status: 401,
+    text: async () => {
+      bodyRead = true;
+      return "invalid API key";
+    },
+  }));
+
+  try {
+    await assert.rejects(() => sfu().call("ListRooms", {}), (error) => {
+      // All four, because this message is the whole diagnostic three scripts get: an SFU
+      // that refused the signature and an SFU that is not there must not read alike.
+      assert.match(error.message, /ListRooms/);
+      assert.match(error.message, /https:\/\/sfu\.example/);
+      assert.match(error.message, /401/);
+      assert.match(error.message, /invalid API key/);
+      return true;
+    });
+  } finally {
+    stub.restore();
+  }
+
+  // The ordering that message depends on. An implementation that branched on `.ok` before
+  // awaiting `text()` would still throw, still name the status, and have no reason in it —
+  // a regression that looks like a working error path right up until you need it.
+  assert.ok(bodyRead, "the body is read before the status is judged");
+});
