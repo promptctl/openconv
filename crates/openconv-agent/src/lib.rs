@@ -146,6 +146,21 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
     // ordering stays in one place.
     let (noticed, mut listening) = mpsc::channel::<Noticed>(64);
 
+    // Ends the listener when this conversation does.
+    //
+    // Dropping the receiver above is not enough to end it: a listener parked on its audio
+    // stream is waiting on frames, not on a send, and that stream never finishes by itself
+    // — see [`listen::listen`]. Left unsaid, every call leaves a task, a native audio sink
+    // and a handle on the caller's track behind for the life of the process.
+    //
+    // A drop guard rather than a `cancel()` at the bottom of this function: every publish
+    // below returns early on failure, and cleanup that only runs on the happy path is
+    // cleanup that eventually does not run.
+    //
+    // [LAW:no-ambient-temporal-coupling] the listener's lifetime has an owner: this scope.
+    let hung_up = CancellationToken::new();
+    let _ends_with_this_conversation = hung_up.clone().drop_guard();
+
     // The agent's own turn, reporting back from the task it runs in.
     let (from_turn, mut turn_events) = mpsc::channel::<FromTurn>(4);
 
@@ -292,6 +307,13 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
             // loop — and with it the announcement, the disconnect handling, and every
             // other conversation's audio pump sharing the runtime.
             RoomEvent::TrackSubscribed { track: RemoteTrack::Audio(track), participant, .. } => {
+                // Attached before anything else in this arm, and before the log line that
+                // announces it, because this call is where the agent stops being deaf:
+                // everything published earlier is discarded by libwebrtc and nothing
+                // buffers it. Attaching inside the spawned task left that moment to the
+                // scheduler, and the caller's opening words in the gap.
+                let ear = listen::attach(&track);
+
                 tracing::info!(
                     conversation = %assignment.conversation_id,
                     participant = %participant.identity(),
@@ -304,10 +326,11 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                 // answers — which from the caller's side is indistinguishable from a
                 // dead line, with nothing in the logs to say otherwise.
                 tokio::spawn(listen::listen(
-                    track,
+                    ear,
                     SpeechDetector::new()?,
                     services.transcriber.clone(),
                     noticed.clone(),
+                    hung_up.clone(),
                 ));
             }
 

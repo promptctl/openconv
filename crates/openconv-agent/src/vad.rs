@@ -88,7 +88,7 @@ impl Score {
     }
 
     /// The louder of two scores.
-    fn max(self, other: Self) -> Self {
+    pub fn max(self, other: Self) -> Self {
         match self.0 >= other.0 {
             true => self,
             false => other,
