@@ -354,7 +354,15 @@ export class Caller {
       track,
       new TrackPublishOptions({ source: TrackSource.SOURCE_MICROPHONE }),
     );
-    await Promise.race([subscribed, rejectAfter(20_000, "the agent to subscribe to the caller")]);
+    // Named at the level of what is actually awaited — `LocalTrackSubscribed`, i.e. some
+    // remote participant — rather than "the agent". Who that participant turns out to be is
+    // the caller's topology, not this method's: `loopback-acceptance` publishes into a room
+    // with two listeners and no agent at all, and a message naming the agent would send the
+    // one probe built to stop misattribution off blaming a participant that does not exist.
+    await Promise.race([
+      subscribed,
+      rejectAfter(20_000, "a remote participant to subscribe to the caller's microphone"),
+    ]);
 
     this.mic = new Microphone(source, sampleRate);
     return this.mic;
