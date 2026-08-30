@@ -14,7 +14,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Caller, millis, readRecording, sounding } from "./caller.mjs";
+import { Caller, delivery, millis, readRecording, sounding } from "./caller.mjs";
 
 /// A caller that has "received" these events, with no room behind it. The accessors read
 /// `controlEvents` and nothing else, so this is the whole of their input.
@@ -265,4 +265,152 @@ test("a recording that declares no sample rate is refused at the parse", () => {
   assert.equal(good.sampleRate, 48_000);
   assert.equal(good.samples.length, 4);
   assert.equal(sounding(good.samples, good.sampleRate).peak, 19838);
+});
+
+/// Real `getRtcStats().toJson()` output, captured from a listener on a call to
+/// livekit.sanctuary.gdn and trimmed to the entries `delivery` reads. Transcribed rather
+/// than invented because the shape is the whole difficulty: 64-bit counters arrive as
+/// strings, proto2 optionals vanish when unset, and every entry is a one-key variant. A
+/// hand-written approximation of that would test the approximation.
+const stats = ({ candidate = {}, inbound = {}, transport = {}, arrival = "publisherStats" } = {}) => {
+  const entries = [
+    {
+      transport: {
+        rtc: { id: "T01", timestamp: "1788132842843992" },
+        transport: {
+          iceState: "ICE_TRANSPORT_CONNECTED",
+          dtlsState: "DTLS_TRANSPORT_CONNECTED",
+          selectedCandidatePairId: "CP+xEdxmt3_zNHUDiTQ",
+          selectedCandidatePairChanges: 1,
+          ...transport,
+        },
+      },
+    },
+    {
+      candidatePair: {
+        rtc: { id: "CP+xEdxmt3_zNHUDiTQ", timestamp: "1788132842843992" },
+        candidatePair: {
+          transportId: "T01",
+          localCandidateId: "I+xEdxmt3",
+          remoteCandidateId: "IzNHUDiTQ",
+          state: "PAIR_SUCCEEDED",
+          nominated: true,
+          bytesReceived: "2938",
+          currentRoundTripTime: 0.027,
+        },
+      },
+    },
+    {
+      localCandidate: {
+        rtc: { id: "I+xEdxmt3", timestamp: "1788132842843992" },
+        candidate: {
+          address: "192.168.7.189",
+          port: 54_647,
+          protocol: "udp",
+          candidateType: "HOST",
+          ...candidate,
+        },
+      },
+    },
+    {
+      remoteCandidate: {
+        rtc: { id: "IzNHUDiTQ", timestamp: "1788132842843992" },
+        candidate: { address: "192.168.7.208", port: 7882, protocol: "udp", candidateType: "HOST" },
+      },
+    },
+    {
+      inboundRtp: {
+        rtc: { id: "IT01A152043745", timestamp: "1788132842843992" },
+        stream: { ssrc: 152_043_745, kind: "audio", transportId: "T01" },
+        received: { packetsReceived: "16", packetsLost: "0", jitter: 0.011 },
+        inbound: {
+          packetsDiscarded: "7",
+          concealedSamples: "0",
+          silentConcealedSamples: "0",
+          concealmentEvents: "0",
+          totalSamplesReceived: "95520",
+          audioLevel: 6.103701895199438e-5,
+          ...inbound,
+        },
+      },
+    },
+  ];
+  return { publisherStats: [], subscriberStats: [], [arrival]: entries };
+};
+
+test("delivery names the path the media actually took", () => {
+  const [transport] = delivery(stats()).transports;
+
+  // The reading openconv-openconv-bwy.28 was filed to get: UDP on 7882, not a fallback to
+  // ICE/TCP on 7881. The whole point is that it is per-run, so it is read from the pair
+  // the transport itself selected rather than from whichever pair happens to look best.
+  assert.equal(transport.selected.protocol, "udp");
+  assert.equal(transport.selected.remote.port, 7882);
+  assert.equal(transport.selected.remote.address, "192.168.7.208");
+  assert.equal(transport.selected.local.type, "HOST");
+  assert.equal(transport.pairChanges, 1);
+  assert.equal(transport.iceState, "ICE_TRANSPORT_CONNECTED");
+
+  // Seconds on the wire, milliseconds in the reading, so a reader comparing this against
+  // the ICMP figures on the ticket is not converting in their head.
+  assert.equal(Math.round(transport.selected.rttMs), 27);
+});
+
+test("a TCP fallback is visible as one, which is the question being asked", () => {
+  // The hypothesis .28 records: TCP head-of-line blocking under a jittery link. A run that
+  // took that path has to be distinguishable from one that did not, or the correlation the
+  // probe exists to draw cannot be drawn.
+  const fell = delivery(
+    stats({ candidate: { protocol: "tcp", port: 7881, tcpType: "TCP_CANDIDATE_TYPE_PASSIVE" } }),
+  );
+  assert.equal(fell.transports[0].selected.protocol, "tcp");
+  assert.equal(fell.transports[0].selected.local.tcpType, "TCP_CANDIDATE_TYPE_PASSIVE");
+
+  // And absent on the UDP run rather than reported as some falsy stand-in, so presence
+  // alone answers the question.
+  assert.equal(delivery(stats()).transports[0].selected.local.tcpType, undefined);
+});
+
+test("counters are numbers, not the strings the wire carries", () => {
+  // 64-bit fields arrive from protobuf as strings, where "0" is truthy and "10" < "9".
+  // A comparison against a threshold would silently do the wrong thing on every one.
+  const [audio] = delivery(
+    stats({ inbound: { concealedSamples: "48000", concealmentEvents: "12" } }),
+  ).inboundAudio;
+
+  assert.strictEqual(audio.concealedSamples, 48_000);
+  assert.strictEqual(audio.concealmentEvents, 12);
+  assert.strictEqual(audio.packetsReceived, 16);
+  assert.strictEqual(audio.packetsLost, 0);
+  assert.strictEqual(audio.packetsDiscarded, 7);
+  assert.strictEqual(audio.samplesReceived, 95_520);
+
+  // The signature this whole line of investigation keeps finding: a track that arrived
+  // complete and decoded to one or two least significant bits of an i16.
+  assert.ok(audio.audioLevel < 1e-4);
+});
+
+test("stats with no transport are refused rather than summarized", () => {
+  // The failure mode this parser exists to prevent. Summarizing an unmeasured call yields
+  // zero loss and zero concealment — indistinguishable, in the report, from a flawless one.
+  assert.throws(
+    () => delivery({ publisherStats: [], subscriberStats: [] }),
+    (error) => error.message.includes("no transport"),
+    "a reading with no connection behind it must not be reported as a clean one",
+  );
+});
+
+test("a transport that has not settled on a pair says so", () => {
+  // A real state of a connecting transport, and not one to fill in with a pair-shaped
+  // default that would name a path the media never took.
+  const unsettled = delivery(stats({ transport: { selectedCandidatePairId: "" } }));
+  assert.equal(unsettled.transports[0].selected, null);
+});
+
+test("stats are read wherever rtc-node files them", () => {
+  // Observed on @livekit/rtc-node 0.13: a client that only subscribes reports its inbound
+  // audio under `publisherStats` and leaves `subscriberStats` empty. Reading one array by
+  // the client's role would go blind on exactly the listener being measured, so both are
+  // read and neither is chosen between.
+  assert.deepEqual(delivery(stats({ arrival: "subscriberStats" })), delivery(stats()));
 });

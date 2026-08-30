@@ -21,6 +21,13 @@
 // the loss is per-subscriber. `reportedSpeaking` splits it again, from above, since the
 // SFU forms its own opinion of how loud the publisher was from the RTP audio-level header
 // rather than from anything either listener decoded.
+//
+// And each client's own peer connection is asked what it saw, which is the reading that
+// says *why*. Decoded audio cannot tell a path that dropped the packets from one that
+// never carried them, and those are different bugs in different systems: the first is the
+// network, the second is whatever was supposed to send. `path:` names the route ICE
+// actually selected and `rtp:` counts what came over it, so a run states its own transport
+// conditions instead of leaving them to be inferred from a symptom.
 
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -175,6 +182,9 @@ const at = async (identity) =>
 
 const clients = [];
 let listeners = [];
+/// Hoisted beside `listeners` and for the same reason: the report below runs after the
+/// cleanup block, outside the scope the clients are created in.
+let publisher = null;
 
 // The last statement before the `try`, deliberately: from here the room exists and is this
 // script's to clean up, and everything that can throw — three connections with their own
@@ -189,8 +199,8 @@ try {
   // frame, and a publisher alone in a room would wait for a subscriber who never arrives.
   listeners = await Promise.all(LISTENERS.map(at));
   clients.push(...listeners);
-  const speaker = await at(SPEAKER);
-  clients.push(speaker);
+  publisher = await at(SPEAKER);
+  clients.push(publisher);
 
   await required(listeners, (listener) => listener.roster().includes(SPEAKER), `${SPEAKER} to join`);
 
@@ -202,7 +212,7 @@ try {
   // `microphone()` resolves on the *first* remote subscription and this room has two. A
   // listener still subscribing while the lead-in plays loses the front of the utterance,
   // which is this probe's own symptom wearing the costume of the bug it hunts.
-  const mic = await speaker.microphone(recording.sampleRate);
+  const mic = await publisher.microphone(recording.sampleRate);
   await required(listeners, (listener) => listener.subscribed(), "a track to listen to");
   console.log(`  ${listeners.length}/${listeners.length} listeners subscribed before a word was spoken\n`);
 
@@ -215,6 +225,19 @@ try {
         "the whole utterance to arrive",
       ),
     ),
+  );
+
+  // Taken here rather than in the report below, because `leave()` tears the peer
+  // connection down and takes its stats with it. Stored per client and rendered later for
+  // the same reason `heard.error` is kept: a run whose stats could not be read must still
+  // print what it heard, since on a failing run that is the reason the run happened.
+  await Promise.all(
+    clients.map(async (client) => {
+      client.delivery = await client.delivered().then(
+        (reading) => ({ reading, error: null }),
+        (error) => ({ reading: null, error }),
+      );
+    }),
   );
 } finally {
   // Reported rather than swallowed: a client that could not leave is a finding about the
@@ -237,6 +260,70 @@ try {
   }
 }
 
+/**
+ * The path one end of the call chose, from the transport's own selected pair.
+ *
+ * The line openconv-openconv-bwy.28 was filed to get. Its hypothesis is a fallback to
+ * ICE/TCP on 7881 under a jittery link, and nothing in the audio can confirm or refute
+ * that — a run that took the TCP path and a run that did not produce the same silence.
+ * Printed on every run rather than only on failures, because the claim being tested is a
+ * correlation and a reading taken only when things break has nothing to correlate against.
+ */
+const pathLine = (transport) =>
+  transport.selected === null
+    ? `  path: ICE never settled on a pair (${transport.iceState})`
+    : `  path: ${transport.selected.protocol} ` +
+      `${transport.selected.local.address}:${transport.selected.local.port} -> ` +
+      `${transport.selected.remote.address}:${transport.selected.remote.port} ` +
+      `(${transport.selected.local.type}/${transport.selected.remote.type}, ` +
+      `rtt ${transport.selected.rttMs.toFixed(1)} ms, ` +
+      `${transport.pairChanges} pair change${transport.pairChanges === 1 ? "" : "s"})`;
+
+/**
+ * What arrived over that path, as the decoder counted it.
+ *
+ * Three causes of a silent track, separated: packets the network never delivered
+ * (`lost`), samples the jitter buffer invented to cover for them (`concealed`), and a
+ * stream that arrived whole and still decoded to nothing — which is both counters at zero
+ * beside a `level` of one least significant bit, and puts the silence upstream of this
+ * client altogether.
+ *
+ * Read `packets` first, and read the others only against a local `livekit-server --dev`
+ * run for scale. Measured over six clean local runs, a listener that received the whole
+ * utterance perfectly still reported ~214 packets with ~200 of them `discarded` and
+ * `concealed` anywhere from 0 to 2506 samples — so neither of those numbers is a fault on
+ * its own, and a reader who arrives at a failing run and seizes on "200 discarded" is
+ * reading the healthy baseline. The count that separates the two populations is `packets`
+ * itself: ~214 local and ~240 on a healthy deployed listener, against 0-23 on a failing
+ * one, with `lost` at zero on both sides of the split.
+ */
+const rtpLine = (audio) =>
+  `  rtp:  ${audio.packetsReceived} packets, ${audio.packetsLost} lost, ` +
+  `${audio.packetsDiscarded} discarded, jitter ${audio.jitterMs.toFixed(1)} ms, ` +
+  `concealed ${audio.concealedSamples} samples in ${audio.concealmentEvents} events, ` +
+  `level ${audio.audioLevel.toExponential(2)}`;
+
+/// A connection carrying no inbound audio stream at all, said out loud. Mapping an empty
+/// list prints nothing, and nothing is what a healthy publisher prints too — so silence
+/// here would read as "no inbound audio to report" on the one client whose inbound audio is
+/// the entire question. Observed on a real failing run before it was written down.
+const rtpLines = (reading) =>
+  reading.inboundAudio.length > 0
+    ? reading.inboundAudio.map(rtpLine)
+    : ["  rtp:  this connection reported no inbound audio stream"];
+
+/// Both arms print. A client whose stats could not be read says so on the same line the
+/// reading would have used, rather than leaving a gap a reader has to notice.
+const account = ({ reading, error }) =>
+  error === null
+    ? reading.transports.map(pathLine)
+    : [`  path: no account of this call — ${error.message}`];
+
+/// Split from `account` rather than selected inside it by a flag: the publisher subscribes
+/// to nothing, so its report is the path alone, and a listener's is the path and what came
+/// over it. Two callers composing two renderers, not one renderer asking who called it.
+const received = ({ reading, error }) => (error === null ? rtpLines(reading) : []);
+
 console.log();
 for (const listener of listeners) {
   const heard = listener.heard;
@@ -245,7 +332,15 @@ for (const listener of listeners) {
     `${who}: heard ${millis(heard.frames)} ms, of which ${millis(heard.audibleFrames)} ms audible, ` +
       `peak ${heard.peak}, SFU called the speaker ${listener.reportedSpeaking.has(SPEAKER) ? "loud" : "silent"}`,
   );
+  for (const line of [...account(listener.delivery), ...received(listener.delivery)]) {
+    console.log(line);
+  }
 }
+
+// The publisher's own path too: an utterance can be lost on the way *into* the SFU as
+// easily as on the way out, and the two are different bugs.
+console.log(`\n${SPEAKER}:`);
+for (const line of account(publisher.delivery)) console.log(line);
 console.log();
 
 for (const listener of listeners) {
