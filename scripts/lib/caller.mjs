@@ -35,6 +35,38 @@ const FRAMES_PER_SECOND = 100;
 const AUDIBLE = 1000;
 
 /**
+ * What a run of samples sounds like: how long it is, how much of it is sound rather than
+ * silence, and the loudest it ever gets.
+ *
+ * [LAW:one-source-of-truth] One reading, because the two questions it answers only mean
+ * something against each other — what a track delivered, and what the recording put on
+ * it. A subscriber that measured "audible" on a different threshold, or over windows of a
+ * different length, would report a healthy track as a lossy one and no assertion built on
+ * the pair could tell which side was wrong.
+ *
+ * Counted in 10 ms windows rather than over the whole run, so `audibleFrames` is a
+ * duration and not a verdict: a track that carried the first second of a four-second
+ * sentence is the symptom being chased here, and a peak taken across the whole thing
+ * cannot see it.
+ */
+export function sounding(samples, sampleRate) {
+  const perFrame = sampleRate / FRAMES_PER_SECOND;
+  const reading = { frames: 0, audibleFrames: 0, peak: 0 };
+
+  for (let at = 0; at < samples.length; at += perFrame) {
+    const end = Math.min(at + perFrame, samples.length);
+    let peak = 0;
+    for (let sample = at; sample < end; sample += 1) {
+      peak = Math.max(peak, Math.abs(samples[sample]));
+    }
+    reading.frames += 1;
+    reading.peak = Math.max(reading.peak, peak);
+    if (peak > AUDIBLE) reading.audibleFrames += 1;
+  }
+  return reading;
+}
+
+/**
  * A 16-bit mono PCM recording, which is the only thing that can be spoken into a room.
  *
  * A parser rather than a check: a `Recording` cannot be built out of a stereo file, a
@@ -120,9 +152,22 @@ export class Caller {
       throw new Error(`mint failed: HTTP ${response.status} ${await response.text()}`);
     }
     const { token } = await response.json();
+    return Caller.at(livekitUrl, token);
+  }
 
-    // The conversation ID *is* the room name, which is what makes it recoverable from
-    // the token the same way both of Happy's clients recover it.
+  /**
+   * Joins whatever room a token already names.
+   *
+   * Split from `join` so that being a client in a room does not require openconv to have
+   * minted the token — a probe measuring the transport itself needs a room with no agent
+   * in it, and building a second client to get one would mean measuring a different
+   * program than the acceptance scripts run.
+   *
+   * The room name is read from the token rather than passed beside it, because the two
+   * cannot then disagree. For a conversation that name *is* the conversation ID, which is
+   * how both of Happy's clients recover it.
+   */
+  static async at(livekitUrl, token) {
     const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64").toString());
     const caller = new Caller(claims.video.room, livekitUrl);
 
@@ -165,6 +210,21 @@ export class Caller {
     });
     this.room.on(RoomEvent.ParticipantConnected, (p) => this.participants.push(p.identity));
 
+    /**
+     * Who the SFU has said is talking.
+     *
+     * A different fact from `heard`, and the only other one available: LiveKit decides
+     * this from the audio-level header the publisher's own libwebrtc stamps on each RTP
+     * packet, so it is a reading taken upstream of this client's decoder and upstream of
+     * the network between them. A participant the SFU calls loud whose track arrives here
+     * silent, and one the SFU never mentions at all, are the same symptom with opposite
+     * causes, and nothing in the decoded audio can tell them apart.
+     */
+    this.reportedSpeaking = new Set();
+    this.room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+      for (const speaker of speakers) this.reportedSpeaking.add(speaker.identity);
+    });
+
     // Read from the moment the track is subscribed, the way a client that is playing
     // audio does. Reading later instead — after the assertions that come first in a
     // script — misses whatever the agent said on subscribe, and reports a working track
@@ -174,12 +234,11 @@ export class Caller {
       this.agentTrack = track;
       (async () => {
         for await (const frame of new AudioStream(track)) {
-          this.heard.frames += 1;
-          let peak = 0;
-          for (const sample of frame.data) peak = Math.max(peak, Math.abs(sample));
-          this.heard.peak = Math.max(this.heard.peak, peak);
-          if (peak > AUDIBLE) {
-            this.heard.audibleFrames += 1;
+          const arrived = sounding(frame.data, frame.sampleRate);
+          this.heard.frames += arrived.frames;
+          this.heard.audibleFrames += arrived.audibleFrames;
+          this.heard.peak = Math.max(this.heard.peak, arrived.peak);
+          if (arrived.audibleFrames > 0) {
             // When the agent was last actually making a sound. What "stopped talking"
             // is measured against — the frames keep arriving after it stops, they just
             // carry silence, so counting frames cannot tell the two apart.
