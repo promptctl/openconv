@@ -60,12 +60,11 @@ const spoken = await mic.say(recording);
 checks.record("finished speaking", true, `${spoken.toFixed(2)}s of audio`);
 
 // ---- did it hear? ----
-const settled = () => caller.events("user_transcript");
-
 checks.record(
   "a user_transcript event arrived",
-  await caller.waitFor(() => settled().length > 0, 45_000, "a final transcript"),
-  `${caller.events("tentative_user_transcript").length} tentative, ${settled().length} final`,
+  await caller.waitFor(() => caller.transcriptEvents().length > 0, 45_000, "a final transcript"),
+  `${caller.events("tentative_user_transcript").length} tentative, ` +
+    `${caller.transcriptEvents().length} final`,
 );
 
 // Every settled transcript, not the last one: the endpointer decides where an utterance
@@ -87,12 +86,13 @@ checks.record(
 );
 
 // The event id is what lets a client correlate a transcript with the turn it belongs to,
-// so its absence is a protocol failure even when the words came through perfectly.
-const final = settled().at(-1);
+// so its absence is a protocol failure even when the words came through perfectly — which
+// is why the payload arrives here unparsed and this reports rather than throws.
+const final = caller.transcriptEvents().at(-1);
 checks.record(
   "the transcript carries an event id",
-  Number.isInteger(final?.user_transcription_event?.event_id),
-  String(final?.user_transcription_event?.event_id),
+  Number.isInteger(final?.event_id),
+  String(final?.event_id),
 );
 
 await caller.leave();

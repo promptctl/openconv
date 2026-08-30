@@ -280,21 +280,26 @@ export class Caller {
   }
 
   /**
-   * What the caller has been heard to say — settled transcripts, not tentative ones.
+   * What openconv wraps each settled transcript in: the words, and the id a client
+   * correlates a turn on.
    *
-   * [LAW:one-source-of-truth] The path into the event is openconv's wire shape, and each
-   * script that asserted on words used to spell it out again. Named here, a rename on the
-   * Rust side has one place to break. `vad-`, `tools-`, and `inbound-text-acceptance`
-   * still reach through `controlEvents` themselves and are the remaining copies.
+   * [LAW:one-source-of-truth] `user_transcription_event` is spelled here and nowhere
+   * else, so a rename on the Rust side has one place to break. Handing back the payload
+   * rather than one field of it means a script asserting on some other part of it needs
+   * nothing new here. `vad-`, `tools-`, and `inbound-text-acceptance` still reach through
+   * `controlEvents` themselves and are the remaining copies.
    *
-   * Reached without guards on purpose: a `user_transcript` carrying no transcript is a
-   * malformed control event, and a stack trace naming the field beats an empty string a
-   * script reads as "the caller said nothing".
+   * Unparsed, unlike `transcripts()`: whether a transcript carries an `event_id` is a
+   * claim `stt-acceptance` exists to make, and refusing here would crash the script that
+   * came to ask rather than let it report the answer.
    */
+  transcriptEvents() {
+    return this.events("user_transcript").map((event) => event.user_transcription_event);
+  }
+
+  /** What the caller has been heard to say — settled transcripts, not tentative ones. */
   transcripts() {
-    return this.events("user_transcript").map(
-      (event) => event.user_transcription_event.user_transcript,
-    );
+    return this.transcriptEvents().map((payload) => requireText(payload, "user_transcript"));
   }
 
   /**
@@ -304,8 +309,8 @@ export class Caller {
    * "was the reply audible" — that claim is `heard`, and the two fail separately.
    */
   replies() {
-    return this.events("agent_response").map(
-      (event) => event.agent_response_event.agent_response,
+    return this.events("agent_response").map((event) =>
+      requireText(event.agent_response_event, "agent_response"),
     );
   }
 
@@ -373,6 +378,25 @@ class Microphone {
     }
     await this.source.waitForPlayout();
   }
+}
+
+/**
+ * The words a control event carries, or a refusal naming what was missing instead.
+ *
+ * [LAW:parse-dont-validate] The one place an event becomes a string. Everything
+ * downstream is handed a `string`, so no script checks — there is nothing left to check.
+ *
+ * Absent is not empty, and the whole point is to keep them apart: a settled transcript of
+ * silence *is* `""` and means the caller said nothing, while a missing field means
+ * openconv published a malformed event. Collapsing the two would let a protocol bug reach
+ * a script as a quiet transcription failure and be reported as one.
+ */
+function requireText(payload, field) {
+  const text = payload?.[field];
+  if (typeof text !== "string") {
+    throw new TypeError(`control event carried no ${field} — found ${JSON.stringify(text)}`);
+  }
+  return text;
 }
 
 function concat(parts) {
