@@ -234,7 +234,7 @@ export class Caller {
      * apart.
      */
     this.heard = { frames: 0, audibleFrames: 0, peak: 0, lastAudibleAt: 0, error: null };
-    this.agentTrack = null;
+    this.remoteTrack = null;
     this.mic = null;
 
     this.room.on(RoomEvent.DataReceived, (payload) => {
@@ -266,11 +266,12 @@ export class Caller {
 
     // Read from the moment the track is subscribed, the way a client that is playing
     // audio does. Reading later instead — after the assertions that come first in a
-    // script — misses whatever the agent said on subscribe, and reports a working track
-    // as silent.
+    // script — misses whatever arrived on subscribe, and reports a working track as
+    // silent. Whoever is publishing: an agent in the acceptance runs, another probe
+    // client in `loopback-acceptance`, which subscribes through this same handler.
     this.room.on(RoomEvent.TrackSubscribed, (track) => {
-      if (this.agentTrack) return;
-      this.agentTrack = track;
+      if (this.remoteTrack) return;
+      this.remoteTrack = track;
       (async () => {
         for await (const frame of new AudioStream(track)) {
           const arrived = sounding(frame.data, frame.sampleRate);
@@ -278,7 +279,7 @@ export class Caller {
           this.heard.audibleFrames += arrived.audibleFrames;
           this.heard.peak = Math.max(this.heard.peak, arrived.peak);
           if (arrived.audibleFrames > 0) {
-            // When the agent was last actually making a sound. What "stopped talking"
+            // When the remote was last actually making a sound. What "stopped talking"
             // is measured against — the frames keep arriving after it stops, they just
             // carry silence, so counting frames cannot tell the two apart.
             this.heard.lastAudibleAt = Date.now();
@@ -298,7 +299,7 @@ export class Caller {
    * looks exactly like the transport losing the audio, and is not.
    */
   subscribed() {
-    return this.agentTrack !== null;
+    return this.remoteTrack !== null;
   }
 
   /** The remote participants currently in the room. */

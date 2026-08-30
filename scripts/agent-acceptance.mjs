@@ -79,8 +79,8 @@ checks.record("a vad_score event arrived", Boolean(vad), JSON.stringify(vad?.vad
 // ---- the audio track ----
 checks.record(
   "the agent published an audio track",
-  await caller.waitFor(() => caller.agentTrack !== null, 15_000, "the agent's audio track"),
-  caller.agentTrack ? `kind=${caller.agentTrack.kind}` : "",
+  await caller.waitFor(() => caller.remoteTrack !== null, 15_000, "the agent's audio track"),
+  caller.remoteTrack ? `kind=${caller.remoteTrack.kind}` : "",
 );
 
 // Frames, not volume. Nobody has spoken and no first message is configured, so this
