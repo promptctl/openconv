@@ -10,12 +10,28 @@ use openconv_server::store::ConversationLog;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+/// What the service says about itself when nothing sets `RUST_LOG`.
+///
+/// `openconv_agent` is on the list because it is where the conversation actually happens:
+/// leaving it off meant the deployed service logged its HTTP endpoints and nothing about
+/// any call served through them, and every question about a call — did the agent hear it,
+/// did it answer, did the answer reach the room — had to be re-run locally with a filter
+/// set by hand.
+///
+/// `libwebrtc` and `livekit` at warn for the same reason one level down. The transport
+/// drops the caller's audio when a sink queue overflows and says so through the `log`
+/// crate; filtered out, the only remaining evidence was a transcript that came back short,
+/// which reads exactly like a speech model getting a word wrong. It was read that way for
+/// days.
+///
+// [LAW:no-silent-failure] the alarms exist; the default filter is what switches them on.
+const DEFAULT_LOG: &str = "openconv_server=info,openconv_agent=info,libwebrtc=warn,livekit=warn,tower_http=info";
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "openconv_server=info,tower_http=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| DEFAULT_LOG.into()),
         )
         .init();
 

@@ -51,6 +51,7 @@ use speak::{Made, Spoken, Stopped, Synthesizer};
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::Instrument;
 use tokio_util::sync::CancellationToken;
 use llm::{Llm, Piece, Reply, Turn};
 use session::SessionConfig;
@@ -145,6 +146,21 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
     // may run on this loop. The loop below is the only thing that publishes ids, so
     // ordering stays in one place.
     let (noticed, mut listening) = mpsc::channel::<Noticed>(64);
+
+    // Ends the listener when this conversation does.
+    //
+    // Dropping the receiver above is not enough to end it: a listener parked on its audio
+    // stream is waiting on frames, not on a send, and that stream never finishes by itself
+    // — see [`listen::listen`]. Left unsaid, every call leaves a task, a native audio sink
+    // and a handle on the caller's track behind for the life of the process.
+    //
+    // A drop guard rather than a `cancel()` at the bottom of this function: every publish
+    // below returns early on failure, and cleanup that only runs on the happy path is
+    // cleanup that eventually does not run.
+    //
+    // [LAW:no-ambient-temporal-coupling] the listener's lifetime has an owner: this scope.
+    let hung_up = CancellationToken::new();
+    let _ends_with_this_conversation = hung_up.clone().drop_guard();
 
     // The agent's own turn, reporting back from the task it runs in.
     let (from_turn, mut turn_events) = mpsc::channel::<FromTurn>(4);
@@ -292,6 +308,13 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
             // loop — and with it the announcement, the disconnect handling, and every
             // other conversation's audio pump sharing the runtime.
             RoomEvent::TrackSubscribed { track: RemoteTrack::Audio(track), participant, .. } => {
+                // Attached before anything else in this arm, and before the log line that
+                // announces it, because this call is where the agent stops being deaf:
+                // everything published earlier is discarded by libwebrtc and nothing
+                // buffers it. Attaching inside the spawned task left that moment to the
+                // scheduler, and the caller's opening words in the gap.
+                let ear = listen::attach(&track);
+
                 tracing::info!(
                     conversation = %assignment.conversation_id,
                     participant = %participant.identity(),
@@ -303,12 +326,28 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                 // speech from silence never decides an utterance ended, so it never
                 // answers — which from the caller's side is indistinguishable from a
                 // dead line, with nothing in the logs to say otherwise.
-                tokio::spawn(listen::listen(
-                    track,
-                    SpeechDetector::new()?,
-                    services.transcriber.clone(),
-                    noticed.clone(),
-                ));
+                // Wrapped in a span rather than handed the conversation id, because the id
+                // is not a fact about an ear or a stretch of audio — it would be a field on
+                // two types that exist to describe sound, carried only so a log line could
+                // print it, and added again to the next type in that chain. A span costs
+                // one wrapper here, where the id already lives, and every event emitted
+                // anywhere inside the listener inherits it: the arrival lines, the closing
+                // account, and the per-window scores at trace.
+                //
+                // [LAW:one-source-of-truth] the conversation id stays on `Assignment`.
+                tokio::spawn(
+                    listen::listen(
+                        ear,
+                        SpeechDetector::new()?,
+                        services.transcriber.clone(),
+                        noticed.clone(),
+                        hung_up.clone(),
+                    )
+                    .instrument(tracing::info_span!(
+                        "listening",
+                        conversation = %assignment.conversation_id,
+                    )),
+                );
             }
 
             // The client's own control messages. The one that matters here is the
@@ -506,10 +545,14 @@ fn decode_client_event(payload: &[u8], assignment: &Assignment) -> Option<Client
     match serde_json::from_slice(payload) {
         Ok(event) => Some(event),
         Err(error) => {
+            // The error and the size, not the payload. A message that failed to parse is
+            // the one most likely to be a half-formed prompt override, and this log is on
+            // by default. Nothing diagnostic is lost: serde names the field it did not
+            // expect and where it found it, which is what says a client has drifted.
             tracing::warn!(
                 conversation = %assignment.conversation_id,
                 %error,
-                raw = %String::from_utf8_lossy(payload).chars().take(200).collect::<String>(),
+                chars = payload.len(),
                 "could not read a client control message"
             );
             None
@@ -942,7 +985,11 @@ async fn publish_response(
     text: &str,
 ) -> Result<(), AgentError> {
     let Some(channel) = control else {
-        tracing::warn!(text, "had something to say before the conversation was announced");
+        // Length, not words — see `publish_transcript` for why.
+        tracing::warn!(
+            chars = text.len(),
+            "had something to say before the conversation was announced"
+        );
         return Ok(());
     };
 
@@ -979,9 +1026,13 @@ async fn publish_transcript(
     // track is subscribed first. Dropping it is right — there is nowhere to send it —
     // but it is said out loud, because a transcript vanishing is otherwise invisible.
     let Some(channel) = control else {
+        // The length and not the words. What is worth knowing here is that a transcript
+        // vanished, and the caller may be discussing anything at all in their coding
+        // session — the rest of this module logs `chars` for exactly that reason, and
+        // these two were the exceptions until the agent's logs were on by default.
         tracing::warn!(
             conversation = %assignment.conversation_id,
-            text = said.text(),
+            chars = said.text().len(),
             "heard speech before the conversation was announced; dropping it"
         );
         return Ok(());
