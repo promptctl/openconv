@@ -53,14 +53,21 @@ const REQUEST_TIMEOUT_MS = 30_000;
  * The LiveKit credentials, or a refusal naming what is missing and where to get it.
  *
  * One fact — these two variables must exist, and they live in Vault at secret/livekit —
- * held once. `livekit-smoke` and `loopback-acceptance` both need exactly it and had
- * separate copies of the check.
+ * held once. Three scripts need exactly it and each had its own copy: `livekit-smoke`,
+ * `loopback-acceptance`, and `webhook-delivery-acceptance` (which sources its other
+ * variables separately through `readEnvironment`, so its LiveKit check stood alone).
  *
- * `token-endpoint-acceptance` deliberately does NOT use this. Its check covers
- * `OPENCONV_API_KEY` as well and reports every missing variable in a single message, so
- * routing the LiveKit half through here would split that into two throws — an operator
- * missing both would learn about one, fix it, rerun, and learn about the other. Same
- * shape, different fact, and the diagnostic is the reason the difference is worth keeping.
+ * Two scripts deliberately do NOT use this, and the reason is the same for both.
+ * `token-endpoint-acceptance` and `conversations-acceptance` each check `OPENCONV_API_KEY`
+ * alongside the pair and report every missing variable in ONE message. Routing their
+ * LiveKit half through here would split that into two throws, so an operator missing both
+ * would learn about one, fix it, rerun, and learn about the other. Same shape, different
+ * fact — "everything this run needs" is not "the LiveKit pair" — and the diagnostic is
+ * what makes the difference worth keeping.
+ *
+ * That is the whole census: three callers, two deliberate abstainers, no other copy. It is
+ * written out because the first version of this docblock named one abstainer and missed a
+ * caller, which is the same miscount this module's own header was corrected for.
  */
 export function livekitCredentials(env) {
   const missing = ["LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"].filter((name) => !env[name]);
@@ -144,6 +151,13 @@ export class Rooms {
    * Throws on anything but a 2xx, naming the status and the body: an SFU that refused
    * the signature and an SFU that is not there produce very different messages, and a
    * script that swallowed either would go on to report the *next* step as the failure.
+   *
+   * The failures `fetch` raises *before* there is a response — a timeout, a refused
+   * connection, an unresolvable host — are named the same way, because they arrive
+   * nameless. `AbortSignal.timeout` rejects with a bare "The operation was aborted due to
+   * timeout" and a refused connection with a bare "fetch failed", neither of which says
+   * which RPC against which SFU. That is the one question this module exists to answer,
+   * so it is answered on every arm rather than on two of the three.
    */
   async call(method, body) {
     const token = sign({
@@ -153,13 +167,22 @@ export class Rooms {
       claims: { video: { roomCreate: true, roomList: true } },
     });
 
-    const response = await fetch(`${this.url}/twirp/livekit.RoomService/${method}`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      // An SFU that accepts the connection and then says nothing is otherwise indefinite.
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+    let response;
+    try {
+      response = await fetch(`${this.url}/twirp/livekit.RoomService/${method}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        // An SFU that accepts the connection and then says nothing is otherwise indefinite.
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (cause) {
+      // One arm for every pre-response failure rather than a branch per error name: they
+      // differ in what went wrong, which the message carries, not in what this has to do
+      // about it. `cause` keeps the original for anyone who wants the stack.
+      // [LAW:dataflow-not-control-flow]
+      throw new Error(`${method} on ${this.url} failed: ${cause.name}: ${cause.message}`, { cause });
+    }
 
     const text = await response.text();
     if (!response.ok) {

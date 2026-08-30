@@ -15,9 +15,10 @@
 import { Rooms, livekitCredentials } from "./lib/livekit.mjs";
 
 // The one boundary: everything below runs on values that are known to exist. The credential
-// half is `livekitCredentials`, shared with `loopback-acceptance` because it is one fact —
-// which variables, and where they live. The URL default is not shared: this script talks to
-// the room service and defaults to `https://`, where a script that also dials as a client
+// half is `livekitCredentials`, which owns both the check and the census of who shares it —
+// naming its other callers here would be a second copy of that list, free to drift the
+// moment one is added. The URL default is deliberately not shared: this script talks to the
+// room service and defaults to `https://`, where a script that also dials as a client
 // defaults to `wss://`, and a flag to pick between them would be a mode where there is
 // currently just a different script. [LAW:no-mode-explosion]
 function readConfig(env, argv) {

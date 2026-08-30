@@ -205,3 +205,30 @@ test("call() throws on a non-2xx, naming the method, the origin, the status and 
   // a regression that looks like a working error path right up until you need it.
   assert.ok(bodyRead, "the body is read before the status is judged");
 });
+
+test("a failure before there is a response still names the method and the origin", async () => {
+  // `AbortSignal.timeout` rejects with a bare "The operation was aborted due to timeout",
+  // and a refused connection with a bare "fetch failed". Neither says which RPC against
+  // which SFU — the one question this module exists to answer, and the reason the non-2xx
+  // arm is so careful about it. Both are checked because they reach the caller by the same
+  // path, so a branch introduced later would break one of them silently.
+  for (const cause of [
+    Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" }),
+    Object.assign(new Error("fetch failed"), { name: "TypeError" }),
+  ]) {
+    const stub = stubFetch(() => {
+      throw cause;
+    });
+    try {
+      await assert.rejects(() => sfu().call("ListRooms", {}), (error) => {
+        assert.match(error.message, /ListRooms/, `${cause.name} names the method`);
+        assert.match(error.message, /https:\/\/sfu\.example/, `${cause.name} names the origin`);
+        assert.match(error.message, new RegExp(cause.name), "and what went wrong");
+        assert.equal(error.cause, cause, "the original is kept for the stack");
+        return true;
+      });
+    } finally {
+      stub.restore();
+    }
+  }
+});

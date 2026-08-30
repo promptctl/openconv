@@ -79,7 +79,7 @@ checks.record("a vad_score event arrived", Boolean(vad), JSON.stringify(vad?.vad
 // ---- the audio track ----
 checks.record(
   "the agent published an audio track",
-  await caller.waitFor(() => caller.remoteTrack !== null, 15_000, "the agent's audio track"),
+  await caller.waitFor(() => caller.subscribed(), 15_000, "the agent's audio track"),
   caller.remoteTrack ? `kind=${caller.remoteTrack.kind}` : "",
 );
 

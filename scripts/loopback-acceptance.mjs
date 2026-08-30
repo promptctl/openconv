@@ -130,9 +130,10 @@ function audible(published) {
 /**
  * The one boundary: everything below runs on values known to exist.
  *
- * The credential check is `livekitCredentials`, shared with `livekit-smoke` — one fact, one
- * home. The URL is this script's own: it dials as a client, so it defaults to `wss://` and
- * strips a trailing slash, neither of which the room-service-only sibling wants.
+ * The credential check is `livekitCredentials`, which owns both the check and the census of
+ * who shares it — one fact, one home, and no list here to fall out of date. The URL is this
+ * script's own: it dials as a client, so it defaults to `wss://` and strips a trailing
+ * slash, neither of which a room-service-only caller wants.
  */
 function readConfig(env, argv) {
   return {
