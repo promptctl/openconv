@@ -7,13 +7,26 @@
 // actually reads, and the drift shows up as a 401 in whichever copy was not updated —
 // which reads exactly like a credential problem and is not one.
 //
-// **Two of those four still carry their own.** `livekit-smoke`, `token-endpoint-acceptance`
-// and `loopback-acceptance` sign here; `conversations-acceptance` (`signWebhook`) and
-// `webhook-delivery-acceptance` (`mintToken`) do not. Both of those sign webhook bodies
-// rather than room tokens, and both read an `ok` off a raw `fetch` to tally as a check,
-// where `Rooms.call` throws — so moving them changes what those scripts claim, not where
-// their signer lives. That is a real remaining drift risk and it is written here rather
-// than only in a pull request, because this is where a reader meets it.
+// **Two of those four still carry their own, and they are not the same case.**
+// `livekit-smoke`, `token-endpoint-acceptance` and `loopback-acceptance` sign here.
+//
+// `conversations-acceptance` (`signWebhook`) does not, and could not: it signs a webhook
+// *body*, carrying a top-level `sha256` digest over the bytes and an empty `video`. That
+// is a different wire format which happens to share an algorithm, and folding it in here
+// would consolidate a resemblance rather than a duplicate.
+//
+// `webhook-delivery-acceptance` (`mintToken`) is the real remaining copy. It signs a
+// room-service token exactly as `sign` does — `video: { roomCreate, roomAdmin, room }`,
+// used to authorize a DeleteRoom against the same Twirp service `Rooms.call` talks to —
+// and it has *already* drifted: its `sub` is `openconv-webhook-probe` where `Rooms.call`
+// sends `openconv-scripts`, and it asks for `roomAdmin` where `Rooms.call` asks for
+// `roomList`. What keeps it out of here is not its shape but its reporting — it reads an
+// `ok` off a raw `fetch` to tally as a check, where `Rooms.call` throws, so moving it
+// changes what that script claims and not merely where its signer lives.
+//
+// So the honest count of this module's own pattern living elsewhere is one, not zero, and
+// it is written here rather than only in a pull request because this is where a reader
+// meets it.
 //
 // Separate from caller.mjs because that module is the client side: what the ElevenLabs
 // SDK does to openconv. Nothing a caller does requires the API secret.
