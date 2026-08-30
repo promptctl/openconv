@@ -35,6 +35,23 @@ const FRAMES_PER_SECOND = 100;
 const AUDIBLE = 1000;
 
 /**
+ * The line the acceptance runs speak into a room.
+ *
+ * [LAW:one-source-of-truth] One sentence, because two scripts assert on it *being the
+ * same one*: `stt-acceptance` claims the agent transcribes it, and `loopback-acceptance`
+ * claims the transport carries it, and the second only bounds the first if they are
+ * speaking the same words. Two copies could drift into a probe that clears a sentence
+ * nobody sends while still describing itself as testing what the acceptance runs test.
+ *
+ * Its words are chosen for the speech model, not for the reader: base.en hears them all
+ * correctly, which a nonce word is not guaranteed to be (it hears "penguin" as "pen win").
+ */
+export const SPOKEN = "Hello, can you hear me? This is a test of the voice agent.";
+
+/** What a count of frames is worth in milliseconds, at the one rate a room works at. */
+export const millis = (frames) => (frames * 1000) / FRAMES_PER_SECOND;
+
+/**
  * What a run of samples sounds like: how long it is, how much of it is sound rather than
  * silence, and the loudest it ever gets.
  *
@@ -56,6 +73,17 @@ export function sounding(samples, sampleRate) {
   // a loud track as silent. Every rate the recordings use divides evenly; the one that
   // does not is the one that would have been believed.
   const perFrame = Math.round(sampleRate / FRAMES_PER_SECOND);
+
+  // [LAW:no-defensive-null-guards] exception: an inland check, and named as one. A rate
+  // that rounds to zero samples per window makes the loop below step by zero and run
+  // forever, and `readRecording` — the parser that would properly refuse it — is not the
+  // only source here; `frame.sampleRate` arrives off the SFU with no parser of ours in
+  // front of it. A hang is the one failure that reaches no log at all, so it is worth an
+  // unproven guard to turn it into a sentence.
+  if (!(perFrame > 0)) {
+    throw new RangeError(`a ${sampleRate} Hz rate is less than one sample per 10 ms window`);
+  }
+
   const reading = { frames: 0, audibleFrames: 0, peak: 0 };
 
   for (let at = 0; at < samples.length; at += perFrame) {
@@ -118,6 +146,12 @@ export function readRecording(path) {
       `${path} must be 16-bit mono PCM, not encoding=${format.encoding} ` +
         `channels=${format.channels} bits=${format.bitsPerSample}`,
     );
+  }
+  // The one field of `fmt ` this parser used to read without constraining, which left a
+  // zero rate representable in the `Recording` it hands out — and downstream that is not a
+  // wrong number but a hung process, since it divides into zero samples per window.
+  if (!(format.sampleRate > 0)) {
+    throw new Error(`${path} declares a ${format.sampleRate} Hz sample rate`);
   }
   return { sampleRate: format.sampleRate, samples };
 }
@@ -254,6 +288,17 @@ export class Caller {
         this.heard.error = error;
       });
     });
+  }
+
+  /**
+   * True once this client has a remote track to listen to.
+   *
+   * Being in a room and being subscribed to what is published in it are different
+   * moments, and a script that speaks in the gap between them is heard by nobody — which
+   * looks exactly like the transport losing the audio, and is not.
+   */
+  subscribed() {
+    return this.agentTrack !== null;
   }
 
   /** The remote participants currently in the room. */

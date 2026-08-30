@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { Caller, sounding } from "./caller.mjs";
+import { Caller, millis, sounding } from "./caller.mjs";
 
 /// A caller that has "received" these events, with no room behind it. The accessors read
 /// `controlEvents` and nothing else, so this is the whole of their input.
@@ -181,4 +181,27 @@ test("a sample rate that does not divide into whole windows still measures the s
   assert.ok(Number.isFinite(reading.peak), `peak was ${reading.peak}`);
   assert.equal(reading.peak, 19838);
   assert.equal(reading.audibleFrames, reading.frames);
+});
+
+test("a rate too low to fill a window is refused, not looped over forever", () => {
+  // The worst failure mode this module could have: `perFrame` of 0 makes the window loop
+  // step by zero and spin, and a hang reaches no log at all — quieter than any wrong
+  // number. `readRecording` refuses such a rate at the parse, but a frame off the SFU has
+  // no parser of ours in front of it, so the refusal is here too.
+  for (const rate of [0, -48_000, 4]) {
+    assert.throws(
+      () => sounding(at(19838, 1), rate),
+      (error) => error instanceof RangeError && error.message.includes(String(rate)),
+      `a ${rate} Hz rate must be named, not spun on`,
+    );
+  }
+});
+
+test("millis is the one place a frame becomes a duration", () => {
+  assert.equal(millis(100), 1000);
+  assert.equal(millis(0), 0);
+  // What the scripts actually ask it: 200 ms of sound is 20 frames, and the comparison
+  // reads as the duration it is rather than as a count divided by a literal.
+  assert.ok(millis(20) >= 200);
+  assert.ok(millis(19) < 200);
 });

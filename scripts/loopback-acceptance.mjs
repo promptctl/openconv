@@ -27,14 +27,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { Caller, Checks, recordSpeech, sounding } from "./lib/caller.mjs";
+import { Caller, Checks, SPOKEN, millis, recordSpeech, sounding } from "./lib/caller.mjs";
 import { Rooms, joinToken } from "./lib/livekit.mjs";
 
-/// The line the speech acceptance run speaks. A tone would survive encodings that speech
-/// does not — Opus, voice activity detection and noise suppression all treat a steady
-/// sine differently from a voice — so the probe carries the signal that is actually going
-/// missing.
-const SPOKEN = "Hello, can you hear me? This is a test of the voice agent.";
+// `SPOKEN` is imported rather than repeated: a tone would survive encodings that speech
+// does not — Opus, voice activity detection and noise suppression all treat a steady sine
+// differently from a voice — so the probe has to carry the signal that is actually going
+// missing, which means the sentence stt-acceptance sends and not one that resembles it.
 
 /// The identity that publishes. Every listener's account is of this participant.
 const SPEAKER = "probe-speaker";
@@ -56,6 +55,12 @@ const QUIETEST_ACCEPTABLE = 0.5;
 /// How much of the utterance's audible duration must survive. Not all of it: the first
 /// and last window straddle the boundary between silence and speech, and which side of
 /// the threshold they land on depends on where the encoder happened to cut a packet.
+///
+/// [LAW:one-source-of-truth] Read by the wait as well as the check. Waiting for a
+/// stricter number than the check accepts is waiting for something this comment says will
+/// not reliably happen: every healthy run then burns the whole settle window and prints
+/// "gave up" on its way to passing, which teaches a reader to ignore the one line that
+/// says audio went missing.
 const SHORTEST_ACCEPTABLE = 0.9;
 
 /** The one boundary: everything below runs on values known to exist. */
@@ -85,46 +90,88 @@ console.log(`created ${name} at ${livekitUrl}\n`);
 const at = (identity) =>
   Caller.at(livekitUrl, joinToken({ apiKey, apiSecret, room: name, identity }));
 
-// The listeners first. `speak` waits for a remote subscription before it captures a
-// frame, and a publisher alone in a room would wait for a subscriber who never arrives.
-const listeners = await Promise.all(LISTENERS.map(at));
-const speaker = await at(SPEAKER);
-
-checks.record(
-  "every listener sees the speaker in the room",
-  (
-    await Promise.all(
-      listeners.map((listener) =>
-        listener.waitFor(() => listener.roster().includes(SPEAKER), 10_000, "the speaker to join"),
-      ),
-    )
-  ).every(Boolean),
-  listeners.map((listener) => listener.roster().length).join(" and ") + " participants seen",
-);
-
+const clients = [];
 const recording = recordSpeech(SPOKEN, join(mkdtempSync(join(tmpdir(), "openconv-loopback-")), "speech.wav"));
 const published = sounding(recording.samples, recording.sampleRate);
-console.log(
-  `speaking ${published.frames * 10} ms, of which ${published.audibleFrames * 10} ms audible, peak ${published.peak}\n`,
-);
 
-await speaker.speak(recording);
-await Promise.all(
-  listeners.map((listener) =>
-    listener.waitFor(
-      () => listener.heard.audibleFrames >= published.audibleFrames,
-      SETTLE_MS,
-      "the whole utterance to arrive",
+/// The audible duration a listener has to reach. One number for the wait and the check,
+/// so the wait ends the moment the run is healthy rather than at the settle window.
+const ENOUGH = Math.ceil(published.audibleFrames * SHORTEST_ACCEPTABLE);
+
+// From here the room exists and is this script's to clean up. Everything that can throw —
+// three connections with their own timeouts, `say`, every wait — sits inside, because a
+// failure that skipped the cleanup would leave connected participants in a room on the
+// real deployment, and a room with clients in it is not empty, so `empty_timeout` does
+// not start counting until the process dies.
+let listeners = [];
+try {
+  // The listeners first. Publishing waits for a remote subscription before it captures a
+  // frame, and a publisher alone in a room would wait for a subscriber who never arrives.
+  listeners = await Promise.all(LISTENERS.map(at));
+  clients.push(...listeners);
+  const speaker = await at(SPEAKER);
+  clients.push(speaker);
+
+  checks.record(
+    "every listener sees the speaker in the room",
+    (
+      await Promise.all(
+        listeners.map((listener) =>
+          listener.waitFor(() => listener.roster().includes(SPEAKER), 10_000, "the speaker to join"),
+        ),
+      )
+    ).every(Boolean),
+    listeners.map((listener) => listener.roster().length).join(" and ") + " participants seen",
+  );
+
+  console.log(
+    `\nspeaking ${millis(published.frames)} ms, of which ${millis(published.audibleFrames)} ms audible, peak ${published.peak}\n`,
+  );
+
+  // Published, then gated, then spoken — three steps rather than `speak()`'s one, because
+  // `microphone()` resolves on the *first* remote subscription and this room has two. A
+  // listener still subscribing while the lead-in plays loses the front of the utterance,
+  // which is this probe's own symptom wearing the costume of the bug it hunts.
+  const mic = await speaker.microphone(recording.sampleRate);
+  checks.record(
+    "every listener is subscribed before a word is spoken",
+    (
+      await Promise.all(
+        listeners.map((listener) =>
+          listener.waitFor(() => listener.subscribed(), 10_000, "a track to listen to"),
+        ),
+      )
+    ).every(Boolean),
+    `${listeners.filter((listener) => listener.subscribed()).length}/${listeners.length} subscribed`,
+  );
+
+  await mic.say(recording);
+  await Promise.all(
+    listeners.map((listener) =>
+      listener.waitFor(
+        () => listener.heard.audibleFrames >= ENOUGH,
+        SETTLE_MS,
+        "the whole utterance to arrive",
+      ),
     ),
-  ),
-);
+  );
+} finally {
+  // Reported rather than swallowed: a client that could not leave is a finding about the
+  // room, and letting it pass silently here would hide it behind whatever sent us into
+  // this block. `allSettled` so one bad disconnect cannot skip the delete.
+  const left = await Promise.allSettled(clients.map((client) => client.leave()));
+  for (const outcome of left.filter((outcome) => outcome.status === "rejected")) {
+    console.error(`  (a client failed to leave ${name}: ${outcome.reason})`);
+  }
+  await rooms.call("DeleteRoom", { room: name });
+}
 
 console.log();
 for (const [index, listener] of listeners.entries()) {
   const heard = listener.heard;
   const who = LISTENERS[index];
   console.log(
-    `${who}: heard ${heard.frames * 10} ms, of which ${heard.audibleFrames * 10} ms audible, ` +
+    `${who}: heard ${millis(heard.frames)} ms, of which ${millis(heard.audibleFrames)} ms audible, ` +
       `peak ${heard.peak}, SFU called the speaker ${listener.reportedSpeaking.has(SPEAKER) ? "loud" : "silent"}`,
   );
 }
@@ -157,8 +204,8 @@ for (const [index, listener] of listeners.entries()) {
   // peak taken across the whole call cannot see.
   checks.record(
     `${who}: heard the whole utterance, not a fragment`,
-    heard.audibleFrames >= published.audibleFrames * SHORTEST_ACCEPTABLE,
-    `${heard.audibleFrames * 10} ms audible against ${published.audibleFrames * 10} ms published`,
+    heard.audibleFrames >= ENOUGH,
+    `${millis(heard.audibleFrames)} ms audible against ${millis(published.audibleFrames)} ms published`,
   );
 
   // Where the loss happened, from a reading neither this client nor the network produced.
@@ -171,7 +218,6 @@ for (const [index, listener] of listeners.entries()) {
   );
 }
 
-await Promise.all([speaker, ...listeners].map((client) => client.leave()));
-await rooms.call("DeleteRoom", { room: name });
-
+// Outside the cleanup block on purpose: `finish` exits the process, so anything placed
+// after it inside a `finally` would never run.
 checks.finish();

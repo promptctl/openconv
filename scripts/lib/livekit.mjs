@@ -7,6 +7,14 @@
 // actually reads, and the drift shows up as a 401 in whichever copy was not updated —
 // which reads exactly like a credential problem and is not one.
 //
+// **Two of those four still carry their own.** `livekit-smoke`, `token-endpoint-acceptance`
+// and `loopback-acceptance` sign here; `conversations-acceptance` (`signWebhook`) and
+// `webhook-delivery-acceptance` (`mintToken`) do not. Both of those sign webhook bodies
+// rather than room tokens, and both read an `ok` off a raw `fetch` to tally as a check,
+// where `Rooms.call` throws — so moving them changes what those scripts claim, not where
+// their signer lives. That is a real remaining drift risk and it is written here rather
+// than only in a pull request, because this is where a reader meets it.
+//
 // Separate from caller.mjs because that module is the client side: what the ElevenLabs
 // SDK does to openconv. Nothing a caller does requires the API secret.
 
@@ -39,9 +47,17 @@ export function sign({ apiKey, apiSecret, sub, claims }) {
 /**
  * A token admitting one participant to one room, with a microphone and an ear.
  *
- * The grants openconv's own `mint_participant_token` issues, spelled once: a script that
- * joins a room it created itself has to be the same kind of participant as a script that
- * joins a conversation, or it is measuring a different client.
+ * These mirror the grants openconv's own `mint_participant_token` issues, because a script
+ * joining a room it created itself has to be the same kind of participant as one joining a
+ * conversation, or it is measuring a different client. **The mirror is maintained by hand
+ * and nothing checks it.** The grants themselves live in Rust
+ * (`crates/openconv-server/src/livekit.rs`), and a JS constant cannot be derived from them.
+ *
+ * What would notice production moving is `token-endpoint-acceptance`, which asserts on a
+ * token minted by the running server — deliberately against literals transcribed from
+ * Happy's voiceRoutes.ts rather than against this function, so that a wrong `joinToken`
+ * cannot make it pass. What nothing notices is *this* copy going stale, which is the
+ * asymmetry to keep in mind before trusting a probe's "same kind of participant" claim.
  */
 export function joinToken({ apiKey, apiSecret, room, identity }) {
   return sign({
