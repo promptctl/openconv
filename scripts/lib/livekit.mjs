@@ -167,7 +167,13 @@ export class Rooms {
       claims: { video: { roomCreate: true, roomList: true } },
     });
 
+    // One rendering of "which RPC, against which SFU", so no arm below can be named
+    // differently from the others or forget to be. [LAW:one-source-of-truth]
+    const named = (cause) =>
+      new Error(`${method} on ${this.url} failed: ${cause.name}: ${cause.message}`, { cause });
+
     let response;
+    let text;
     try {
       response = await fetch(`${this.url}/twirp/livekit.RoomService/${method}`, {
         method: "POST",
@@ -176,18 +182,29 @@ export class Rooms {
         // An SFU that accepts the connection and then says nothing is otherwise indefinite.
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
+      // Inside the same arm as the fetch, because the timeout covers body consumption too:
+      // an SFU that returns headers and then stalls mid-body resolves `fetch` and rejects
+      // HERE, which is the exact case REQUEST_TIMEOUT_MS exists for. Reading it outside
+      // left that one escaping unnamed while the two easier arms were covered.
+      text = await response.text();
     } catch (cause) {
       // One arm for every pre-response failure rather than a branch per error name: they
       // differ in what went wrong, which the message carries, not in what this has to do
       // about it. `cause` keeps the original for anyone who wants the stack.
       // [LAW:dataflow-not-control-flow]
-      throw new Error(`${method} on ${this.url} failed: ${cause.name}: ${cause.message}`, { cause });
+      throw named(cause);
     }
 
-    const text = await response.text();
     if (!response.ok) {
       throw new Error(`${method} on ${this.url} failed: HTTP ${response.status} ${text}`);
     }
-    return JSON.parse(text);
+
+    // A 2xx that is not JSON is an ingress or a proxy answering instead of the SFU, and
+    // `SyntaxError: Unexpected token '<'` alone does not say that — or which SFU said it.
+    try {
+      return JSON.parse(text);
+    } catch (cause) {
+      throw named(cause);
+    }
   }
 }

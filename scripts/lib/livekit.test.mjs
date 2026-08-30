@@ -232,3 +232,50 @@ test("a failure before there is a response still names the method and the origin
     }
   }
 });
+
+test("a stall during the body read is named too, not just one during the headers", async () => {
+  // The arm that escaped the first time this was fixed. `AbortSignal.timeout` covers body
+  // consumption, so an SFU that returns headers and then goes quiet resolves `fetch` and
+  // rejects at `text()` — which is precisely the "accepts the connection and then says
+  // nothing" case the timeout exists for, and it was the one still arriving nameless.
+  const cause = Object.assign(new Error("The operation was aborted due to timeout"), {
+    name: "TimeoutError",
+  });
+  const stub = stubFetch(() => ({
+    ok: true,
+    status: 200,
+    text: async () => {
+      throw cause;
+    },
+  }));
+
+  try {
+    await assert.rejects(() => sfu().call("ListRooms", {}), (error) => {
+      assert.match(error.message, /ListRooms/);
+      assert.match(error.message, /https:\/\/sfu\.example/);
+      assert.match(error.message, /TimeoutError/);
+      assert.equal(error.cause, cause);
+      return true;
+    });
+  } finally {
+    stub.restore();
+  }
+});
+
+test("a 2xx that is not JSON names the SFU that sent it", async () => {
+  // An ingress or a proxy answering instead of the room service. `SyntaxError: Unexpected
+  // token '<'` on its own says neither which call nor which host, which is the same
+  // nameless failure as the other two arms and reachable on a perfectly healthy 200.
+  const stub = stubFetch(() => ({ ok: true, status: 200, text: async () => "<html>502</html>" }));
+
+  try {
+    await assert.rejects(() => sfu().call("ListRooms", {}), (error) => {
+      assert.match(error.message, /ListRooms/);
+      assert.match(error.message, /https:\/\/sfu\.example/);
+      assert.match(error.message, /SyntaxError/);
+      return true;
+    });
+  } finally {
+    stub.restore();
+  }
+});
