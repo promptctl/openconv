@@ -50,7 +50,12 @@ const AUDIBLE = 1000;
  * cannot see it.
  */
 export function sounding(samples, sampleRate) {
-  const perFrame = sampleRate / FRAMES_PER_SECOND;
+  // Rounded, because a window has to be a whole number of samples: 22 050 Hz divides into
+  // 220.5, and a fractional stride walks off the end of the array into `undefined`, whose
+  // absolute value is NaN — a peak that compares false against every threshold and reports
+  // a loud track as silent. Every rate the recordings use divides evenly; the one that
+  // does not is the one that would have been believed.
+  const perFrame = Math.round(sampleRate / FRAMES_PER_SECOND);
   const reading = { frames: 0, audibleFrames: 0, peak: 0 };
 
   for (let at = 0; at < samples.length; at += perFrame) {

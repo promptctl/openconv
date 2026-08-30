@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { Caller } from "./caller.mjs";
+import { Caller, sounding } from "./caller.mjs";
 
 /// A caller that has "received" these events, with no room behind it. The accessors read
 /// `controlEvents` and nothing else, so this is the whole of their input.
@@ -132,4 +132,53 @@ test("a malformed event is named, never laundered into an empty string", () => {
       `${what} must be named, not swallowed`,
     );
   }
+});
+
+/// A run of `samples` at a given amplitude, in whole 10 ms windows.
+const at = (amplitude, windows, sampleRate = 48_000) =>
+  Int16Array.from({ length: (sampleRate / 100) * windows }, () => amplitude);
+
+const concat = (...runs) => {
+  const out = new Int16Array(runs.reduce((total, run) => total + run.length, 0));
+  runs.reduce((offset, run) => (out.set(run, offset), offset + run.length), 0);
+  return out;
+};
+
+test("silence and sound are told apart by amplitude, not by length", () => {
+  assert.deepEqual(sounding(at(0, 100), 48_000), { frames: 100, audibleFrames: 0, peak: 0 });
+  assert.deepEqual(sounding(at(19838, 100), 48_000), {
+    frames: 100,
+    audibleFrames: 100,
+    peak: 19838,
+  });
+});
+
+test("audibleFrames is a duration, so a track that stopped partway says so", () => {
+  // The symptom openconv-openconv-bwy.26 is filed on: a full-length track carrying the
+  // front of an utterance and then nothing. A peak taken across the whole run is 19838
+  // either way, so only the windowed count can see it.
+  const cutOff = concat(at(19838, 30), at(0, 70));
+  const whole = at(19838, 100);
+
+  assert.equal(sounding(cutOff, 48_000).peak, sounding(whole, 48_000).peak);
+  assert.equal(sounding(cutOff, 48_000).frames, sounding(whole, 48_000).frames);
+  assert.equal(sounding(cutOff, 48_000).audibleFrames, 30);
+});
+
+test("one least significant bit is silence, not sound", () => {
+  // What the agent logs as loudest=3.05e-5 and this probe as peak 1. A reading that
+  // called it audible would report the exact failure being chased as a healthy call.
+  assert.equal(sounding(at(1, 100), 48_000).audibleFrames, 0);
+  assert.equal(sounding(at(1, 100), 48_000).peak, 1);
+});
+
+test("a sample rate that does not divide into whole windows still measures the sound", () => {
+  // 22 050 / 100 is 220.5. A fractional stride walks off the end of the array into
+  // `undefined`, and Math.abs(undefined) is NaN — a peak that compares false against
+  // every threshold, reporting a loud recording as silent.
+  const reading = sounding(at(19838, 50, 22_050), 22_050);
+
+  assert.ok(Number.isFinite(reading.peak), `peak was ${reading.peak}`);
+  assert.equal(reading.peak, 19838);
+  assert.equal(reading.audibleFrames, reading.frames);
 });
