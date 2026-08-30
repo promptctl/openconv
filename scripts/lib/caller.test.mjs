@@ -175,6 +175,20 @@ test("one least significant bit is silence, not sound", () => {
   assert.equal(sounding(at(1, 100), 48_000).peak, 1);
 });
 
+test("the AUDIBLE threshold is exclusive: 1000 is silence, 1001 is sound", () => {
+  // Every number this investigation turns on is denominated in this threshold, and the
+  // comparison is a strict `peak > AUDIBLE`. The cases above — 0, 1, 19838 — are all far
+  // enough from 1000 that `>` and `>=` are indistinguishable to them, so nothing pinned
+  // which one it was. Flipping the comparison would move the boundary by one bit and stay
+  // green everywhere else in this file.
+  assert.equal(sounding(at(1000, 100), 48_000).audibleFrames, 0, "exactly at the threshold is silence");
+  assert.equal(sounding(at(1001, 100), 48_000).audibleFrames, 100, "one above it is sound");
+
+  // The peak is reported either way — the threshold decides what counts as an audible
+  // *window*, never what the loudest sample was.
+  assert.equal(sounding(at(1000, 100), 48_000).peak, 1000);
+});
+
 test("a sample rate that does not divide into whole windows still measures the sound", () => {
   // 22 050 / 100 is 220.5. A fractional stride walks off the end of the array into
   // `undefined`, and Math.abs(undefined) is NaN — a peak that compares false against
