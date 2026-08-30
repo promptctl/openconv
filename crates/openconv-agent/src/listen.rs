@@ -189,13 +189,6 @@ pub async fn listen(
     }
 }
 
-/// The next frame, or nothing once there will be no more.
-///
-/// The two ways listening stops — the track closing and the conversation ending — come
-/// back as the same value, so the loop above has one exit and the flush and the report
-/// after it happen on both. `biased` because which of the two won is not something to
-/// leave to a coin flip: a conversation that has ended is over even if frames are still
-/// queued behind it.
 /// What came next on the caller's track.
 #[derive(Debug)]
 enum Next {

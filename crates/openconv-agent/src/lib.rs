@@ -545,10 +545,14 @@ fn decode_client_event(payload: &[u8], assignment: &Assignment) -> Option<Client
     match serde_json::from_slice(payload) {
         Ok(event) => Some(event),
         Err(error) => {
+            // The error and the size, not the payload. A message that failed to parse is
+            // the one most likely to be a half-formed prompt override, and this log is on
+            // by default. Nothing diagnostic is lost: serde names the field it did not
+            // expect and where it found it, which is what says a client has drifted.
             tracing::warn!(
                 conversation = %assignment.conversation_id,
                 %error,
-                raw = %String::from_utf8_lossy(payload).chars().take(200).collect::<String>(),
+                chars = payload.len(),
                 "could not read a client control message"
             );
             None

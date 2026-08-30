@@ -88,7 +88,11 @@ impl Score {
     }
 
     /// The louder of two scores.
-    pub fn max(self, other: Self) -> Self {
+    ///
+    // [LAW:composability] crate-visible for [`crate::listen`], which keeps the loudest
+    // score of a call — not public, because nothing outside this crate has a `Score` to
+    // compare and widening the library's surface for an in-crate caller buys nothing.
+    pub(crate) fn max(self, other: Self) -> Self {
         match self.0 >= other.0 {
             true => self,
             false => other,
