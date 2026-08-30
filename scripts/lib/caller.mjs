@@ -269,9 +269,44 @@ export class Caller {
     await this.room.disconnect();
   }
 
+  /** Every control event of a given type, in arrival order. */
+  events(type) {
+    return this.controlEvents.filter((event) => event.type === type);
+  }
+
   /** The first control event of a given type, or undefined. */
   control(type) {
-    return this.controlEvents.find((event) => event.type === type);
+    return this.events(type)[0];
+  }
+
+  /**
+   * What the caller has been heard to say — settled transcripts, not tentative ones.
+   *
+   * [LAW:one-source-of-truth] The path into the event is openconv's wire shape, and each
+   * script that asserted on words used to spell it out again. Named here, a rename on the
+   * Rust side has one place to break. `vad-`, `tools-`, and `inbound-text-acceptance`
+   * still reach through `controlEvents` themselves and are the remaining copies.
+   *
+   * Reached without guards on purpose: a `user_transcript` carrying no transcript is a
+   * malformed control event, and a stack trace naming the field beats an empty string a
+   * script reads as "the caller said nothing".
+   */
+  transcripts() {
+    return this.events("user_transcript").map(
+      (event) => event.user_transcription_event.user_transcript,
+    );
+  }
+
+  /**
+   * What the agent has said, as text.
+   *
+   * Published before the words are synthesized, so this answers "did it reply" and never
+   * "was the reply audible" — that claim is `heard`, and the two fail separately.
+   */
+  replies() {
+    return this.events("agent_response").map(
+      (event) => event.agent_response_event.agent_response,
+    );
   }
 
   /**
