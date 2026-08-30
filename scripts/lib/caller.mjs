@@ -35,6 +35,71 @@ const FRAMES_PER_SECOND = 100;
 const AUDIBLE = 1000;
 
 /**
+ * The line the acceptance runs speak into a room.
+ *
+ * [LAW:one-source-of-truth] One sentence, because two scripts assert on it *being the
+ * same one*: `stt-acceptance` claims the agent transcribes it, and `loopback-acceptance`
+ * claims the transport carries it, and the second only bounds the first if they are
+ * speaking the same words. Two copies could drift into a probe that clears a sentence
+ * nobody sends while still describing itself as testing what the acceptance runs test.
+ *
+ * Its words are chosen for the speech model, not for the reader: base.en hears them all
+ * correctly, which a nonce word is not guaranteed to be (it hears "penguin" as "pen win").
+ */
+export const SPOKEN = "Hello, can you hear me? This is a test of the voice agent.";
+
+/** What a count of frames is worth in milliseconds, at the one rate a room works at. */
+export const millis = (frames) => (frames * 1000) / FRAMES_PER_SECOND;
+
+/**
+ * What a run of samples sounds like: how long it is, how much of it is sound rather than
+ * silence, and the loudest it ever gets.
+ *
+ * [LAW:one-source-of-truth] One reading, because the two questions it answers only mean
+ * something against each other — what a track delivered, and what the recording put on
+ * it. A subscriber that measured "audible" on a different threshold, or over windows of a
+ * different length, would report a healthy track as a lossy one and no assertion built on
+ * the pair could tell which side was wrong.
+ *
+ * Counted in 10 ms windows rather than over the whole run, so `audibleFrames` is a
+ * duration and not a verdict: a track that carried the first second of a four-second
+ * sentence is the symptom being chased here, and a peak taken across the whole thing
+ * cannot see it.
+ */
+export function sounding(samples, sampleRate) {
+  // Rounded, because a window has to be a whole number of samples: 22 050 Hz divides into
+  // 220.5, and a fractional stride walks off the end of the array into `undefined`, whose
+  // absolute value is NaN — a peak that compares false against every threshold and reports
+  // a loud track as silent. Every rate the recordings use divides evenly; the one that
+  // does not is the one that would have been believed.
+  const perFrame = Math.round(sampleRate / FRAMES_PER_SECOND);
+
+  // [LAW:no-defensive-null-guards] exception: an inland check, and named as one. A rate
+  // that rounds to zero samples per window makes the loop below step by zero and run
+  // forever, and `readRecording` — the parser that would properly refuse it — is not the
+  // only source here; `frame.sampleRate` arrives off the SFU with no parser of ours in
+  // front of it. A hang is the one failure that reaches no log at all, so it is worth an
+  // unproven guard to turn it into a sentence.
+  if (!(perFrame > 0)) {
+    throw new RangeError(`a ${sampleRate} Hz rate is less than one sample per 10 ms window`);
+  }
+
+  const reading = { frames: 0, audibleFrames: 0, peak: 0 };
+
+  for (let at = 0; at < samples.length; at += perFrame) {
+    const end = Math.min(at + perFrame, samples.length);
+    let peak = 0;
+    for (let sample = at; sample < end; sample += 1) {
+      peak = Math.max(peak, Math.abs(samples[sample]));
+    }
+    reading.frames += 1;
+    reading.peak = Math.max(reading.peak, peak);
+    if (peak > AUDIBLE) reading.audibleFrames += 1;
+  }
+  return reading;
+}
+
+/**
  * A 16-bit mono PCM recording, which is the only thing that can be spoken into a room.
  *
  * A parser rather than a check: a `Recording` cannot be built out of a stereo file, a
@@ -82,6 +147,12 @@ export function readRecording(path) {
         `channels=${format.channels} bits=${format.bitsPerSample}`,
     );
   }
+  // The one field of `fmt ` this parser used to read without constraining, which left a
+  // zero rate representable in the `Recording` it hands out — and downstream that is not a
+  // wrong number but a hung process, since it divides into zero samples per window.
+  if (!(format.sampleRate > 0)) {
+    throw new Error(`${path} declares a ${format.sampleRate} Hz sample rate`);
+  }
   return { sampleRate: format.sampleRate, samples };
 }
 
@@ -120,9 +191,22 @@ export class Caller {
       throw new Error(`mint failed: HTTP ${response.status} ${await response.text()}`);
     }
     const { token } = await response.json();
+    return Caller.at(livekitUrl, token);
+  }
 
-    // The conversation ID *is* the room name, which is what makes it recoverable from
-    // the token the same way both of Happy's clients recover it.
+  /**
+   * Joins whatever room a token already names.
+   *
+   * Split from `join` so that being a client in a room does not require openconv to have
+   * minted the token — a probe measuring the transport itself needs a room with no agent
+   * in it, and building a second client to get one would mean measuring a different
+   * program than the acceptance scripts run.
+   *
+   * The room name is read from the token rather than passed beside it, because the two
+   * cannot then disagree. For a conversation that name *is* the conversation ID, which is
+   * how both of Happy's clients recover it.
+   */
+  static async at(livekitUrl, token) {
     const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64").toString());
     const caller = new Caller(claims.video.room, livekitUrl);
 
@@ -150,7 +234,7 @@ export class Caller {
      * apart.
      */
     this.heard = { frames: 0, audibleFrames: 0, peak: 0, lastAudibleAt: 0, error: null };
-    this.agentTrack = null;
+    this.remoteTrack = null;
     this.mic = null;
 
     this.room.on(RoomEvent.DataReceived, (payload) => {
@@ -165,22 +249,37 @@ export class Caller {
     });
     this.room.on(RoomEvent.ParticipantConnected, (p) => this.participants.push(p.identity));
 
+    /**
+     * Who the SFU has said is talking.
+     *
+     * A different fact from `heard`, and the only other one available: LiveKit decides
+     * this from the audio-level header the publisher's own libwebrtc stamps on each RTP
+     * packet, so it is a reading taken upstream of this client's decoder and upstream of
+     * the network between them. A participant the SFU calls loud whose track arrives here
+     * silent, and one the SFU never mentions at all, are the same symptom with opposite
+     * causes, and nothing in the decoded audio can tell them apart.
+     */
+    this.reportedSpeaking = new Set();
+    this.room.on(RoomEvent.ActiveSpeakersChanged, (speakers) => {
+      for (const speaker of speakers) this.reportedSpeaking.add(speaker.identity);
+    });
+
     // Read from the moment the track is subscribed, the way a client that is playing
     // audio does. Reading later instead — after the assertions that come first in a
-    // script — misses whatever the agent said on subscribe, and reports a working track
-    // as silent.
+    // script — misses whatever arrived on subscribe, and reports a working track as
+    // silent. Whoever is publishing: an agent in the acceptance runs, another probe
+    // client in `loopback-acceptance`, which subscribes through this same handler.
     this.room.on(RoomEvent.TrackSubscribed, (track) => {
-      if (this.agentTrack) return;
-      this.agentTrack = track;
+      if (this.remoteTrack) return;
+      this.remoteTrack = track;
       (async () => {
         for await (const frame of new AudioStream(track)) {
-          this.heard.frames += 1;
-          let peak = 0;
-          for (const sample of frame.data) peak = Math.max(peak, Math.abs(sample));
-          this.heard.peak = Math.max(this.heard.peak, peak);
-          if (peak > AUDIBLE) {
-            this.heard.audibleFrames += 1;
-            // When the agent was last actually making a sound. What "stopped talking"
+          const arrived = sounding(frame.data, frame.sampleRate);
+          this.heard.frames += arrived.frames;
+          this.heard.audibleFrames += arrived.audibleFrames;
+          this.heard.peak = Math.max(this.heard.peak, arrived.peak);
+          if (arrived.audibleFrames > 0) {
+            // When the remote was last actually making a sound. What "stopped talking"
             // is measured against — the frames keep arriving after it stops, they just
             // carry silence, so counting frames cannot tell the two apart.
             this.heard.lastAudibleAt = Date.now();
@@ -190,6 +289,17 @@ export class Caller {
         this.heard.error = error;
       });
     });
+  }
+
+  /**
+   * True once this client has a remote track to listen to.
+   *
+   * Being in a room and being subscribed to what is published in it are different
+   * moments, and a script that speaks in the gap between them is heard by nobody — which
+   * looks exactly like the transport losing the audio, and is not.
+   */
+  subscribed() {
+    return this.remoteTrack !== null;
   }
 
   /** The remote participants currently in the room. */
@@ -245,7 +355,15 @@ export class Caller {
       track,
       new TrackPublishOptions({ source: TrackSource.SOURCE_MICROPHONE }),
     );
-    await Promise.race([subscribed, rejectAfter(20_000, "the agent to subscribe to the caller")]);
+    // Named at the level of what is actually awaited — `LocalTrackSubscribed`, i.e. some
+    // remote participant — rather than "the agent". Who that participant turns out to be is
+    // the caller's topology, not this method's: `loopback-acceptance` publishes into a room
+    // with two listeners and no agent at all, and a message naming the agent would send the
+    // one probe built to stop misattribution off blaming a participant that does not exist.
+    await Promise.race([
+      subscribed,
+      rejectAfter(20_000, "a remote participant to subscribe to the caller's microphone"),
+    ]);
 
     this.mic = new Microphone(source, sampleRate);
     return this.mic;

@@ -12,26 +12,7 @@
 // from the endpoint's own documentation, so this fails when openconv stops satisfying
 // its caller — not when it stops matching what we believed its caller wanted.
 
-import { createHmac } from "node:crypto";
-
-const b64url = (buf) =>
-  Buffer.from(buf).toString("base64").replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
-
-function mintRoomListToken(apiKey, apiSecret) {
-  const now = Math.floor(Date.now() / 1000);
-  const header = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-  const payload = b64url(
-    JSON.stringify({
-      iss: apiKey,
-      sub: "openconv-acceptance",
-      nbf: now,
-      exp: now + 600,
-      video: { roomList: true },
-    }),
-  );
-  const signature = b64url(createHmac("sha256", apiSecret).update(`${header}.${payload}`).digest());
-  return `${header}.${payload}.${signature}`;
-}
+import { Rooms } from "./lib/livekit.mjs";
 
 // The one boundary: everything below runs on values known to exist.
 function readConfig(env, argv) {
@@ -68,7 +49,19 @@ async function mint(query, apiKey = config.xiApiKey) {
 // How Happy recovers the conversation ID — its regex, verbatim from voiceRoutes.ts.
 const recoverConversationId = (room) => (room || "").match(/(conv_[a-zA-Z0-9]+)/)?.[0];
 
-console.log(`openconv ${config.openconv} against LiveKit ${config.livekit}\n`);
+// Constructed here rather than beside its first use so the banner below can name the origin
+// requests actually go to. `Rooms` derives an HTTP origin from whichever scheme it is handed
+// (`wss://host` -> `https://host`), so printing the raw argument would have the banner claim
+// one endpoint while every request went to another — misleading on exactly the failed run
+// somebody reads a banner on. Constructing it is pure string work; nothing is dialled until
+// `call`. [LAW:one-source-of-truth]
+const roomService = new Rooms({
+  url: config.livekit,
+  apiKey: config.apiKey,
+  apiSecret: config.apiSecret,
+});
+
+console.log(`openconv ${config.openconv} against LiveKit ${roomService.url}\n`);
 
 // ---- the metered path: agent_id plus a participant_name carrying Happy's user ID ----
 const minted = await mint("agent_id=agent_happy&participant_name=u_acceptance");
@@ -102,18 +95,7 @@ check("token is signed by the configured key", claims.iss === config.apiKey, cla
 check("token outlives a long call", claims.exp - claims.nbf >= 5 * 3600, `${claims.exp - claims.nbf}s`);
 
 // ---- the room exists on the SFU, because auto_create is off and joining would fail ----
-const roomsResponse = await fetch(`${config.livekit}/twirp/livekit.RoomService/ListRooms`, {
-  method: "POST",
-  headers: {
-    Authorization: `Bearer ${mintRoomListToken(config.apiKey, config.apiSecret)}`,
-    "Content-Type": "application/json",
-  },
-  body: "{}",
-});
-if (!roomsResponse.ok) {
-  throw new Error(`ListRooms failed: HTTP ${roomsResponse.status} ${await roomsResponse.text()}`);
-}
-const rooms = (await roomsResponse.json()).rooms ?? [];
+const { rooms = [] } = await roomService.call("ListRooms", {});
 const room = rooms.find((candidate) => candidate.name === conversationId);
 
 check("the room was actually created on the SFU", Boolean(room), `${rooms.length} room(s) open`);
