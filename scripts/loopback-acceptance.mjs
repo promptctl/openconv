@@ -84,14 +84,46 @@ const SETUP_MS = 10_000;
  */
 async function required(listeners, predicate, what) {
   const met = await Promise.all(
-    listeners.map((listener) => listener.waitFor(() => predicate(listener), SETUP_MS, what)),
+    // The identity goes into `what` as well as into the message below, because `waitFor`
+    // prints its own "gave up" line before this throw is ever reached — and a run that
+    // says which ear gave up, then which ear never got there, needs no second run.
+    listeners.map((listener) =>
+      listener.waitFor(() => predicate(listener), SETUP_MS, `${listener.identity}: ${what}`),
+    ),
   );
-  if (met.every(Boolean)) return;
+
+  const missed = listeners.filter((_, index) => !met[index]);
+  if (missed.length === 0) return;
 
   throw new Error(
-    `waited ${SETUP_MS / 1000}s for ${what} and ${met.filter((ok) => !ok).length} of ` +
-      `${listeners.length} listeners never got there — stopping, because every number ` +
-      `this script would print from here on would be about that and not about the transport`,
+    `waited ${SETUP_MS / 1000}s for ${what} and ${missed.map((l) => l.identity).join(", ")} ` +
+      `never got there — stopping, because every number this script would print from here ` +
+      `on would be about that and not about the transport`,
+  );
+}
+
+/**
+ * The measuring stick, checked before anything is measured against it.
+ *
+ * Every check below is a ratio against this recording, so a recording with nothing in it
+ * does not fail the run — it certifies it. `ENOUGH` becomes `ceil(0 * 0.9)` = 0, and
+ * `heard.audibleFrames >= 0` holds for a listener that received not one frame; `heard.peak
+ * / published.peak` becomes `Infinity`, which clears `QUIETEST_ACCEPTABLE` the moment Opus
+ * dithers a single non-zero sample out of silence. Quiet TTS output or a wrong voice on a
+ * runner is enough to get there.
+ *
+ * That is this script's own documented failure — an answer-shaped void, a green run whose
+ * numbers mean something other than what they appear to — arriving through the instrument
+ * rather than through the transport. So it is refused here, loudly, at the one place the
+ * recording becomes a thing worth comparing against. [LAW:parse-dont-validate]
+ */
+function audible(published) {
+  if (published.peak > 0 && published.audibleFrames > 0) return published;
+
+  throw new Error(
+    `the recording to measure against is silent (peak ${published.peak}, ` +
+      `${millis(published.audibleFrames)} ms audible) — stopping, because every check below ` +
+      `is a ratio against it and would pass for a listener that heard nothing at all`,
   );
 }
 
@@ -111,32 +143,46 @@ function readConfig(env, argv) {
 const { apiKey, apiSecret, livekitUrl } = readConfig(process.env, process.argv);
 const checks = new Checks();
 
-// Created rather than joined: the deployment runs with room.auto_create off, and a
-// conversation room is capped at two participants — this one is ours, so it can be
-// whatever shape the measurement needs.
-const rooms = new Rooms({ url: livekitUrl, apiKey, apiSecret });
-const name = `probe_${randomUUID()}`;
-await rooms.call("CreateRoom", { name, empty_timeout: 120, max_participants: 8 });
-console.log(`created ${name} at ${livekitUrl}\n`);
-
-const at = (identity) =>
-  Caller.at(livekitUrl, joinToken({ apiKey, apiSecret, room: name, identity }));
-
-const clients = [];
+// Recorded before the room exists, not because the order reads better but because
+// `recordSpeech` shells out to `say`, which throws on a non-zero exit or a missing binary
+// — on any non-macOS runner, every time. Anything that can throw between `CreateRoom` and
+// the `try` below leaks a room on the real deployment, so the region between them is kept
+// empty rather than kept safe. [LAW:no-ambient-temporal-coupling]
 const recording = recordSpeech(SPOKEN, join(mkdtempSync(join(tmpdir(), "openconv-loopback-")), "speech.wav"));
-const published = sounding(recording.samples, recording.sampleRate);
+const published = audible(sounding(recording.samples, recording.sampleRate));
 
 /// The audible duration a listener has to reach. One number for the wait and the check,
 /// so the wait ends the moment the run is healthy rather than at the settle window.
 const ENOUGH = Math.ceil(published.audibleFrames * SHORTEST_ACCEPTABLE);
 
-// From here the room exists and is this script's to clean up. Everything that can throw —
-// three connections with their own timeouts, `say`, every wait — sits inside, because a
-// failure that skipped the cleanup would leave connected participants in a room on the
-// real deployment, and a room with clients in it is not empty, so `empty_timeout` does
-// not start counting until the process dies.
+// Created rather than joined: the deployment runs with room.auto_create off, and a
+// conversation room is capped at two participants — this one is ours, so it can be
+// whatever shape the measurement needs.
+const rooms = new Rooms({ url: livekitUrl, apiKey, apiSecret });
+const name = `probe_${randomUUID()}`;
+
+/// The identity travels with the client rather than being recovered later by zipping this
+/// array against `LISTENERS` by index — two parallel arrays that stay aligned only as long
+/// as nobody reorders one, in a script whose whole point is saying which ear lost the
+/// audio. [LAW:one-source-of-truth]
+const at = async (identity) =>
+  Object.assign(
+    await Caller.at(livekitUrl, joinToken({ apiKey, apiSecret, room: name, identity })),
+    { identity },
+  );
+
+const clients = [];
 let listeners = [];
+
+// The last statement before the `try`, deliberately: from here the room exists and is this
+// script's to clean up, and everything that can throw — three connections with their own
+// timeouts, every wait — sits inside, because a failure that skipped the cleanup would
+// leave connected participants in a room on the real deployment, and a room with clients in
+// it is not empty, so `empty_timeout` does not start counting until the process dies.
+await rooms.call("CreateRoom", { name, empty_timeout: 120, max_participants: 8 });
 try {
+  console.log(`created ${name} at ${livekitUrl}\n`);
+
   // The listeners first. Publishing waits for a remote subscription before it captures a
   // frame, and a publisher alone in a room would wait for a subscriber who never arrives.
   listeners = await Promise.all(LISTENERS.map(at));
@@ -190,9 +236,9 @@ try {
 }
 
 console.log();
-for (const [index, listener] of listeners.entries()) {
+for (const listener of listeners) {
   const heard = listener.heard;
-  const who = LISTENERS[index];
+  const who = listener.identity;
   console.log(
     `${who}: heard ${millis(heard.frames)} ms, of which ${millis(heard.audibleFrames)} ms audible, ` +
       `peak ${heard.peak}, SFU called the speaker ${listener.reportedSpeaking.has(SPEAKER) ? "loud" : "silent"}`,
@@ -200,9 +246,9 @@ for (const [index, listener] of listeners.entries()) {
 }
 console.log();
 
-for (const [index, listener] of listeners.entries()) {
+for (const listener of listeners) {
   const heard = listener.heard;
-  const who = LISTENERS[index];
+  const who = listener.identity;
 
   // Reported before anything else is judged: a reader that died on its first frame leaves
   // the same zero counts as a track that was never spoken into, and only this tells them
