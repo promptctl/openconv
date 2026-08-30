@@ -118,7 +118,11 @@ pub async fn listen(
     let mut reporter = Reporter::new();
     let mut arriving = Arriving::attached_at(attached);
 
-    while let Some(frame) = next_frame(&mut frames, &ended).await {
+    let ending = loop {
+        let frame = match next_frame(&mut frames, &ended).await {
+            Next::Frame(frame) => frame,
+            Next::Ended(ending) => break ending,
+        };
         let arrived = Instant::now();
 
         let samples = to_f32(&frame.data);
@@ -138,7 +142,7 @@ pub async fn listen(
             tracing::trace!(score = report.as_f64(), "scored the caller's audio");
 
             if noticed.send(Noticed::Speaking(report)).await.is_err() {
-                break;
+                break Ending::NobodyListening;
             }
         }
 
@@ -151,7 +155,7 @@ pub async fn listen(
                     // the caller has decided not to wait for. A transcript of what they
                     // are saying arrives seconds later; the agent has to stop now.
                     if noticed.send(Noticed::Started).await.is_err() {
-                        break;
+                        break Ending::NobodyListening;
                     }
                     continue;
                 }
@@ -162,15 +166,23 @@ pub async fn listen(
         if let Some(speech) = transcribe(&transcriber, audio, kind).await {
             // A closed receiver means the conversation ended while we were transcribing.
             if noticed.send(Noticed::Said(speech)).await.is_err() {
-                break;
+                break Ending::NobodyListening;
             }
         }
-    }
+    };
 
     arriving.report();
 
-    // A caller who hangs up mid-sentence still said it.
-    if let Some(audio) = endpointer.flush() {
+    // A caller who hangs up mid-sentence still said it — but only to someone still there
+    // to hear it, which is the distinction [`Ending`] exists to carry. Transcription is by
+    // far the most expensive thing this module does, and running it for a value nobody
+    // reads is an inference taken from the calls that are still live.
+    let owed = match ending {
+        Ending::TrackStopped => endpointer.flush(),
+        Ending::NobodyListening => None,
+    };
+
+    if let Some(audio) = owed {
         if let Some(speech) = transcribe(&transcriber, audio, Speech::Final).await {
             let _ = noticed.send(Noticed::Said(speech)).await;
         }
@@ -184,18 +196,52 @@ pub async fn listen(
 /// after it happen on both. `biased` because which of the two won is not something to
 /// leave to a coin flip: a conversation that has ended is over even if frames are still
 /// queued behind it.
+/// What came next on the caller's track.
+#[derive(Debug)]
+enum Next {
+    Frame(AudioFrame<'static>),
+    Ended(Ending),
+}
+
+/// Why the listener stopped, and therefore what is still owed.
+///
+/// Two variants rather than one "the loop finished", because they are owed different
+/// things. A track that stopped may have cut the caller off mid-word, and the conversation
+/// is still there to be told what it was. A conversation that has ended has nobody left to
+/// tell, and transcribing for it costs a whole speech-to-text inference — the most
+/// expensive thing this module does — taken from the calls that are still live.
+///
+/// The distinction is not academic. Locals drop in reverse order, so a conversation ending
+/// cancels the token and then closes the channel, in that order, with nothing awaited in
+/// between: by the time the woken listener has transcribed anything there is reliably no
+/// receiver left. Collapsing these two into one exit made that waste the *ordinary* path,
+/// not the edge case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ending {
+    /// The caller's track stopped producing frames.
+    TrackStopped,
+    /// The conversation is over — cancelled, or its receiver already gone.
+    NobodyListening,
+}
+
 /// Generic over the stream so the one case that matters can be tested: a stream that never
 /// yields and never ends, which is what a [`NativeAudioStream`] becomes the moment its
 /// caller hangs up. There is no way to build one of those in a test, and it is the exact
 /// shape that used to park this task forever.
-async fn next_frame<S>(frames: &mut S, ended: &CancellationToken) -> Option<AudioFrame<'static>>
+///
+/// `biased` because which of the two won is not something to leave to a coin flip: a
+/// conversation that has ended is over even if frames are still queued behind it.
+async fn next_frame<S>(frames: &mut S, ended: &CancellationToken) -> Next
 where
     S: futures_util::Stream<Item = AudioFrame<'static>> + Unpin,
 {
     tokio::select! {
         biased;
-        () = ended.cancelled() => None,
-        frame = frames.next() => frame,
+        () = ended.cancelled() => Next::Ended(Ending::NobodyListening),
+        frame = frames.next() => match frame {
+            Some(frame) => Next::Frame(frame),
+            None => Next::Ended(Ending::TrackStopped),
+        },
     }
 }
 
@@ -384,7 +430,26 @@ mod tests {
 
         ended.cancel();
 
-        assert!(next_frame(&mut forever, &ended).await.is_none());
+        let next = next_frame(&mut forever, &ended).await;
+        assert!(
+            matches!(next, Next::Ended(Ending::NobodyListening)),
+            "a cancelled conversation left the listener waiting: {next:?}"
+        );
+    }
+
+    /// The two endings are told apart, because only one of them is owed a last transcript.
+    /// A track that runs out while the conversation is still live is a caller cut off
+    /// mid-word; the conversation is still there to hear what it was.
+    #[tokio::test]
+    async fn a_track_running_out_is_a_different_ending_from_the_conversation_closing() {
+        let ended = CancellationToken::new();
+        let mut finished = futures_util::stream::empty::<AudioFrame<'static>>();
+
+        let next = next_frame(&mut finished, &ended).await;
+        assert!(
+            matches!(next, Next::Ended(Ending::TrackStopped)),
+            "a finished track read as the conversation ending: {next:?}"
+        );
     }
 
     /// And while the conversation is live, a stream with nothing on it yet is not an
