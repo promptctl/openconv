@@ -10,8 +10,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { Caller, millis, sounding } from "./caller.mjs";
+import { Caller, millis, readRecording, sounding } from "./caller.mjs";
 
 /// A caller that has "received" these events, with no room behind it. The accessors read
 /// `controlEvents` and nothing else, so this is the whole of their input.
@@ -204,4 +207,48 @@ test("millis is the one place a frame becomes a duration", () => {
   // reads as the duration it is rather than as a count divided by a literal.
   assert.ok(millis(20) >= 200);
   assert.ok(millis(19) < 200);
+});
+
+/// A minimal RIFF/WAVE file, built rather than checked in so a test can say which field it
+/// is corrupting. Defaults are what `say -o --data-format LEI16@48000` produces.
+const wav = ({ sampleRate = 48_000, channels = 1, bitsPerSample = 16, encoding = 1 } = {}) => {
+  const samples = Int16Array.from([0, 19838, -19838, 0]);
+  const file = Buffer.alloc(44 + samples.byteLength);
+  file.write("RIFF", 0);
+  file.writeUInt32LE(36 + samples.byteLength, 4);
+  file.write("WAVE", 8);
+  file.write("fmt ", 12);
+  file.writeUInt32LE(16, 16);
+  file.writeUInt16LE(encoding, 20);
+  file.writeUInt16LE(channels, 22);
+  file.writeUInt32LE(sampleRate, 24);
+  file.writeUInt32LE((sampleRate * channels * bitsPerSample) / 8, 28);
+  file.writeUInt16LE((channels * bitsPerSample) / 8, 32);
+  file.writeUInt16LE(bitsPerSample, 34);
+  file.write("data", 36);
+  file.writeUInt32LE(samples.byteLength, 40);
+  Buffer.from(samples.buffer).copy(file, 44);
+
+  const path = join(mkdtempSync(join(tmpdir(), "openconv-wav-")), "built.wav");
+  writeFileSync(path, file);
+  return path;
+};
+
+test("a recording that declares no sample rate is refused at the parse", () => {
+  // The boundary half of the zero-rate fix, and the half that matters more: `sounding`
+  // refuses such a rate too, but this is the parser whose output nothing downstream
+  // re-checks, so a zero surviving here is a zero that reaches a window loop stepping by
+  // zero — a hang rather than a wrong answer.
+  assert.throws(
+    () => readRecording(wav({ sampleRate: 0 })),
+    (error) => error.message.includes("0 Hz"),
+    "a zero sample rate must be named, not passed through",
+  );
+
+  // And the same builder parses when only that field is sound, so the test above cannot
+  // be passing by refusing every WAV it is handed.
+  const good = readRecording(wav());
+  assert.equal(good.sampleRate, 48_000);
+  assert.equal(good.samples.length, 4);
+  assert.equal(sounding(good.samples, good.sampleRate).peak, 19838);
 });

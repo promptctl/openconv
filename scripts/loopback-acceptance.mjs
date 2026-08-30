@@ -63,6 +63,38 @@ const QUIETEST_ACCEPTABLE = 0.5;
 /// says audio went missing.
 const SHORTEST_ACCEPTABLE = 0.9;
 
+/// How long a client is given to finish joining and subscribing before the run is void.
+const SETUP_MS = 10_000;
+
+/**
+ * Waits for something every listener has to have done, and voids the run if one has not.
+ *
+ * Not a `checks.record`, though both of these once were. `Checks` is for claims about the
+ * thing under test, and everything this script claims is about audio — what the transport
+ * carried. Whether the clients finished joining and subscribing is a precondition: if it
+ * does not hold there is no answer to give, and speaking anyway produces a short reading
+ * that the checks below would attribute to the transport. That is an answer-shaped void —
+ * a number with the exact shape of a measurement and a different meaning — and it is the
+ * specific false negative the publish-wait-speak split exists to prevent, so recording it
+ * and continuing is worse than not checking: it prints FAIL on one line and manufactures
+ * evidence for the wrong conclusion on the next.
+ *
+ * [LAW:one-type-per-behavior] One helper for both waits: they differ in a predicate and a
+ * name, which are values, not in what happens when they fail.
+ */
+async function required(listeners, predicate, what) {
+  const met = await Promise.all(
+    listeners.map((listener) => listener.waitFor(() => predicate(listener), SETUP_MS, what)),
+  );
+  if (met.every(Boolean)) return;
+
+  throw new Error(
+    `waited ${SETUP_MS / 1000}s for ${what} and ${met.filter((ok) => !ok).length} of ` +
+      `${listeners.length} listeners never got there — stopping, because every number ` +
+      `this script would print from here on would be about that and not about the transport`,
+  );
+}
+
 /** The one boundary: everything below runs on values known to exist. */
 function readConfig(env, argv) {
   const missing = ["LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"].filter((name) => !env[name]);
@@ -112,17 +144,7 @@ try {
   const speaker = await at(SPEAKER);
   clients.push(speaker);
 
-  checks.record(
-    "every listener sees the speaker in the room",
-    (
-      await Promise.all(
-        listeners.map((listener) =>
-          listener.waitFor(() => listener.roster().includes(SPEAKER), 10_000, "the speaker to join"),
-        ),
-      )
-    ).every(Boolean),
-    listeners.map((listener) => listener.roster().length).join(" and ") + " participants seen",
-  );
+  await required(listeners, (listener) => listener.roster().includes(SPEAKER), `${SPEAKER} to join`);
 
   console.log(
     `\nspeaking ${millis(published.frames)} ms, of which ${millis(published.audibleFrames)} ms audible, peak ${published.peak}\n`,
@@ -133,17 +155,8 @@ try {
   // listener still subscribing while the lead-in plays loses the front of the utterance,
   // which is this probe's own symptom wearing the costume of the bug it hunts.
   const mic = await speaker.microphone(recording.sampleRate);
-  checks.record(
-    "every listener is subscribed before a word is spoken",
-    (
-      await Promise.all(
-        listeners.map((listener) =>
-          listener.waitFor(() => listener.subscribed(), 10_000, "a track to listen to"),
-        ),
-      )
-    ).every(Boolean),
-    `${listeners.filter((listener) => listener.subscribed()).length}/${listeners.length} subscribed`,
-  );
+  await required(listeners, (listener) => listener.subscribed(), "a track to listen to");
+  console.log(`  ${listeners.length}/${listeners.length} listeners subscribed before a word was spoken\n`);
 
   await mic.say(recording);
   await Promise.all(
@@ -163,7 +176,17 @@ try {
   for (const outcome of left.filter((outcome) => outcome.status === "rejected")) {
     console.error(`  (a client failed to leave ${name}: ${outcome.reason})`);
   }
-  await rooms.call("DeleteRoom", { room: name });
+
+  // Loud on stderr but not fatal. A throw from inside `finally` replaces the run's whole
+  // report — every check already recorded — with a stack trace about cleanup, and on a
+  // failing run that report is the reason the run happened. A leaked room is worth
+  // shouting about; it is not worth the findings. An error from the try block still
+  // propagates past this, so a real cause is never masked by cleanup noise.
+  try {
+    await rooms.call("DeleteRoom", { room: name });
+  } catch (error) {
+    console.error(`  (${name} was left behind on the SFU: ${error.message})`);
+  }
 }
 
 console.log();
