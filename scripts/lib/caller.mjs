@@ -269,16 +269,66 @@ export class Caller {
     await this.room.disconnect();
   }
 
+  /** Every control event of a given type, in arrival order. */
+  events(type) {
+    return this.controlEvents.filter((event) => event.type === type);
+  }
+
   /** The first control event of a given type, or undefined. */
   control(type) {
-    return this.controlEvents.find((event) => event.type === type);
+    return this.events(type)[0];
+  }
+
+  /**
+   * What openconv wraps each settled transcript in: the words, and the id a client
+   * correlates a turn on.
+   *
+   * [LAW:one-source-of-truth] `user_transcription_event` is spelled here and nowhere
+   * else, so a rename on the Rust side has one place to break. Handing back the payload
+   * rather than one field of it means a script asserting on some other part of it needs
+   * nothing new here. `inbound-text-acceptance` also selects transcript events, but only
+   * on `type` — it never reaches into the payload, so this key genuinely has one owner.
+   *
+   * Unparsed, unlike `transcripts()`: whether a transcript carries an `event_id` is a
+   * claim `stt-acceptance` exists to make, and refusing here would crash the script that
+   * came to ask rather than let it report the answer.
+   */
+  transcriptEvents() {
+    return this.events("user_transcript").map((event) => event.user_transcription_event);
+  }
+
+  /** What the caller has been heard to say — settled transcripts, not tentative ones. */
+  transcripts() {
+    return this.transcriptEvents().map((payload) => requireText(payload, "user_transcript"));
+  }
+
+  /**
+   * What the agent has said, as text.
+   *
+   * Published before the words are synthesized, so this answers "did it reply" and never
+   * "was the reply audible" — that claim is `heard`, and the two fail separately.
+   *
+   * [LAW:one-source-of-truth] `tools-` and `inbound-text-acceptance` still spell
+   * `agent_response_event.agent_response` out themselves and are the remaining copies of
+   * this read.
+   */
+  replies() {
+    return this.events("agent_response").map((event) =>
+      requireText(event.agent_response_event, "agent_response"),
+    );
   }
 
   /**
    * Polls until `predicate` holds, and says so when it never does.
    *
-   * Returns a boolean rather than throwing because every caller is a check: a script
-   * reports "the agent never answered" as a failed assertion, not as a stack trace.
+   * The thing not happening returns `false` rather than throwing, because every caller is
+   * a check: a script reports "the agent never answered" as a failed assertion, not as a
+   * stack trace.
+   *
+   * A predicate that meets a malformed control event still throws, and is meant to. That
+   * is a different fact with a different cause — openconv published something the
+   * protocol does not allow, rather than the agent staying quiet — and reporting it as a
+   * failed check would send the next reader to the wrong end of the system.
    */
   async waitFor(predicate, ms, what) {
     const until = Date.now() + ms;
@@ -338,6 +388,25 @@ class Microphone {
     }
     await this.source.waitForPlayout();
   }
+}
+
+/**
+ * The words a control event carries, or a refusal naming what was missing instead.
+ *
+ * [LAW:parse-dont-validate] The one place an event becomes a string. Everything
+ * downstream is handed a `string`, so no script checks — there is nothing left to check.
+ *
+ * Absent is not empty, and the whole point is to keep them apart: a settled transcript of
+ * silence *is* `""` and means the caller said nothing, while a missing field means
+ * openconv published a malformed event. Collapsing the two would let a protocol bug reach
+ * a script as a quiet transcription failure and be reported as one.
+ */
+function requireText(payload, field) {
+  const text = payload?.[field];
+  if (typeof text !== "string") {
+    throw new TypeError(`control event carried no ${field} — found ${JSON.stringify(text)}`);
+  }
+  return text;
 }
 
 function concat(parts) {

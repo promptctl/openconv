@@ -50,7 +50,7 @@ const PROMPT =
 
 /// Matching is on words, so "Banana." counts and spacing or punctuation never decides
 /// whether the pipeline worked.
-const said = (text, word) => (text ?? "").toLowerCase().includes(word);
+const said = (text, word) => text.toLowerCase().includes(word);
 
 const { xiApiKey, openconv, livekitUrl } = readEnvironment(process.env, process.argv);
 const checks = new Checks();
@@ -93,30 +93,24 @@ const before = caller.mark();
 const spoken = await caller.speak(recording);
 console.log(`\nspoke ${spoken.toFixed(1)}s into the room, waiting to be answered\n`);
 
-const transcript = () =>
-  caller.controlEvents
-    .filter((event) => event.type === "user_transcript")
-    .map((event) => event.user_transcription_event?.user_transcript ?? "");
-
 checks.record(
   "the caller's words reached speech-to-text",
   await caller.waitFor(
-    () => transcript().some((text) => said(text, word)),
+    () => caller.transcripts().some((text) => said(text, word)),
     60_000,
     "a final transcript of the caller",
   ),
-  JSON.stringify(transcript()),
+  JSON.stringify(caller.transcripts()),
 );
-
-const replies = () =>
-  caller.controlEvents
-    .filter((event) => event.type === "agent_response")
-    .map((event) => event.agent_response_event?.agent_response ?? "");
 
 checks.record(
   "the agent answered what the caller actually said",
-  await caller.waitFor(() => replies().some((text) => said(text, word)), 60_000, "the reply"),
-  JSON.stringify(replies()),
+  await caller.waitFor(
+    () => caller.replies().some((text) => said(text, word)),
+    60_000,
+    "the reply",
+  ),
+  JSON.stringify(caller.replies()),
 );
 
 // The reply is published as text before its audio has been synthesized, so the sound
