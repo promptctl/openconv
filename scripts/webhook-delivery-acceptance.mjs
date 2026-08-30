@@ -16,6 +16,7 @@
 
 import { createHmac } from "node:crypto";
 import { Checks, readEnvironment } from "./lib/caller.mjs";
+import { livekitCredentials } from "./lib/livekit.mjs";
 
 const b64url = (buf) =>
   Buffer.from(buf).toString("base64").replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
@@ -35,17 +36,17 @@ function mintToken(apiKey, apiSecret, grants) {
 /** The one boundary: everything below runs on values known to exist. */
 function readConfig(env, argv) {
   const { xiApiKey, openconv } = readEnvironment(env, argv);
-  const missing = ["LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"].filter((name) => !env[name]);
-  if (missing.length > 0) {
-    throw new Error(`missing ${missing.join(" and ")} — read them from Vault at secret/livekit`);
-  }
+  // Shared, unlike the sibling scripts that fold the LiveKit pair into one combined
+  // message: this one already sources its other variables through `readEnvironment`, so
+  // its LiveKit check was a standalone copy with nothing holding it here.
+  const { apiKey, apiSecret } = livekitCredentials(env);
   // The SFU's HTTP origin, which is what the Twirp room service answers on. Accepts the
   // wss:// form every other script takes so one argument shape works everywhere.
   const sfu = (argv[3] ?? "wss://livekit.sanctuary.gdn")
     .replace(/^wss:/, "https:")
     .replace(/^ws:/, "http:")
     .replace(/\/$/, "");
-  return { xiApiKey, openconv, sfu, apiKey: env.LIVEKIT_API_KEY, apiSecret: env.LIVEKIT_API_SECRET };
+  return { xiApiKey, openconv, sfu, apiKey, apiSecret };
 }
 
 const { xiApiKey, openconv, sfu, apiKey, apiSecret } = readConfig(process.env, process.argv);

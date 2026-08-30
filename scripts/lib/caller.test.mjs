@@ -10,8 +10,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { Caller } from "./caller.mjs";
+import { Caller, millis, readRecording, sounding } from "./caller.mjs";
 
 /// A caller that has "received" these events, with no room behind it. The accessors read
 /// `controlEvents` and nothing else, so this is the whole of their input.
@@ -132,4 +135,134 @@ test("a malformed event is named, never laundered into an empty string", () => {
       `${what} must be named, not swallowed`,
     );
   }
+});
+
+/// A run of `samples` at a given amplitude, in whole 10 ms windows.
+const at = (amplitude, windows, sampleRate = 48_000) =>
+  Int16Array.from({ length: (sampleRate / 100) * windows }, () => amplitude);
+
+const concat = (...runs) => {
+  const out = new Int16Array(runs.reduce((total, run) => total + run.length, 0));
+  runs.reduce((offset, run) => (out.set(run, offset), offset + run.length), 0);
+  return out;
+};
+
+test("silence and sound are told apart by amplitude, not by length", () => {
+  assert.deepEqual(sounding(at(0, 100), 48_000), { frames: 100, audibleFrames: 0, peak: 0 });
+  assert.deepEqual(sounding(at(19838, 100), 48_000), {
+    frames: 100,
+    audibleFrames: 100,
+    peak: 19838,
+  });
+});
+
+test("audibleFrames is a duration, so a track that stopped partway says so", () => {
+  // The symptom openconv-openconv-bwy.26 is filed on: a full-length track carrying the
+  // front of an utterance and then nothing. A peak taken across the whole run is 19838
+  // either way, so only the windowed count can see it.
+  const cutOff = concat(at(19838, 30), at(0, 70));
+  const whole = at(19838, 100);
+
+  assert.equal(sounding(cutOff, 48_000).peak, sounding(whole, 48_000).peak);
+  assert.equal(sounding(cutOff, 48_000).frames, sounding(whole, 48_000).frames);
+  assert.equal(sounding(cutOff, 48_000).audibleFrames, 30);
+});
+
+test("one least significant bit is silence, not sound", () => {
+  // What the agent logs as loudest=3.05e-5 and this probe as peak 1. A reading that
+  // called it audible would report the exact failure being chased as a healthy call.
+  assert.equal(sounding(at(1, 100), 48_000).audibleFrames, 0);
+  assert.equal(sounding(at(1, 100), 48_000).peak, 1);
+});
+
+test("the AUDIBLE threshold is exclusive: 1000 is silence, 1001 is sound", () => {
+  // Every number this investigation turns on is denominated in this threshold, and the
+  // comparison is a strict `peak > AUDIBLE`. The cases above — 0, 1, 19838 — are all far
+  // enough from 1000 that `>` and `>=` are indistinguishable to them, so nothing pinned
+  // which one it was. Flipping the comparison would move the boundary by one bit and stay
+  // green everywhere else in this file.
+  assert.equal(sounding(at(1000, 100), 48_000).audibleFrames, 0, "exactly at the threshold is silence");
+  assert.equal(sounding(at(1001, 100), 48_000).audibleFrames, 100, "one above it is sound");
+
+  // The peak is reported either way — the threshold decides what counts as an audible
+  // *window*, never what the loudest sample was.
+  assert.equal(sounding(at(1000, 100), 48_000).peak, 1000);
+});
+
+test("a sample rate that does not divide into whole windows still measures the sound", () => {
+  // 22 050 / 100 is 220.5. A fractional stride walks off the end of the array into
+  // `undefined`, and Math.abs(undefined) is NaN — a peak that compares false against
+  // every threshold, reporting a loud recording as silent.
+  const reading = sounding(at(19838, 50, 22_050), 22_050);
+
+  assert.ok(Number.isFinite(reading.peak), `peak was ${reading.peak}`);
+  assert.equal(reading.peak, 19838);
+  assert.equal(reading.audibleFrames, reading.frames);
+});
+
+test("a rate too low to fill a window is refused, not looped over forever", () => {
+  // The worst failure mode this module could have: `perFrame` of 0 makes the window loop
+  // step by zero and spin, and a hang reaches no log at all — quieter than any wrong
+  // number. `readRecording` refuses such a rate at the parse, but a frame off the SFU has
+  // no parser of ours in front of it, so the refusal is here too.
+  for (const rate of [0, -48_000, 4]) {
+    assert.throws(
+      () => sounding(at(19838, 1), rate),
+      (error) => error instanceof RangeError && error.message.includes(String(rate)),
+      `a ${rate} Hz rate must be named, not spun on`,
+    );
+  }
+});
+
+test("millis is the one place a frame becomes a duration", () => {
+  assert.equal(millis(100), 1000);
+  assert.equal(millis(0), 0);
+  // What the scripts actually ask it: 200 ms of sound is 20 frames, and the comparison
+  // reads as the duration it is rather than as a count divided by a literal.
+  assert.ok(millis(20) >= 200);
+  assert.ok(millis(19) < 200);
+});
+
+/// A minimal RIFF/WAVE file, built rather than checked in so a test can say which field it
+/// is corrupting. Defaults are what `say -o --data-format LEI16@48000` produces.
+const wav = ({ sampleRate = 48_000, channels = 1, bitsPerSample = 16, encoding = 1 } = {}) => {
+  const samples = Int16Array.from([0, 19838, -19838, 0]);
+  const file = Buffer.alloc(44 + samples.byteLength);
+  file.write("RIFF", 0);
+  file.writeUInt32LE(36 + samples.byteLength, 4);
+  file.write("WAVE", 8);
+  file.write("fmt ", 12);
+  file.writeUInt32LE(16, 16);
+  file.writeUInt16LE(encoding, 20);
+  file.writeUInt16LE(channels, 22);
+  file.writeUInt32LE(sampleRate, 24);
+  file.writeUInt32LE((sampleRate * channels * bitsPerSample) / 8, 28);
+  file.writeUInt16LE((channels * bitsPerSample) / 8, 32);
+  file.writeUInt16LE(bitsPerSample, 34);
+  file.write("data", 36);
+  file.writeUInt32LE(samples.byteLength, 40);
+  Buffer.from(samples.buffer).copy(file, 44);
+
+  const path = join(mkdtempSync(join(tmpdir(), "openconv-wav-")), "built.wav");
+  writeFileSync(path, file);
+  return path;
+};
+
+test("a recording that declares no sample rate is refused at the parse", () => {
+  // The boundary half of the zero-rate fix, and the half that matters more: `sounding`
+  // refuses such a rate too, but this is the parser whose output nothing downstream
+  // re-checks, so a zero surviving here is a zero that reaches a window loop stepping by
+  // zero — a hang rather than a wrong answer.
+  assert.throws(
+    () => readRecording(wav({ sampleRate: 0 })),
+    (error) => error.message.includes("0 Hz"),
+    "a zero sample rate must be named, not passed through",
+  );
+
+  // And the same builder parses when only that field is sound, so the test above cannot
+  // be passing by refusing every WAV it is handed.
+  const good = readRecording(wav());
+  assert.equal(good.sampleRate, 48_000);
+  assert.equal(good.samples.length, 4);
+  assert.equal(sounding(good.samples, good.sampleRate).peak, 19838);
 });

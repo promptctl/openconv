@@ -17,9 +17,10 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Caller, Checks, readEnvironment, recordSpeech } from "./lib/caller.mjs";
-
-const SPOKEN = "Hello, can you hear me? This is a test of the voice agent.";
+// `SPOKEN` is shared with loopback-acceptance, which claims the transport carries the
+// same sentence this script claims the agent transcribes. That pairing is only a bound on
+// this one while both are speaking the same words.
+import { Caller, Checks, SPOKEN, readEnvironment, recordSpeech } from "./lib/caller.mjs";
 
 /// Word overlap rather than string equality: the point is that it heard the sentence,
 /// not that a speech model reproduced punctuation exactly.

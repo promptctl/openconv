@@ -22,7 +22,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Caller, Checks, readEnvironment, recordSpeech } from "./lib/caller.mjs";
+import { Caller, Checks, millis, readEnvironment, recordSpeech } from "./lib/caller.mjs";
 
 /// Everyday nouns rather than a random string, because the word has to survive being
 /// spoken by one synthesizer and heard by a speech model: "xk7q" is a test of nothing
@@ -124,7 +124,7 @@ const AUDIBLE_MS = 200;
 checks.record(
   "the answer came back as sound in the room",
   await caller.waitFor(
-    () => caller.heard.audibleFrames - before.audibleFrames >= AUDIBLE_MS / 10,
+    () => millis(caller.heard.audibleFrames - before.audibleFrames) >= AUDIBLE_MS,
     120_000,
     "the agent's speech",
   ),
