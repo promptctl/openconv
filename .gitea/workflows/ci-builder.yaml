@@ -15,10 +15,21 @@ name: CI builder reachability
 # self-hosted act_runner polls outbound, so no inbound connection exists at any
 # point (home-infra/CLAUDE.md: "No inbound internet exposure, ever").
 
+# Pushing to the Gitea remote IS the trigger. openconv is developed on GitHub, which
+# cannot reach this network and must not drive anything inside it; a build happens when
+# someone deliberately pushes the commit they want built to gitea.sanctuary.gdn, the
+# only side that can reach the registry. No branch filter — pushing a ref here is the
+# request to build that ref.
 on:
   push:
-    branches: [master]
   workflow_dispatch:
+
+# [LAW:no-ambient-temporal-coupling] act_runner runs `capacity: 4` against a single
+# Docker daemon whose BuildKit cache mounts are shared mutable state. Ordering is owned
+# here rather than left to whenever two runs happen to arrive.
+concurrency:
+  group: openconv-builder
+  cancel-in-progress: false
 
 env:
   # The registry as the cluster's Docker daemons name it — trusted cluster-wide via
@@ -82,14 +93,43 @@ jobs:
         run: |
           set -euo pipefail
           docker version --format 'daemon {{.Server.Version}}'
-          # Exercising the three features rather than asking whether a plugin is
-          # installed: a `buildx version` that succeeds still says nothing about
-          # whether THIS daemon resolves a syntax frontend, honours a cache mount, or
-          # parses a heredoc. Building a miniature of openconv's Dockerfile answers
-          # all three, and answers them the same way .3 will ask.
+          # Exercising the features rather than asking whether a plugin is installed:
+          # a `buildx version` that succeeds still says nothing about whether THIS
+          # daemon resolves a syntax frontend, honours a cache mount, or parses a
+          # heredoc.
+          #
+          # [LAW:one-source-of-truth] Which frontend, and which mount kinds, are read
+          # out of the real Dockerfile rather than restated here. A probe holding its
+          # own copy of "what the build needs" goes stale the first time the Dockerfile
+          # gains a feature, and stays green while the real build breaks on it.
+          if ! head -n 1 Dockerfile | grep -q '^# syntax='; then
+            echo "ERROR: Dockerfile line 1 is not a syntax directive, so this probe" >&2
+            echo "       cannot know which frontend the real build resolves." >&2
+            exit 1
+          fi
+          syntax="$(head -n 1 Dockerfile)"
+
+          # Every mount kind the real Dockerfile uses must be one the probe below
+          # actually exercises, or the probe is testing the wrong daemon capability.
+          covered=" cache "
+          for kind in $(grep -o -- '--mount=type=[a-z]*' Dockerfile | cut -d= -f3 | sort -u); do
+            case "$covered" in
+              *" $kind "*) ;;
+              *)
+                echo "ERROR: Dockerfile uses --mount=type=$kind, which this probe never" >&2
+                echo "       exercises. Extend the probe so the daemon is checked for it." >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          # Run-scoped tag: act_runner's capacity is 4, so a fixed name lets two
+          # concurrent runs remove each other's image mid-build.
           probe="$(mktemp -d)"
-          cat > "$probe/Dockerfile" <<'PROBE'
-          # syntax=docker/dockerfile:1.7
+          tag="openconv-buildkit-probe:${GITHUB_RUN_ID}"
+          {
+            echo "$syntax"
+            cat <<'PROBE'
           FROM busybox
           RUN --mount=type=cache,target=/probe-cache <<'SHELL'
           set -eu
@@ -97,8 +137,9 @@ jobs:
           cat /probe-cache/marker
           SHELL
           PROBE
-          DOCKER_BUILDKIT=1 docker build --progress=plain -t openconv-buildkit-probe "$probe"
-          docker image rm openconv-buildkit-probe
+          } > "$probe/Dockerfile"
+          DOCKER_BUILDKIT=1 docker build --progress=plain -t "$tag" "$probe"
+          docker image rm "$tag"
           rm -rf "$probe"
 
       # [LAW:no-silent-failure] The registry answering at all is not the property that
@@ -131,11 +172,12 @@ jobs:
             exit 1
           fi
           # [LAW:dataflow-not-control-flow] The spec lets Location come back either
-          # absolute or as a bare path, so the value is normalised to a path and the
-          # URL rebuilt one way. Trying one form and falling back to the other on
-          # failure would mean a genuinely broken cancel is indistinguishable from a
-          # registry that simply chose the other spelling.
-          path="${location#http://$REGISTRY}"
+          # absolute or as a bare path, and a registry may name itself differently than
+          # we dialled it. Stripping ANY scheme+authority — not only the one assumed —
+          # normalises both spellings through one expression, leaving a bare path
+          # untouched. Matching only the expected host would degrade to a no-op and
+          # build a malformed URL from the leftover.
+          path="$(printf '%s' "$location" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*##')"
           echo "upload session opened, cancelling it"
           curl -sS --fail --max-time 20 -X DELETE "http://$REGISTRY$path"
 
