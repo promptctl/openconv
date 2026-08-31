@@ -10,7 +10,9 @@ Why: an image built from a working tree has no known source. It contains whateve
 
 Instead: build in CI from a commit, tag `YYYY.MM.DD.N`, push to the homelab registry, then file that tag into the homelab's `service-versions.auto.tfvars.json` so Atlantis deploys it.
 
-See CLAUDE.md in this repo for the full rule.
+The only builder is the homelab's self-hosted Gitea `act_runner`. The `gpu` node is not a build host — it is reserved for workloads that need the GPU.
+
+See CLAUDE.md in this repo for the full rule — why that runner is the only executor, how CI is triggered, and what the workflow does today.
 
 ## Never guard against an absent LiveKit stats field
 
