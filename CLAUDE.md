@@ -29,6 +29,24 @@ Read that remote's name and URL out of `git remote -v` in the clone you are actu
 
 The `gpu` node is not a build host. It is reserved for workloads that genuinely need the GPU. When the runner is slow and the ticket is late, the sentence that will occur to you is *"I'll just build it on gpu this once."* That once is how `openconv:2026.08.24.2` came to be deployed with nobody able to say what built it. Push the commit; the build host is the runner, never gpu.
 
+**Every published image now says what built it, and you read that from the registry.** `docker build --label` in `.gitea/workflows/publish-image.yaml` stamps OCI provenance into the image config; before this, the published config blob had `Labels: null` and nothing at all recorded what built it. The one to reach for is `org.opencontainers.image.revision` — the full 40-character source commit sha, the answer to "what built this container". For the rest, read the workflow's "Compose the provenance the image will carry" step; that step is the list, and a copy of it in this file would drift away from it.
+
+The registry is plain HTTP, needs no auth, and answers you directly. Fetch the manifest, read `.config.digest` out of it, then read the labels from that blob:
+
+```sh
+D=$(curl -s -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+  http://192.168.7.208:5000/v2/openconv/manifests/latest | jq -r .config.digest)
+curl -s http://192.168.7.208:5000/v2/openconv/blobs/"$D" | jq .config.Labels
+```
+
+The Accept header is load-bearing: without it the registry can answer with a different manifest schema and `.config.digest` is not there.
+
+`docker image inspect` on a local image tells you nothing about what is in the registry. The question is always what the published bytes say, so read the published bytes.
+
+The workflow verifies these labels on the image it just pushed and fails the run if any is missing or wrong. When it fails, the sentence that will occur to you is *"I'll just hand-tag a fixed image and push it."* That is the working-tree build returning by another door, and this whole section exists to forbid it. Fix the workflow and push the commit.
+
+One consequence, because it will otherwise read as a broken build: digests now change on every commit. The runtime stage copies only the binary, the whisper model and `libonnxruntime.so` out of the build stage, so two commits touching only docs or workflows used to publish a byte-identical image. The commit sha now lives in the image config, so every commit produces a distinct digest. That is the stamp working, not a cache miss.
+
 <!-- BEGIN LIT INTEGRATION -->
 ## lit Agent-Native Workflow
 
