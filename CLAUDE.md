@@ -35,11 +35,12 @@ The registry is plain HTTP, needs no auth, and answers you directly. Fetch the m
 
 ```sh
 D=$(curl -s -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+  -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
   http://192.168.7.208:5000/v2/openconv/manifests/latest | jq -r .config.digest)
 curl -s http://192.168.7.208:5000/v2/openconv/blobs/"$D" | jq .config.Labels
 ```
 
-The Accept header is load-bearing: without it the registry can answer with a different manifest schema and `.config.digest` is not there.
+The Accept headers are load-bearing, and both of them: the registry can answer in either schema, and without them `.config.digest` is not there. They are the same pair the workflow's own verification sends.
 
 `docker image inspect` on a local image tells you nothing about what is in the registry. The question is always what the published bytes say, so read the published bytes.
 
