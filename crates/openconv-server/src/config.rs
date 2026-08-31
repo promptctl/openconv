@@ -33,12 +33,12 @@ pub struct Config {
     /// Credentials and model for the LLM that decides what the agent says.
     pub anthropic_api_key: String,
     pub llm_model: String,
-    /// Origin of elvenreader-server, which turns the agent's words into speech. Not a
+    /// Origin of the text-to-speech server, which turns the agent's words into speech. Not a
     /// credential — it is reached over the private network and takes no API key.
     pub tts_url: String,
     /// The voice used when the client asks for none, as an ElevenLabs voice ID.
     ///
-    /// A default rather than a mapping: elvenreader-server resolves IDs it does not
+    /// A default rather than a mapping: the text-to-speech server resolves IDs it does not
     /// serve, so this only decides which ID it is asked to resolve.
     pub tts_voice: String,
 }

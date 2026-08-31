@@ -5,9 +5,20 @@
 //! 1. **Start early.** The first clause goes to synthesis as soon as the model has
 //!    written it, not when the reply is finished. That is the second of silence this
 //!    module exists to remove.
-//! 2. **Overlap.** Synthesis costs a few seconds of mostly fixed overhead per request,
-//!    so a reply cut into three clauses and synthesized one after another is *slower*
-//!    than not cutting it at all. Clauses are therefore in flight together.
+//! 2. **Overlap.** Clauses are in flight together rather than one after another.
+//!
+//!    Read the reason carefully, because it has changed and the old one inverts the
+//!    design. Against elvenreader-server synthesis cost a few seconds of *fixed*
+//!    overhead per request, so cutting a reply into three clauses tripled that overhead
+//!    and overlapping was what paid it back. Against elvenspeak the cost is proportional
+//!    and small — see [`crate::tts`] for the measurement — so serial synthesis would
+//!    already keep well ahead of playback, and overlap no longer buys throughput.
+//!
+//!    It is kept for what it still buys: the burst at the start of a reply, where
+//!    several short clauses land at once and the caller is waiting on the first sound.
+//!    That moment is the one still worth optimizing, because it is the only one that is
+//!    close — the first clause's audio lands within a couple of tenths either side of
+//!    the model finishing. See [`IN_FLIGHT`], now a bound rather than a throughput knob.
 //! 3. **Stay in order.** Overlapping requests do not finish in the order they were
 //!    sent, and a reply whose sentences arrive shuffled is worse than a slow one.
 //!
@@ -48,9 +59,14 @@ use tokio_util::sync::CancellationToken;
 
 /// How many clauses may be synthesized at once.
 ///
-/// Enough that a long reply overlaps its requests rather than paying the per-request
-/// overhead end to end; small enough that one caller cannot open a dozen connections to
-/// a text-to-speech server shared with every other conversation.
+/// This is a ceiling, not a target. Against a local engine that synthesizes far faster
+/// than the caller can listen, the queue rarely reaches it; what the number actually
+/// does is stop one caller opening a dozen connections to a text-to-speech server shared
+/// with every other conversation.
+///
+/// Raising it does not make a reply start sooner — that is decided by when the first
+/// clause is written, not by how many follow it — so tune it against the server's
+/// concurrency, not against latency.
 const IN_FLIGHT: usize = 4;
 
 /// How much of a clause may be decoded ahead of the one being spoken.
