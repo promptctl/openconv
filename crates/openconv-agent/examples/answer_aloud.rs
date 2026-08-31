@@ -9,7 +9,7 @@
 //!   ANTHROPIC_API_KEY=... cargo run -p openconv-agent --example answer_aloud -- \
 //!     "what did the tests say" /tmp/reply.wav
 //!
-//! Needs elvenreader-server reachable at `OPENCONV_TTS_URL` (default
+//! Needs a text-to-speech server reachable at `OPENCONV_TTS_URL` (default
 //! `http://127.0.0.1:11000`). The WAV it writes is what the caller would have heard.
 
 use openconv_agent::audio::SAMPLE_RATE;
@@ -76,7 +76,7 @@ async fn main() {
     let mut samples = Vec::new();
     let mut audible_at = None;
     for (index, task) in synthesis.into_iter().enumerate() {
-        let clause = task.await.expect("synthesis task").expect("elvenreader answered");
+        let clause = task.await.expect("synthesis task").expect("the server answered");
         let at = started.elapsed();
         audible_at.get_or_insert(at);
         println!(

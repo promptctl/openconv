@@ -1,4 +1,4 @@
-//! Checks the speech path against a real elvenreader-server.
+//! Checks the speech path against a real text-to-speech server (elvenspeak today).
 //!
 //! Ignored by default, because it needs a server: run it with
 //!
@@ -30,12 +30,12 @@ fn seconds(samples: &[i16]) -> f32 {
 /// The whole client, end to end: a clause goes out, audible speech comes back at the
 /// rate the agent's track publishes.
 #[tokio::test]
-#[ignore = "needs a running elvenreader-server"]
+#[ignore = "needs a running text-to-speech server"]
 async fn a_clause_comes_back_as_audible_audio_at_the_tracks_rate() {
     let spoken = "Both suites passed on the first attempt.";
 
     let started = Instant::now();
-    let speech = tts().synthesize(None, spoken).await.expect("elvenreader answered");
+    let speech = tts().synthesize(None, spoken).await.expect("the server answered");
     let samples = collect(speech).await.expect("the audio decoded");
     let took = started.elapsed();
 
@@ -65,12 +65,19 @@ async fn a_clause_comes_back_as_audible_audio_at_the_tracks_rate() {
 /// What the streaming design buys, measured rather than assumed.
 ///
 /// Prints the two numbers that decide whether cutting a reply into clauses is worth it:
-/// what a clause costs to synthesize, and how much of that is fixed overhead rather
-/// than proportional to the words. When the fixed part dominates, the reply should be
-/// cut into fewer, larger pieces — and this is how you find out.
+/// what a clause costs to synthesize, and how much of that is fixed overhead rather than
+/// proportional to the words. When the fixed part dominates, the reply should be cut
+/// into fewer, larger pieces; when the proportional part does, into as many as it takes
+/// to get the first one speaking. This is how you find out which world you are in.
+///
+/// The name of this test used to assert the answer — `the_cost_of_a_clause_is_mostly_fixed`
+/// — which was true of elvenreader-server and false of elvenspeak, while the test went
+/// on passing either way because it measures rather than asserts the ratio. A test whose
+/// name states a finding is a second copy of that finding that no assertion keeps honest,
+/// so it now names the question instead.
 #[tokio::test]
-#[ignore = "needs a running elvenreader-server"]
-async fn the_cost_of_a_clause_is_mostly_fixed() {
+#[ignore = "needs a running text-to-speech server"]
+async fn what_a_clause_costs_fixed_versus_per_second() {
     let tts = tts();
 
     let short = Instant::now();
@@ -112,7 +119,7 @@ async fn the_cost_of_a_clause_is_mostly_fixed() {
 /// live so this measures the speech path rather than the model's mood — and because the
 /// interesting quantity is the *gap*, which is a property of the API, not of one answer.
 #[tokio::test]
-#[ignore = "needs a running elvenreader-server"]
+#[ignore = "needs a running text-to-speech server"]
 async fn the_first_clause_is_measured_against_when_the_reply_ended() {
     // (arrival in seconds, text) — a recorded reply, and when it finished.
     let recorded = [
@@ -133,7 +140,7 @@ async fn the_first_clause_is_measured_against_when_the_reply_ended() {
         .expect("the reply produced a clause");
 
     let started = Instant::now();
-    let mut speech = tts().synthesize(None, &clause).await.expect("elvenreader answered");
+    let mut speech = tts().synthesize(None, &clause).await.expect("the server answered");
 
     // Time to the *first* stretch of audio, not the last — that is the moment the caller
     // starts hearing something, and the whole reason this decodes as the bytes arrive.
@@ -169,7 +176,9 @@ async fn the_first_clause_is_measured_against_when_the_reply_ended() {
         "the first clause was not speakable before the reply ended, so cutting bought nothing"
     );
     // Deliberately not asserted: how much of the request is spent receiving audio the
-    // caller could already be hearing. That is elvenreader-server's to improve, and the
-    // printed `to_first` / `to_last` above is how you find out whether it has — today
-    // the body arrives in one burst at the end, so the gap is a tenth of a second.
+    // caller could already be hearing. That is the server's to improve, and the printed
+    // `to_first` / `to_last` above is how you find out whether it has. Against
+    // elvenspeak it has — first audio lands in milliseconds and the gap is a few
+    // hundredths of a second, where elvenreader-server delivered the whole body in one
+    // burst at the end.
 }
