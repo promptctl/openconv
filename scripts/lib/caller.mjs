@@ -123,13 +123,43 @@ export function sounding(samples, sampleRate) {
  * place it can still be told from the healthy run it imitates.
  */
 export function delivery(stats) {
-  // Both arrays, concatenated rather than chosen between. Observed on @livekit/rtc-node
-  // 0.13: a client that only subscribes still reports its inbound audio under
-  // `publisherStats`, with `subscriberStats` empty — so a reading that picked the array by
-  // the client's role would go blind on exactly the listener whose loss is being measured.
-  // Merging asks no question about which peer connection produced an entry, because
-  // nothing below depends on the answer. [LAW:dataflow-not-control-flow]
-  const entries = [...(stats.publisherStats ?? []), ...(stats.subscriberStats ?? [])];
+  // Both arrays are read, and each is parsed on its own. Reading both is required:
+  // observed on @livekit/rtc-node 0.13, a client that only subscribes still reports its
+  // inbound audio under `publisherStats` with `subscriberStats` empty, so picking an array
+  // by the client's role would go blind on exactly the listener whose loss is being
+  // measured.
+  //
+  // Parsing them separately is required for a different reason. Every id in these stats —
+  // `T01`, a pair id, a candidate id — is assigned per `RTCPeerConnection`, so two
+  // connections each name their first transport `T01`. Indexing both arrays into one map
+  // would let the second connection's entry overwrite the first's and resolve a transport
+  // against the wrong connection's candidates, silently. Two id namespaces never meet,
+  // which makes that collision unrepresentable rather than merely unlikely.
+  // [LAW:types-are-the-program]
+  const connections = [stats.publisherStats ?? [], stats.subscriberStats ?? []].map(ofOne);
+  const transports = connections.flatMap((connection) => connection.transports);
+
+  if (transports.length === 0) {
+    throw new Error(
+      "these RTC stats hold no transport — refusing to report a call that was never " +
+        "measured as one with no loss, since the two are the same numbers",
+    );
+  }
+
+  return {
+    transports,
+    inboundAudio: connections.flatMap((connection) => connection.inboundAudio),
+  };
+}
+
+/**
+ * One peer connection's entries, resolved against that connection's ids and no others.
+ *
+ * The unit of id scope, which is why it is the unit of parsing. Its output holds no ids a
+ * caller could cross-reference, so the two connections' readings concatenate without ever
+ * being able to contaminate each other.
+ */
+function ofOne(entries) {
   const of = (kind) => entries.filter((entry) => entry[kind]).map((entry) => entry[kind]);
 
   // Candidates are referenced by id from the pair that selected them, so they are indexed
@@ -170,13 +200,6 @@ export function delivery(stats) {
         : null,
     };
   });
-
-  if (transports.length === 0) {
-    throw new Error(
-      "these RTC stats hold no transport — refusing to report a call that was never " +
-        "measured as one with no loss, since the two are the same numbers",
-    );
-  }
 
   return {
     transports,
@@ -424,9 +447,21 @@ export class Caller {
    * Must be asked while still connected: `leave()` tears the peer connection down, and
    * the stats go with it. The fetch lives here rather than in each script so that the one
    * incantation — get the stats, render them out of protobuf — has a single home.
+   *
+   * Bounded like every other room operation in this module, and for a sharper reason than
+   * the others. `getRtcStats` is a native FFI call with no guaranteed completion, and its
+   * one caller asks for it inside the block whose `finally` deletes the room. A rejection
+   * there is reported and cleaned up after; a hang never reaches the cleanup at all, and a
+   * room still holding connected participants does not begin its `empty_timeout` — so an
+   * unbounded wait here leaks a room on the real deployment for as long as the process
+   * lives. [LAW:no-ambient-temporal-coupling]
    */
   async delivered() {
-    return delivery((await this.room.getRtcStats()).toJson());
+    const stats = await Promise.race([
+      this.room.getRtcStats(),
+      rejectAfter(10_000, "this client's peer connection to report its stats"),
+    ]);
+    return delivery(stats.toJson());
   }
 
   /** The remote participants currently in the room. */
