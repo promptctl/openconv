@@ -14,7 +14,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Caller, millis, readRecording, sounding } from "./caller.mjs";
+import { Caller, delivery, millis, readRecording, sounding } from "./caller.mjs";
 
 /// A caller that has "received" these events, with no room behind it. The accessors read
 /// `controlEvents` and nothing else, so this is the whole of their input.
@@ -265,4 +265,279 @@ test("a recording that declares no sample rate is refused at the parse", () => {
   assert.equal(good.sampleRate, 48_000);
   assert.equal(good.samples.length, 4);
   assert.equal(sounding(good.samples, good.sampleRate).peak, 19838);
+});
+
+/// Real `getRtcStats().toJson()` output, captured from a listener on a call to
+/// livekit.sanctuary.gdn and trimmed to the entries `delivery` reads. Transcribed rather
+/// than invented because the shape is the whole difficulty: 64-bit counters arrive as
+/// strings, proto2 optionals vanish when unset, and every entry is a one-key variant. A
+/// hand-written approximation of that would test the approximation.
+const stats = ({
+  candidate = {},
+  inbound = {},
+  received = {},
+  pair = {},
+  transport = {},
+  extra = [],
+  arrival = "publisherStats",
+} = {}) => {
+  const entries = [
+    {
+      transport: {
+        rtc: { id: "T01", timestamp: "1788132842843992" },
+        transport: {
+          iceState: "ICE_TRANSPORT_CONNECTED",
+          dtlsState: "DTLS_TRANSPORT_CONNECTED",
+          selectedCandidatePairId: "CP+xEdxmt3_zNHUDiTQ",
+          selectedCandidatePairChanges: 1,
+          ...transport,
+        },
+      },
+    },
+    {
+      candidatePair: {
+        rtc: { id: "CP+xEdxmt3_zNHUDiTQ", timestamp: "1788132842843992" },
+        candidatePair: {
+          transportId: "T01",
+          localCandidateId: "I+xEdxmt3",
+          remoteCandidateId: "IzNHUDiTQ",
+          state: "PAIR_SUCCEEDED",
+          nominated: true,
+          bytesReceived: "2938",
+          currentRoundTripTime: 0.027,
+          ...pair,
+        },
+      },
+    },
+    {
+      localCandidate: {
+        rtc: { id: "I+xEdxmt3", timestamp: "1788132842843992" },
+        candidate: {
+          address: "192.168.7.189",
+          port: 54_647,
+          protocol: "udp",
+          candidateType: "HOST",
+          ...candidate,
+        },
+      },
+    },
+    {
+      remoteCandidate: {
+        rtc: { id: "IzNHUDiTQ", timestamp: "1788132842843992" },
+        candidate: { address: "192.168.7.208", port: 7882, protocol: "udp", candidateType: "HOST" },
+      },
+    },
+    {
+      inboundRtp: {
+        rtc: { id: "IT01A152043745", timestamp: "1788132842843992" },
+        stream: { ssrc: 152_043_745, kind: "audio", transportId: "T01" },
+        received: { packetsReceived: "16", packetsLost: "0", jitter: 0.011, ...received },
+        inbound: {
+          packetsDiscarded: "7",
+          concealedSamples: "0",
+          silentConcealedSamples: "0",
+          concealmentEvents: "0",
+          totalSamplesReceived: "95520",
+          audioLevel: 6.103701895199438e-5,
+          ...inbound,
+        },
+      },
+    },
+    ...extra,
+  ];
+  return { publisherStats: [], subscriberStats: [], [arrival]: entries };
+};
+
+test("delivery names the path the media actually took", () => {
+  const [transport] = delivery(stats()).transports;
+
+  // The reading openconv-openconv-bwy.28 was filed to get: UDP on 7882, not a fallback to
+  // ICE/TCP on 7881. The whole point is that it is per-run, so it is read from the pair
+  // the transport itself selected rather than from whichever pair happens to look best.
+  assert.equal(transport.selected.protocol, "udp");
+  assert.equal(transport.selected.remote.port, 7882);
+  assert.equal(transport.selected.remote.address, "192.168.7.208");
+  // Both ends' candidate types, because the report prints them as a pair — `HOST/HOST` at
+  // loopback-acceptance.mjs:278 — and asserting only the local one lets a typo render the
+  // remote half as `undefined` in the line this probe exists to produce.
+  assert.equal(transport.selected.local.type, "HOST");
+  assert.equal(transport.selected.remote.type, "HOST");
+  assert.equal(transport.pairChanges, 1);
+
+  // Both of the transport's own reported states, not the ICE one alone: a path can be ICE
+  // connected with DTLS still handshaking, and a reading that showed only the first would
+  // call that settled.
+  assert.equal(transport.iceState, "ICE_TRANSPORT_CONNECTED");
+  assert.equal(transport.dtlsState, "DTLS_TRANSPORT_CONNECTED");
+});
+
+test("seconds on the wire are milliseconds in the reading", () => {
+  // Two fields cross this boundary — the selected pair's round trip and the jitter buffer's
+  // delay — and they are one contract rather than two coincidences, so they are asserted
+  // together: a reader comparing either against the ICMP figures on the ticket must not be
+  // converting in their head. Both are driven nonzero deliberately. Zero is the one input
+  // that survives every way of getting the conversion wrong — a dropped `* 1000`, an
+  // inverted one, a read of the wrong field — so a suite that only ever asserts the zero
+  // case is not testing the conversion at all.
+  const reading = delivery(stats());
+
+  assert.equal(Math.round(reading.transports[0].selected.rttMs), 27);
+  assert.equal(Math.round(reading.inboundAudio[0].jitterMs), 11);
+});
+
+test("a TCP fallback is visible as one, which is the question being asked", () => {
+  // The hypothesis .28 records: TCP head-of-line blocking under a jittery link. A run that
+  // took that path has to be distinguishable from one that did not, or the correlation the
+  // probe exists to draw cannot be drawn.
+  const fell = delivery(
+    stats({ candidate: { protocol: "tcp", port: 7881, tcpType: "TCP_CANDIDATE_TYPE_PASSIVE" } }),
+  );
+  assert.equal(fell.transports[0].selected.protocol, "tcp");
+  assert.equal(fell.transports[0].selected.local.tcpType, "TCP_CANDIDATE_TYPE_PASSIVE");
+
+  // And absent on the UDP run rather than reported as some falsy stand-in, so presence
+  // alone answers the question.
+  assert.equal(delivery(stats()).transports[0].selected.local.tcpType, undefined);
+});
+
+test("counters are numbers, not the strings the wire carries", () => {
+  // 64-bit fields arrive from protobuf as strings, where "0" is truthy and "10" < "9".
+  // A comparison against a threshold would silently do the wrong thing on every one.
+  const reading = delivery(
+    stats({
+      inbound: {
+        concealedSamples: "48000",
+        silentConcealedSamples: "31000",
+        concealmentEvents: "12",
+      },
+    }),
+  );
+  const [audio] = reading.inboundAudio;
+
+  assert.strictEqual(audio.concealedSamples, 48_000);
+  // Distinct from the concealed total above, so a read of the wrong neighbouring field
+  // fails here rather than passing on a number that happens to match.
+  assert.strictEqual(audio.silentConcealedSamples, 31_000);
+  assert.strictEqual(audio.concealmentEvents, 12);
+  assert.strictEqual(audio.packetsReceived, 16);
+  assert.strictEqual(audio.packetsLost, 0);
+  assert.strictEqual(audio.packetsDiscarded, 7);
+  assert.strictEqual(audio.samplesReceived, 95_520);
+
+  // Same wire representation on the other side of the reading: the selected pair's byte
+  // count arrives as a 64-bit string too, and nothing would notice it staying one until a
+  // threshold comparison quietly went lexicographic.
+  assert.strictEqual(reading.transports[0].selected.bytesReceived, 2938);
+
+  // The signature this whole line of investigation keeps finding: a track that arrived
+  // complete and decoded to one or two least significant bits of an i16.
+  assert.ok(audio.audioLevel < 1e-4);
+});
+
+test("stats with no transport are refused rather than summarized", () => {
+  // The failure mode this parser exists to prevent. Summarizing an unmeasured call yields
+  // zero loss and zero concealment — indistinguishable, in the report, from a flawless one.
+  assert.throws(
+    () => delivery({ publisherStats: [], subscriberStats: [] }),
+    (error) => error.message.includes("no transport"),
+    "a reading with no connection behind it must not be reported as a clean one",
+  );
+});
+
+test("a transport that has not settled on a pair says so", () => {
+  // A real state of a connecting transport, and not one to fill in with a pair-shaped
+  // default that would name a path the media never took.
+  const unsettled = delivery(stats({ transport: { selectedCandidatePairId: "" } }));
+  assert.equal(unsettled.transports[0].selected, null);
+});
+
+test("stats are read wherever rtc-node files them", () => {
+  // Observed on @livekit/rtc-node 0.13: a client that only subscribes reports its inbound
+  // audio under `publisherStats` and leaves `subscriberStats` empty. Reading one array by
+  // the client's role would go blind on exactly the listener being measured, so both are
+  // read and neither is chosen between.
+  assert.deepEqual(delivery(stats({ arrival: "subscriberStats" })), delivery(stats()));
+});
+
+test("two peer connections that reuse an id do not overwrite each other", () => {
+  // Ids in these stats are assigned per RTCPeerConnection, so a client that both publishes
+  // and subscribes has two connections each naming their first transport `T01` and their
+  // first pair the same string. Indexed into one map, the second silently overwrites the
+  // first and a transport resolves against the wrong connection's candidates — a corrupted
+  // path reported with total confidence, which is worse than no path at all.
+  const publisher = stats({ candidate: { address: "10.0.0.1", port: 1111 } });
+  const subscriber = stats({ candidate: { address: "10.0.0.2", port: 2222 } });
+  const both = delivery({
+    publisherStats: publisher.publisherStats,
+    subscriberStats: subscriber.publisherStats,
+  });
+
+  assert.equal(both.transports.length, 2, "both connections must be reported");
+  assert.deepEqual(
+    both.transports.map((transport) => transport.selected.local.address),
+    ["10.0.0.1", "10.0.0.2"],
+    "each transport keeps its own connection's candidates",
+  );
+  assert.deepEqual(
+    both.transports.map((transport) => transport.selected.local.port),
+    [1111, 2222],
+  );
+  assert.equal(both.inboundAudio.length, 2);
+});
+
+test("a non-audio stream is excluded from the audio reading", () => {
+  // The filter is only meaningful against something that must be excluded. With every
+  // fixture supplying audio alone, a typo in the field name or the literal would pass the
+  // whole suite while letting video RTP into an audio-only reading.
+  const withVideo = delivery(
+    stats({
+      extra: [
+        {
+          inboundRtp: {
+            rtc: { id: "IT01V900", timestamp: "1788132842843992" },
+            stream: { ssrc: 900, kind: "video", transportId: "T01" },
+            received: { packetsReceived: "5000", packetsLost: "3", jitter: 0.02 },
+            inbound: {
+              packetsDiscarded: "0",
+              concealedSamples: "0",
+              silentConcealedSamples: "0",
+              concealmentEvents: "0",
+              totalSamplesReceived: "0",
+              audioLevel: 0,
+            },
+          },
+        },
+      ],
+    }),
+  );
+
+  assert.equal(withVideo.inboundAudio.length, 1);
+  assert.equal(withVideo.inboundAudio[0].ssrc, 152_043_745);
+});
+
+test("counters that are legitimately zero render as zero, never NaN or undefined", () => {
+  // These stats are proto2 and every field read here is declared `required`, so a zero
+  // arrives as an explicit zero rather than vanishing the way a proto3 scalar would at its
+  // default. That is a claim about the schema, and this is where it stops being a claim: a
+  // guard against absence would be defending a state the wire cannot produce, while a
+  // silent NaN would corrupt the diagnostic this parser exists to print.
+  const quiet = delivery(
+    stats({
+      received: { jitter: 0 },
+      pair: { currentRoundTripTime: 0 },
+      transport: { selectedCandidatePairChanges: 0 },
+      inbound: { audioLevel: 0 },
+    }),
+  );
+
+  assert.strictEqual(quiet.transports[0].selected.rttMs, 0);
+  assert.strictEqual(quiet.transports[0].pairChanges, 0);
+  assert.strictEqual(quiet.inboundAudio[0].jitterMs, 0);
+  assert.strictEqual(quiet.inboundAudio[0].audioLevel, 0);
+
+  // And the rendering those feed, which is where a NaN would actually be seen: every one
+  // of these formats to a number a reader can act on.
+  assert.equal(quiet.transports[0].selected.rttMs.toFixed(1), "0.0");
+  assert.equal(quiet.inboundAudio[0].jitterMs.toFixed(1), "0.0");
+  assert.equal(quiet.inboundAudio[0].audioLevel.toExponential(2), "0.00e+0");
 });
