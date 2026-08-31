@@ -91,6 +91,22 @@ jobs:
             exit 1
           fi
 
+      # `jq` is the one command the publish job needs that is not in coreutils and not
+      # exercised anywhere before it is relied on. It reads the published image's config
+      # blob at the very end of `publish`, which is the worst place in the run to discover
+      # a missing binary: the image is already built and already pushed, so the failure
+      # costs a full build and leaves a published tag whose provenance was never checked.
+      #
+      # Asserted here rather than beside the use, for the same reason the BuildKit probe
+      # is here: this job is the one that answers "is this host fit to build and publish",
+      # and `publish` needs it. [LAW:single-enforcer]
+      - name: Assert the tools the publish job depends on are installed
+        run: |
+          set -euo pipefail
+          # Run it rather than asking `command -v`: a `jq` on PATH that cannot execute —
+          # wrong architecture, broken install — answers the lookup and fails the use.
+          echo "jq: $(jq --version)"
+
       # BuildKit is not optional for this repo: the Dockerfile declares
       # `# syntax=docker/dockerfile:1.7` and uses heredoc RUN blocks plus
       # --mount=type=cache. The legacy builder fails on all three. Proving the daemon
