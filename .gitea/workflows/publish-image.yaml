@@ -51,6 +51,19 @@ env:
   REGISTRY: 192.168.7.208:5000
   IMAGE: openconv
 
+  # The forge under the name that will still mean something later, because the labels
+  # built from it go into an artifact that outlives this network's addressing.
+  #
+  # Deliberately NOT `$GITHUB_SERVER_URL`, which is the obvious reach and is wrong here:
+  # act_runner sets it to `http://192.168.7.208:28569`, the LAN address and ephemeral port
+  # the runner itself dials. That resolves from inside the cluster today and is useless in
+  # an image label — the reader of a published image is someone months from now asking
+  # what built it, and a port-pinned private IP answers them with a dead link. CLAUDE.md's
+  # warning that "a guessed URL is the worst outcome available: it 404s" applies exactly
+  # as much to a URL the runner handed us. [FRAMING:representation] — the map has to stay
+  # true after the territory is re-addressed.
+  FORGE: https://gitea.sanctuary.gdn
+
 jobs:
   reachability:
     runs-on: ubuntu-latest
@@ -77,6 +90,27 @@ jobs:
             echo "ERROR: builder is $arch; openconv's image is x86_64 Linux." >&2
             exit 1
           fi
+
+      # `jq` is the one command the publish job needs that is not in coreutils and not
+      # exercised anywhere before it is relied on. It reads the published image's config
+      # blob at the very end of `publish`, which is the worst place in the run to discover
+      # a missing binary: the image is already built and already pushed, so the failure
+      # costs a full build and leaves a published tag whose provenance was never checked.
+      #
+      # Asserted here rather than beside the use, for the same reason the BuildKit probe
+      # is here: this job is the one that answers "is this host fit to build and publish",
+      # and `publish` needs it. [LAW:single-enforcer]
+      - name: Assert the tools the publish job depends on are installed
+        run: |
+          set -euo pipefail
+          # Run it rather than asking `command -v`: a `jq` on PATH that cannot execute —
+          # wrong architecture, broken install — answers the lookup and fails the use.
+          #
+          # On its own line, and that is the whole assertion. Wrapped as
+          # `echo "jq: $(jq --version)"` the step proves nothing: errexit reads the exit
+          # status of `echo`, which is 0 however the substitution inside it went, so a
+          # missing jq prints an empty version and passes.
+          jq --version
 
       # BuildKit is not optional for this repo: the Dockerfile declares
       # `# syntax=docker/dockerfile:1.7` and uses heredoc RUN blocks plus
@@ -294,6 +328,7 @@ jobs:
       # here. [LAW:parse-dont-validate] — the commit is checked at the one boundary where
       # source enters this job, and nothing downstream re-asks.
       - name: Assert the source is the commit the event named
+        id: source
         uses: ./.gitea/actions/assert-source-is-event-commit
 
       # ---------------------------------------------------------------------------
@@ -363,14 +398,119 @@ jobs:
           echo "publishing as $tag"
           echo "image-tag=$tag" >> "$GITHUB_OUTPUT"
 
+      # ---------------------------------------------------------------------------
+      # What the image says about itself (openconv-deploy-690.2).
+      #
+      # The epic's premise is that `openconv:2026.08.24.2` is deployed and nobody can say
+      # what built it. Naming the commit in a version file or a CI log does not fix that
+      # class: both are things you must already have access to, and the person who needs
+      # the answer is holding a container and nothing else. So the provenance goes inside
+      # the artifact, where it travels with the bytes and survives being retagged, copied
+      # to another registry, or pulled by digest with no tag at all.
+      #
+      # [LAW:one-source-of-truth] Composed once, here, and consumed twice — the build
+      # stamps this list and the verification below reads the published image back against
+      # this same list. A second copy written out in the verify step would be a checker
+      # that agrees with itself while both drift away from what was actually pushed.
+      # ---------------------------------------------------------------------------
+      - name: Compose the provenance the image will carry
+        id: labels
+        env:
+          REVISION: ${{ steps.source.outputs.revision }}
+          TAG: ${{ steps.tag.outputs.image-tag }}
+        run: |
+          set -euo pipefail
+
+          # [LAW:no-silent-failure] `revision` reaches this step through composite-action
+          # outputs, a mechanism whose behaviour on this act_runner nothing had previously
+          # established. If it ever yields nothing — a Gitea upgrade, the assertion step
+          # renamed, the `id:` dropped from the caller — the failure this guards against is
+          # not a crash but a published image carrying `revision=`, which is the epic's own
+          # bug wearing a label. Shape-checked rather than merely non-empty, so a value that
+          # arrives as an expression Gitea declined to expand is caught too.
+          if ! printf '%s' "$REVISION" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "ERROR: the proven revision came through as '${REVISION}', which is not a" >&2
+            echo "       40-character commit sha. The assert-source-is-event-commit step" >&2
+            echo "       did not hand one back, so this build cannot name its own source" >&2
+            echo "       and must not publish an image claiming to." >&2
+            exit 1
+          fi
+
+          # OCI's standard keys where OCI defines one, so a reader with no knowledge of this
+          # repo — or a generic tool — finds the commit where the convention says it is.
+          #
+          # `image.created` is deliberately absent: the image config already carries a
+          # `created` timestamp that Docker writes itself, and a label repeating it would be
+          # a second map of one fact. [LAW:one-source-of-truth]
+          #
+          # The ref and the build link get a reverse-DNS namespace because OCI has no key
+          # for either. `image.ref.name` is NOT that key despite the inviting name — the
+          # spec scopes it to descriptors in an image layout, so a git branch stored there
+          # would read as a lie to anyone who knows the spec and as truth to anyone who
+          # does not. The version is kept even though it repeats the registry tag: a tag is
+          # a pointer the registry owns and can move, while this travels in the image and
+          # still answers after a `pull` by digest.
+          provenance="$(cat <<PROVENANCE
+          org.opencontainers.image.revision=$REVISION
+          org.opencontainers.image.source=$FORGE/$GITHUB_REPOSITORY
+          org.opencontainers.image.version=$TAG
+          gdn.sanctuary.build.ref=$GITHUB_REF
+          gdn.sanctuary.build.run=$FORGE/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          PROVENANCE
+          )"
+
+          # [LAW:no-silent-failure] Every label must carry a value. `set -u` already aborts
+          # on a variable that is unset, but not on one that is set and empty, which would
+          # publish `gdn.sanctuary.build.ref=` — a label that is present, looks answered,
+          # and says nothing. That is the epic's own bug at the scale of one field.
+          #
+          # [LAW:dataflow-not-control-flow] Asked of the composed block rather than of each
+          # variable before it. Three guards naming three variables would leave a fourth
+          # label added later unchecked, because nothing would tie the guard list to the
+          # label list; this covers every label there is and every label there will be, so
+          # a fact is protected by having been added to the heredoc above.
+          if printf '%s\n' "$provenance" | grep -q '=$'; then
+            echo "ERROR: these labels came out with no value, so the image would carry" >&2
+            echo "       fields that look answered and say nothing:" >&2
+            printf '%s\n' "$provenance" | grep '=$' >&2
+            exit 1
+          fi
+
+          echo "$provenance"
+          {
+            echo "labels<<PROVENANCE"
+            echo "$provenance"
+            echo "PROVENANCE"
+          } >> "$GITHUB_OUTPUT"
+
       # Tagged `latest` alongside the dated tag in the same build, so the alias can only
       # ever name an image that was actually produced here.
       - name: Build and push
         env:
           TAG: ${{ steps.tag.outputs.image-tag }}
+          PROVENANCE: ${{ steps.labels.outputs.labels }}
         run: |
           set -euo pipefail
+
+          # [LAW:no-silent-failure] The list crossed a step boundary to get here. Empty
+          # would reach docker as `--label ""` and fail on an argument error that says
+          # nothing about where the list was lost; this says it.
+          if [ -z "$PROVENANCE" ]; then
+            echo "ERROR: no provenance arrived from the compose step, so this build would" >&2
+            echo "       publish an image that names nothing. Check that step's output." >&2
+            exit 1
+          fi
+
+          # [LAW:dataflow-not-control-flow] The labels are data the build loops over, not
+          # a hand-written flag per fact. Adding one to the list above is the whole of
+          # adding one to the image — there is no second place that enumerates them.
+          args=()
+          while IFS= read -r label; do
+            args+=(--label "$label")
+          done <<< "$PROVENANCE"
+
           DOCKER_BUILDKIT=1 docker build --progress=plain \
+            "${args[@]}" \
             --tag "$REGISTRY/$IMAGE:$TAG" \
             --tag "$REGISTRY/$IMAGE:latest" \
             .
@@ -437,4 +577,59 @@ jobs:
             echo "verified $REGISTRY/$IMAGE:$ref -> $found"
           done
 
-          echo "published $REGISTRY/$IMAGE:$TAG (also :latest) from ${GITHUB_SHA}"
+      # The step above proves the registry holds this run's bytes. This one proves those
+      # bytes answer the question the epic was opened over — asked of the published image
+      # rather than of the builder, because "docker build was passed --label" and "the
+      # image in the registry carries the label" are different claims, and only the second
+      # one is what a person debugging a container months from now actually gets to read.
+      #
+      # [LAW:verifiable-goals] This is openconv-deploy-690.2's acceptance criterion, run by
+      # CI on every publish rather than checked by hand once. A stamp that silently stopped
+      # landing would otherwise be discovered the next time someone needed it, which is
+      # precisely the moment it is too late.
+      - name: Verify the published image names its source commit
+        env:
+          TAG: ${{ steps.tag.outputs.image-tag }}
+          PROVENANCE: ${{ steps.labels.outputs.labels }}
+        run: |
+          set -euo pipefail
+
+          # Read down to the config blob the way anyone holding only the image would:
+          # manifest, then the config it names, then the labels inside it. Both tags were
+          # just shown to resolve to one digest, so checking the dated tag checks `latest`
+          # too — there is one config blob under both.
+          config="$(curl -sS --fail --max-time 60 \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            "http://$REGISTRY/v2/$IMAGE/manifests/$TAG" | jq -r '.config.digest // empty')"
+
+          # [LAW:no-silent-failure] A manifest list has no `.config`, and so would leave
+          # this empty and send the next request to `blobs/`. Named here instead of
+          # surfacing as a confusing 404 one line later.
+          if [ -z "$config" ]; then
+            echo "ERROR: the manifest for $IMAGE:$TAG names no config blob, so the image's" >&2
+            echo "       own metadata cannot be read. A multi-platform index would look" >&2
+            echo "       like this, and this workflow builds a single image." >&2
+            exit 1
+          fi
+
+          published="$(curl -sS --fail --max-time 60 "http://$REGISTRY/v2/$IMAGE/blobs/$config")"
+
+          # [LAW:dataflow-not-control-flow] Every label composed above is checked by the
+          # same comparison — so a fact added to that list is verified by having been
+          # added, and none of them can become the one nobody looks at.
+          while IFS= read -r label; do
+            key="${label%%=*}"
+            want="${label#*=}"
+            got="$(printf '%s' "$published" | jq -r --arg k "$key" '.config.Labels[$k] // empty')"
+            if [ "$got" != "$want" ]; then
+              echo "ERROR: the published $IMAGE:$TAG carries $key=${got:-<absent>}," >&2
+              echo "       but this run built it to say $want. The image in the registry" >&2
+              echo "       does not describe the commit that produced it." >&2
+              exit 1
+            fi
+            echo "image says $key=$got"
+          done <<< "$PROVENANCE"
+
+          echo "published $REGISTRY/$IMAGE:$TAG (also :latest) from ${GITHUB_SHA}, and the"
+          echo "image itself names that commit."
