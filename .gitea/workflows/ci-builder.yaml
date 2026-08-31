@@ -109,26 +109,6 @@ jobs:
           fi
           syntax="$(head -n 1 Dockerfile)"
 
-          # Every mount kind the real Dockerfile uses must be one the probe below
-          # actually exercises, or the probe is testing the wrong daemon capability.
-          # Select the --mount tokens first, then read type= out of each, so the kind is
-          # found wherever it sits among the comma-separated keys. Matching
-          # `--mount=type=` as one pattern only finds the kind when it is written first
-          # and silently misses `--mount=id=x,type=secret` — a guard that reports
-          # nothing because it looked in the wrong place is worse than no guard.
-          covered=" cache "
-          for kind in $(grep -oE -- '--mount=[^[:space:]]+' Dockerfile \
-                        | grep -oE 'type=[a-z]+' | cut -d= -f2 | sort -u); do
-            case "$covered" in
-              *" $kind "*) ;;
-              *)
-                echo "ERROR: Dockerfile uses --mount=type=$kind, which this probe never" >&2
-                echo "       exercises. Extend the probe so the daemon is checked for it." >&2
-                exit 1
-                ;;
-            esac
-          done
-
           # Run-scoped tag: act_runner's capacity is 4, so a fixed name lets two
           # concurrent runs remove each other's image mid-build.
           probe="$(mktemp -d)"
@@ -158,6 +138,38 @@ jobs:
           SHELL
           PROBE
           } > "$probe/Dockerfile"
+
+          # [LAW:one-source-of-truth] Both sides are READ, neither is written down. What
+          # the build needs comes from the real Dockerfile; what the probe covers comes
+          # from the probe just generated above — same extractor, two inputs. A ledger of
+          # covered kinds would be a third claim that drifts from both, and the drift is
+          # not hypothetical: a maintainer meeting the failure below would satisfy a
+          # ledger by adding a word to it, leaving the daemon unchecked for the feature
+          # that failed. There is no word to add here — the only way to cover a kind is
+          # to make the probe exercise it.
+          #
+          # Selecting the --mount tokens first and reading type= out of each finds the
+          # kind wherever it sits among the comma-separated keys; matching
+          # `--mount=type=` in one pattern only sees it when written first.
+          mount_kinds() {
+            grep -oE -- '--mount=[^[:space:]]+' "$1" \
+              | grep -oE 'type=[a-z]+' | cut -d= -f2 | sort -u
+          }
+
+          covered=" $(mount_kinds "$probe/Dockerfile" | tr '\n' ' ')"
+          echo "probe exercises:$covered"
+          for kind in $(mount_kinds Dockerfile); do
+            case "$covered" in
+              *" $kind "*) ;;
+              *)
+                echo "ERROR: Dockerfile uses --mount=type=$kind, which the probe does not" >&2
+                echo "       exercise, so this daemon was never checked for it. Add a RUN" >&2
+                echo "       using type=$kind to the probe above." >&2
+                exit 1
+                ;;
+            esac
+          done
+
           DOCKER_BUILDKIT=1 docker build --progress=plain -t "$tag" "$probe"
 
       # [LAW:no-silent-failure] The registry answering at all is not the property that
@@ -185,10 +197,7 @@ jobs:
           location="$(curl -sS --fail --max-time 20 -X POST -D - -o /dev/null \
             "http://$REGISTRY/v2/$IMAGE/blobs/uploads/" | tr -d '\r' \
             | awk '/^[Ll]ocation:/{print $2}')"
-          if [ -z "$location" ]; then
-            echo "ERROR: the registry accepted the upload request but named no session." >&2
-            exit 1
-          fi
+
           # [LAW:dataflow-not-control-flow] The spec lets Location come back either
           # absolute or as a bare path, and a registry may name itself differently than
           # we dialled it. Stripping ANY scheme+authority — not only the one assumed —
@@ -197,16 +206,31 @@ jobs:
           # build a malformed URL from the leftover.
           path="$(printf '%s' "$location" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*##')"
 
-          # From here the session occupies registry disk until it is cancelled, and this
-          # workflow runs on every push. A cancel skipped by an abort — or by the runner
-          # losing the network between the POST and the DELETE — accumulates orphaned
-          # uploads on a registry with 13G free. The trap cancels on every exit path and
-          # says so when the cancel does not take, rather than leaving a silent orphan.
+          # The trap goes up here, before the session is validated rather than after.
+          # curl returned 2xx, so the registry HAS opened a session by this line; every
+          # exit below it — including the one for a Location we could not parse — has to
+          # cancel. Installing it after the check left the single path where the session
+          # is hardest to account for as the one path that never cleaned up.
+          #
+          # This workflow runs on every push, and a cancel skipped by an abort or by the
+          # runner losing the network accumulates orphaned uploads on a registry with
+          # 13G free. The trap says so when the cancel does not take, rather than
+          # leaving a silent orphan.
           cleanup_upload() {
             curl -sS --fail --max-time 20 -X DELETE "http://$REGISTRY$path" \
               || echo "note: upload session $path was not cancelled; registry GC must reap it" >&2
           }
           trap cleanup_upload EXIT
+
+          # Now safe to reject: the trap above already owns whatever was opened. A
+          # session whose Location we could not parse is one we cannot address, so this
+          # says that plainly instead of implying it was cleaned up.
+          if [ -z "$path" ]; then
+            echo "ERROR: the registry opened an upload session but named none this" >&2
+            echo "       script could parse. It cannot be cancelled from here and must" >&2
+            echo "       be reaped by registry GC." >&2
+            exit 1
+          fi
 
           echo "upload session opened at $path"
 
