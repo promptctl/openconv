@@ -10,6 +10,12 @@ Why: an image built from a working tree has no known source. It contains whateve
 
 Instead: build in CI from a commit, tag `YYYY.MM.DD.N`, push to the homelab registry, then file that tag into the homelab's `service-versions.auto.tfvars.json` so Atlantis deploys it.
 
+That CI is the homelab's self-hosted Gitea `act_runner`, the only CI executor here: it polls outbound and exposes no inbound port, because this network accepts no inbound connections, ever (`home-infra/CLAUDE.md:11`). No GitHub-hosted runner may join the network and no GitHub Actions job may drive anything inside it. Development, PRs and review stay on GitHub (`git@github.com:promptctl/openconv.git`); that does not change.
+
+Pushing a commit to this repo's second remote — its Gitea repo on `gitea.sanctuary.gdn` — is what triggers a build. No mirror, no polling, no schedule; `.gitea/workflows/ci-builder.yaml` runs on any push and on manual dispatch. Read that remote's name and URL out of `git remote -v`, never from memory — a guessed URL 404s and the build you think you triggered never ran.
+
+The `gpu` node is not a build host. It is reserved for workloads that need the GPU.
+
 See CLAUDE.md in this repo for the full rule.
 
 ## Never guard against an absent LiveKit stats field

@@ -14,6 +14,14 @@ Why: an image built from a working tree has no known source. It contains whateve
 
 Instead: build in CI from a commit, tag `YYYY.MM.DD.N`, push to the registry, then let the `update-service-version` action file the tag into the homelab's `service-versions.auto.tfvars.json` so Atlantis deploys it.
 
+That CI is the homelab's self-hosted Gitea `act_runner` — the only CI executor here. It polls outbound and exposes no inbound port, which is precisely why it is the builder: this network accepts no inbound connections, ever, stated authoritatively in `home-infra/CLAUDE.md:11`. A GitHub-hosted runner joining the network, and a GitHub Actions job driving anything inside it, are both forbidden. Do not go looking for the arrangement that makes one of them work; there isn't one.
+
+openconv is still developed on GitHub (`git@github.com:promptctl/openconv.git`), and pull requests and code review stay there. The repo also carries a second remote pointing at its Gitea repo on `gitea.sanctuary.gdn`, and **pushing a commit to that remote is what triggers a build.** No mirror, no polling, no schedule — a build exists because someone deliberately pushed the ref they wanted built. `.gitea/workflows/ci-builder.yaml` is the workflow that runs, on any push (no branch filter) and on manual dispatch.
+
+Read that remote's name and URL out of `git remote -v` in the clone you are actually in — not from memory, and not from this document. If the clone has only `origin`, get the URL from the Gitea repo itself and add it. A guessed URL is the worst outcome available: it 404s, and the build you believe you triggered never ran.
+
+The `gpu` node is not a build host. It is reserved for workloads that genuinely need the GPU. When the runner is slow and the ticket is late, the sentence that will occur to you is *"I'll just build it on gpu this once."* That once is how `openconv:2026.08.24.2` came to be deployed with nobody able to say what built it. Push the commit; let the runner build it.
+
 <!-- BEGIN LIT INTEGRATION -->
 ## lit Agent-Native Workflow
 
