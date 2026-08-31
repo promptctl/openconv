@@ -245,16 +245,25 @@ It mints a `roomList` token and calls `ListRooms`, so a failure tells you whethe
 the SFU rejected the signature or was never reachable — two things that look the
 same from inside the app.
 
-openconv itself is deployed beside it at `https://openconv.sanctuary.gdn`, from the
-`Dockerfile` here:
+openconv itself is deployed beside it at `https://openconv.sanctuary.gdn`, built by
+CI from the `Dockerfile` here. The CI is `.gitea/workflows/publish-image.yaml`, run
+by the homelab's self-hosted Gitea `act_runner` — not the development machine, which
+is arm64 macOS and has no Docker, while the image is x86_64 Linux.
 
-```
-scripts/build-image.sh          # prints the tag it published
-```
+Development and pull requests happen on GitHub (`origin`), but merging a PR there
+builds nothing. The repo has a second remote, `gitea`
+(`ssh://git@gitea.sanctuary.gdn:2222/brandon-fryslie/openconv.git`), and pushing a
+commit to it is what triggers a build — no mirror, no polling, no schedule. After a
+merge, someone still has to `git push gitea master`. A push of any branch runs a
+reachability job that proves the builder without building; only `master`, or a
+manual workflow dispatch, actually publishes an image.
 
-The build runs on a homelab node rather than on the development machine, which is
-arm64 and has no Docker. What it produces goes to the cluster registry, and the tag
-it prints is the value that belongs in `service-versions.auto.tfvars.json` over in
+A publish resolves a tag of the form `YYYY.MM.DD.N` from what the registry has
+already published, pushes that tag and `:latest`, then reads the registry back and
+fails unless both resolve to the digest it just pushed. Every image also carries its
+own source commit, in the OCI label `org.opencontainers.image.revision`, so telling
+what a running container was built from is a label read, not a guess. The dated tag
+is the value that belongs in `service-versions.auto.tfvars.json` over in
 `~/code/home-infra` — a merged PR there is what actually rolls the deployment
 (`jobs/openconv.nomad.hcl`).
 
