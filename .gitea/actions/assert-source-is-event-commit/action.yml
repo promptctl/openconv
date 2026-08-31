@@ -1,6 +1,7 @@
 name: assert-source-is-event-commit
 description: >-
-  Fails unless the checked-out working tree is the commit the triggering event named.
+  Fails unless the checked-out working tree is the commit the triggering event named,
+  and returns that commit so callers can record what they built.
 
 # The invariant openconv-deploy-690 exists to establish, in the one place that states it.
 #
@@ -10,10 +11,26 @@ description: >-
 # copies of the epic's central invariant would be two maps of one territory, free to
 # drift the first time one is edited. [LAW:one-source-of-truth]
 
+# [LAW:parse-dont-validate] The `revision` output is what makes this a checkpoint rather
+# than a check. Asserting and returning nothing leaves `$GITHUB_SHA` readable by any later
+# step, so an image label built from it carries no trace of having been proved — delete the
+# assertion and the label is still written, still looks authoritative, and is now a claim
+# nobody verified. A caller stamping `steps.<id>.outputs.revision` cannot obtain the value
+# without this action having run and passed: the commit stops being ambient and becomes
+# something handed across a boundary.
+outputs:
+  revision:
+    description: >-
+      The commit the working tree was proved to be. Anything recording provenance into a
+      published artifact should read this rather than $GITHUB_SHA, so the value it records
+      is the one this action verified.
+    value: ${{ steps.assert.outputs.revision }}
+
 runs:
   using: composite
   steps:
     - name: Assert the checkout is the triggering commit
+      id: assert
       shell: bash
       run: |
         set -euo pipefail
@@ -25,8 +42,17 @@ runs:
           echo "       An image built here could not name its own source." >&2
           exit 1
         fi
-        # A shallow clone still proves provenance, but a build that wants to stamp
-        # `git describe` into the image needs history (openconv-deploy-690.2, which
-        # will have to ask checkout for fetch-depth: 0). Reported rather than
-        # discovered later.
+        # The commit, now proved, handed back as this action's answer. `$head` rather
+        # than `$GITHUB_SHA`: they are equal by the assertion above, and this is the one
+        # that was physically measured against the tree the build will consume.
+        echo "revision=$head" >> "$GITHUB_OUTPUT"
+
+        # `actions/checkout` defaults to fetch-depth 1, so this is a shallow clone —
+        # which proves provenance perfectly well, since the assertion above compares a
+        # sha and needs no ancestry. openconv-deploy-690.2 asked whether stamping the
+        # image required deepening it to fetch-depth: 0 for `git describe`, and the
+        # answer is no: this repo carries no git tags, so `git describe` has nothing to
+        # name and the published tag is `YYYY.MM.DD.N` read from the registry instead.
+        # Depth is reported rather than assumed, so anyone who does reach for history
+        # sees what they actually have.
         echo "history depth: $(git rev-list --count HEAD)"
