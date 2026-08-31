@@ -174,6 +174,26 @@ function ofOne(entries) {
   );
   const pairs = new Map(of("candidatePair").map((entry) => [entry.rtc.id, entry.candidatePair]));
 
+  // Every numeric below is read bare — no presence check, no `?? 0` — and that is a fact
+  // about the schema rather than an oversight. `stats.proto` is `syntax proto2`, and each of
+  // these fields is declared `required` (`required double audio_level`, `required double
+  // jitter`, `required double current_round_trip_time`, `required uint32
+  // selected_candidate_pair_changes`), which is explicit presence. protobuf-es gives such a
+  // field two fates and no third: set — including set to `0` — and always written, or unset
+  // and `toJson()` throws `required field not set`. Vanishing at its default is reachable
+  // only for *optional* fields, which is the proto3 behaviour this schema does not have.
+  //
+  // So an absent reading is unreachable here, and a guard against one would defend a state
+  // the wire cannot produce. [LAW:no-defensive-null-guards] A `?? 0` would be worse than
+  // dead: a zero jitter beside a zero level is the exact shape of the flawless call this
+  // module exists to tell apart from an unmeasured one. The automated reviewer filed this as
+  // a NaN/undefined crash three times in one review of PR #9 and was wrong all three times;
+  // the test "counters that are legitimately zero render as zero, never NaN or undefined"
+  // is where the invariant is pinned.
+  //
+  // The one reachable failure is already loud: were the FFI ever to hand back a message with
+  // a required field unset, `toJson()` throws, `delivered()` rejects, and
+  // `loopback-acceptance.mjs` catches it per client into its "no account of this call" arm.
   const transports = of("transport").map((entry) => {
     const transport = entry.transport;
     // The connection's own answer, not one re-derived by scanning for a nominated pair in
