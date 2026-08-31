@@ -1,0 +1,32 @@
+name: assert-source-is-event-commit
+description: >-
+  Fails unless the checked-out working tree is the commit the triggering event named.
+
+# The invariant openconv-deploy-690 exists to establish, in the one place that states it.
+#
+# It has to be asserted per checkout, not per run: every job that consumes the source
+# does its own `actions/checkout`, and a claim proved about one job's workspace says
+# nothing about another's. That makes the assertion something two jobs need — and two
+# copies of the epic's central invariant would be two maps of one territory, free to
+# drift the first time one is edited. [LAW:one-source-of-truth]
+
+runs:
+  using: composite
+  steps:
+    - name: Assert the checkout is the triggering commit
+      shell: bash
+      run: |
+        set -euo pipefail
+        head="$(git rev-parse HEAD)"
+        echo "checked out: $head"
+        echo "event  said: $GITHUB_SHA"
+        if [ "$head" != "$GITHUB_SHA" ]; then
+          echo "ERROR: checkout is $head but the event names $GITHUB_SHA." >&2
+          echo "       An image built here could not name its own source." >&2
+          exit 1
+        fi
+        # A shallow clone still proves provenance, but a build that wants to stamp
+        # `git describe` into the image needs history (openconv-deploy-690.2, which
+        # will have to ask checkout for fetch-depth: 0). Reported rather than
+        # discovered later.
+        echo "history depth: $(git rev-list --count HEAD)"
