@@ -12,6 +12,16 @@ Instead: build in CI from a commit, tag `YYYY.MM.DD.N`, push to the homelab regi
 
 See CLAUDE.md in this repo for the full rule.
 
+## Never guard against an absent LiveKit stats field
+
+`scripts/lib/caller.mjs` reads every number out of `getRtcStats().toJson()` bare — no presence check, no `?? 0`, no null-carrying parse. That is correct, and it must stay that way.
+
+Banned: adding a presence check, a `?? 0` default, or an absence-carrying return type to any of those fields on the grounds that a protobuf scalar disappears at its default value.
+
+Why: `stats.proto` is `syntax proto2`, and the fields in question are declared `required` — explicit presence. protobuf-es either writes such a field, including when its value is `0`, or throws `required field not set`. Only *optional* fields vanish at their default, and this schema has none of the kind being worried about. A `?? 0` would be worse than dead code: a zero jitter beside a zero level is the exact shape of a flawless call, which is the one reading this parser exists to tell apart from an unmeasured one.
+
+The automated reviewer filed this as a NaN/undefined crash three times in a single review of PR #9. It was wrong all three times. The test `counters that are legitimately zero render as zero, never NaN or undefined` pins the invariant — cite it, cite the proto2 `required` declaration, and resolve the thread rather than re-deriving the argument.
+
 <!-- BEGIN LIT INTEGRATION -->
 ## lit Agent-Native Workflow
 
