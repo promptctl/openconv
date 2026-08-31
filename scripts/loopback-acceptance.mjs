@@ -268,6 +268,13 @@ try {
  * that — a run that took the TCP path and a run that did not produce the same silence.
  * Printed on every run rather than only on failures, because the claim being tested is a
  * correlation and a reading taken only when things break has nothing to correlate against.
+ *
+ * `dtls` is on every line for that same reason rather than appearing only when it is
+ * unhealthy. A transport can hold a selected pair with ICE connected while the DTLS
+ * handshake is still unfinished — a state that carries no media and otherwise renders as an
+ * ordinary success line, leaving `rtp: 0 packets` as the only hint and pointing the reader
+ * at the network instead of at the handshake. Shown always, a reader can also tell a
+ * completed handshake from a build that does not report one.
  */
 const pathLine = (transport) =>
   transport.selected === null
@@ -277,7 +284,8 @@ const pathLine = (transport) =>
       `${transport.selected.remote.address}:${transport.selected.remote.port} ` +
       `(${transport.selected.local.type}/${transport.selected.remote.type}, ` +
       `rtt ${transport.selected.rttMs.toFixed(1)} ms, ` +
-      `${transport.pairChanges} pair change${transport.pairChanges === 1 ? "" : "s"})`;
+      `${transport.pairChanges} pair change${transport.pairChanges === 1 ? "" : "s"}, ` +
+      `dtls ${transport.dtlsState})`;
 
 /**
  * What arrived over that path, as the decoder counted it.

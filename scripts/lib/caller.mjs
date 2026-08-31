@@ -235,7 +235,6 @@ function endpoint(candidate) {
     port: candidate?.port,
     type: candidate?.candidateType,
     tcpType: candidate?.tcpType,
-    relayProtocol: candidate?.relayProtocol,
   };
 }
 
