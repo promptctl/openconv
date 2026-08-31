@@ -155,9 +155,11 @@ export function delivery(stats) {
 /**
  * One peer connection's entries, resolved against that connection's ids and no others.
  *
- * The unit of id scope, which is why it is the unit of parsing. Its output holds no ids a
- * caller could cross-reference, so the two connections' readings concatenate without ever
- * being able to contaminate each other.
+ * The unit of id scope, which is why it is the unit of parsing. Every stats-local id — the
+ * `T01`/`CP01` handles each RTCPeerConnection numbers from one — is consumed here and none
+ * reaches the output, so the two connections' readings concatenate without ever being able
+ * to contaminate each other. `ssrc` survives and is not that kind of id: it names the RTP
+ * stream itself and stays itself across connections.
  */
 function ofOne(entries) {
   const of = (kind) => entries.filter((entry) => entry[kind]).map((entry) => entry[kind]);
@@ -180,7 +182,6 @@ function ofOne(entries) {
     const pair = pairs.get(transport.selectedCandidatePairId);
 
     return {
-      id: entry.rtc.id,
       iceState: transport.iceState,
       dtlsState: transport.dtlsState,
       // How many times ICE changed its mind. A pair that was re-selected mid-call is a
