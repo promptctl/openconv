@@ -1,0 +1,145 @@
+name: CI builder reachability
+
+# Proves the three properties openconv's image build depends on, before any image
+# is built (openconv-deploy-690.1). Each is asserted against the live system, so a
+# green run here means a build job placed on this runner would find what it needs.
+#
+#   1. The builder obtained this source by fetching it from git itself.
+#   2. It is the x86_64 Linux host the image targets, with a Docker daemon.
+#   3. It can reach the homelab registry the image is published to.
+#
+# Why this exists at all: openconv's image used to be built by tarring a working
+# tree over SSH to a homelab node (scripts/build-image.sh), which produced images
+# whose source no commit could name. See CLAUDE.md. The replacement must run where
+# nothing outside the network can reach in — this repo mirrors into Gitea and the
+# self-hosted act_runner polls outbound, so no inbound connection exists at any
+# point (home-infra/CLAUDE.md: "No inbound internet exposure, ever").
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  # The registry as the cluster's Docker daemons name it — trusted cluster-wide via
+  # insecure-registries in home-infra/modules/docker/default.nix. The HTTPS name
+  # registry.sanctuary.gdn is the same store behind Caddy; this job checks the one
+  # a build would actually push to, because that is the one that can be wrong.
+  REGISTRY: 192.168.7.208:5000
+  IMAGE: openconv
+
+jobs:
+  reachability:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@v4
+
+      # [LAW:verifiable-goals] The invariant this whole epic exists to establish is
+      # "the builder fetched this commit itself", and that is only worth anything if
+      # something checks it. HEAD is compared against the SHA the event named: they
+      # agree only if the checkout really resolved to the commit that triggered the
+      # run, which no working-tree tarball can satisfy.
+      - name: Assert the checkout is the triggering commit
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          echo "checked out: $head"
+          echo "event  said: $GITHUB_SHA"
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "ERROR: checkout is $head but the event names $GITHUB_SHA." >&2
+            echo "       An image built here could not name its own source." >&2
+            exit 1
+          fi
+          # A shallow clone still proves provenance, but a build that wants to stamp
+          # `git describe` into the image needs history. Report the depth rather than
+          # discovering it in .2.
+          echo "history depth: $(git rev-list --count HEAD)"
+
+      # The image is x86_64 Linux. A runner of any other architecture would build a
+      # silently-wrong image, or fall into hours of emulation — the exact failure the
+      # old SSH-to-a-build-host script existed to dodge.
+      - name: Assert the builder matches the image's target platform
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          # /proc/meminfo rather than `free`: procps is not in every job image, and a
+          # capacity report that vanishes with the container's base image is no report.
+          echo "runner: $(uname -s) $arch, $(nproc) cpu, $(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)MB ram"
+          df -h / | tail -1
+          if [ "$arch" != "x86_64" ]; then
+            echo "ERROR: builder is $arch; openconv's image is x86_64 Linux." >&2
+            exit 1
+          fi
+
+      # BuildKit is not optional for this repo: the Dockerfile declares
+      # `# syntax=docker/dockerfile:1.7` and uses heredoc RUN blocks plus
+      # --mount=type=cache. The legacy builder fails on all three. Proving the daemon
+      # is reachable AND BuildKit-capable here means .3 fails on the build itself
+      # rather than on the builder it was handed.
+      - name: Assert a BuildKit-capable Docker daemon is reachable
+        run: |
+          set -euo pipefail
+          docker version --format 'daemon {{.Server.Version}}'
+          # Exercising the three features rather than asking whether a plugin is
+          # installed: a `buildx version` that succeeds still says nothing about
+          # whether THIS daemon resolves a syntax frontend, honours a cache mount, or
+          # parses a heredoc. Building a miniature of openconv's Dockerfile answers
+          # all three, and answers them the same way .3 will ask.
+          probe="$(mktemp -d)"
+          cat > "$probe/Dockerfile" <<'PROBE'
+          # syntax=docker/dockerfile:1.7
+          FROM busybox
+          RUN --mount=type=cache,target=/probe-cache <<'SHELL'
+          set -eu
+          echo buildkit-ok > /probe-cache/marker
+          cat /probe-cache/marker
+          SHELL
+          PROBE
+          DOCKER_BUILDKIT=1 docker build --progress=plain -t openconv-buildkit-probe "$probe"
+          docker image rm openconv-buildkit-probe
+          rm -rf "$probe"
+
+      # [LAW:no-silent-failure] The registry answering at all is not the property that
+      # matters — the property is that it answers as a registry. A Caddy error page or
+      # a captive portal returns a 200 body just as happily, so the response is
+      # required to carry the API version header the /v2/ endpoint is defined to send.
+      - name: Assert the registry answers as a registry
+        run: |
+          set -euo pipefail
+          headers="$(curl -sS --fail --max-time 20 -D - -o /dev/null "http://$REGISTRY/v2/")"
+          echo "$headers"
+          if ! grep -qi '^docker-distribution-api-version:' <<<"$headers"; then
+            echo "ERROR: $REGISTRY/v2/ answered without a Docker-Distribution-API-Version" >&2
+            echo "       header, so whatever replied is not the registry." >&2
+            exit 1
+          fi
+
+      # A read proves routing; only a write proves the builder can publish. This
+      # opens an upload session and immediately cancels it, so it exercises the write
+      # path without leaving a blob behind. A registry that accepts reads but refuses
+      # writes would otherwise be discovered by .3, mid-build, after the expensive part.
+      - name: Assert the builder may write to the registry
+        run: |
+          set -euo pipefail
+          location="$(curl -sS --fail --max-time 20 -X POST -D - -o /dev/null \
+            "http://$REGISTRY/v2/$IMAGE/blobs/uploads/" | tr -d '\r' \
+            | awk '/^[Ll]ocation:/{print $2}')"
+          if [ -z "$location" ]; then
+            echo "ERROR: the registry accepted the upload request but named no session." >&2
+            exit 1
+          fi
+          # [LAW:dataflow-not-control-flow] The spec lets Location come back either
+          # absolute or as a bare path, so the value is normalised to a path and the
+          # URL rebuilt one way. Trying one form and falling back to the other on
+          # failure would mean a genuinely broken cancel is indistinguishable from a
+          # registry that simply chose the other spelling.
+          path="${location#http://$REGISTRY}"
+          echo "upload session opened, cancelling it"
+          curl -sS --fail --max-time 20 -X DELETE "http://$REGISTRY$path"
+
+      - name: Summary
+        run: |
+          echo "builder fetched ${GITHUB_SHA} itself, is x86_64 with BuildKit,"
+          echo "and can both read and write ${REGISTRY}."
