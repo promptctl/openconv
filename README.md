@@ -245,18 +245,21 @@ It mints a `roomList` token and calls `ListRooms`, so a failure tells you whethe
 the SFU rejected the signature or was never reachable — two things that look the
 same from inside the app.
 
-openconv itself is deployed beside it at `https://openconv.sanctuary.gdn`, from the
-`Dockerfile` here:
+openconv itself is deployed beside it at `https://openconv.sanctuary.gdn`, built by
+CI from the `Dockerfile` here — not on the development machine, which is arm64 macOS
+and has no Docker, while the image is x86_64 Linux.
 
-```
-scripts/build-image.sh          # prints the tag it published
-```
+The one thing about that build worth knowing before you go looking for it: **merging
+a PR on GitHub builds nothing.** This repo has a second remote pointing at Gitea, and
+pushing a commit there is what triggers a build. After a merge, someone still has to
+push. `.gitea/workflows/publish-image.yaml` is the pipeline and CLAUDE.md explains
+what it asserts and why; read the remote's URL out of `git remote -v` rather than
+from either document.
 
-The build runs on a homelab node rather than on the development machine, which is
-arm64 and has no Docker. What it produces goes to the cluster registry, and the tag
-it prints is the value that belongs in `service-versions.auto.tfvars.json` over in
-`~/code/home-infra` — a merged PR there is what actually rolls the deployment
-(`jobs/openconv.nomad.hcl`).
+What a publish leaves behind is a dated tag in the cluster registry, and an image
+that records the commit it was built from. That tag is the value that belongs in
+`service-versions.auto.tfvars.json` over in `~/code/home-infra` — a merged PR there
+is what actually rolls the deployment (`jobs/openconv.nomad.hcl`).
 
 Two things about that image are worth knowing before changing its dependencies.
 
