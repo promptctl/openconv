@@ -151,9 +151,25 @@ jobs:
           # Selecting the --mount tokens first and reading type= out of each finds the
           # kind wherever it sits among the comma-separated keys; matching
           # `--mount=type=` in one pattern only sees it when written first.
+          # Total over --mount tokens, not just over the ones that spell type=. BuildKit
+          # defaults a mount with no type= key to bind, so an extractor that only sees
+          # the literal string contributes nothing for `--mount=source=.,target=/x` —
+          # and because both sides use this same function, such a mount would never
+          # enter the required set at all. A guard that asks no question always passes,
+          # which is the quietest way for this check to become decorative.
+          # awk rather than a sed `t` branch: BSD sed reads `t;` as a label name and
+          # errors, so that spelling works on this Linux runner and breaks for anyone
+          # running the check on a Mac. The extractor is the part most likely to be
+          # tried by hand when it rejects something.
           mount_kinds() {
             grep -oE -- '--mount=[^[:space:]]+' "$1" \
-              | grep -oE 'type=[a-z]+' | cut -d= -f2 | sort -u
+              | awk '{
+                  if (match($0, /[=,]type=[a-z]+/))
+                    print substr($0, RSTART + 6, RLENGTH - 6)
+                  else
+                    print "bind"
+                }' \
+              | sort -u
           }
 
           covered=" $(mount_kinds "$probe/Dockerfile" | tr '\n' ' ')"
