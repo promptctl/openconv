@@ -11,8 +11,9 @@ name: Publish the openconv image
 # far end of a cold build on master.
 #
 # Why this exists at all: openconv's image used to be built by tarring a working tree
-# over SSH to a homelab node (scripts/build-image.sh), which produced images whose source
-# no commit could name. See CLAUDE.md. The replacement must run where nothing outside the
+# over SSH to a homelab node (scripts/build-image.sh, deleted in openconv-deploy-690.4 —
+# do not restore it from history), which produced images whose source no commit could
+# name. See CLAUDE.md. The replacement must run where nothing outside the
 # network can reach in — this repo pushes to Gitea and the self-hosted act_runner polls
 # outbound, so no inbound connection exists at any point (home-infra/CLAUDE.md: "No
 # inbound internet exposure, ever").
