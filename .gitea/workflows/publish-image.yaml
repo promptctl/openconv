@@ -105,7 +105,12 @@ jobs:
           set -euo pipefail
           # Run it rather than asking `command -v`: a `jq` on PATH that cannot execute —
           # wrong architecture, broken install — answers the lookup and fails the use.
-          echo "jq: $(jq --version)"
+          #
+          # On its own line, and that is the whole assertion. Wrapped as
+          # `echo "jq: $(jq --version)"` the step proves nothing: errexit reads the exit
+          # status of `echo`, which is 0 however the substitution inside it went, so a
+          # missing jq prints an empty version and passes.
+          jq --version
 
       # BuildKit is not optional for this repo: the Dockerfile declares
       # `# syntax=docker/dockerfile:1.7` and uses heredoc RUN blocks plus
@@ -453,6 +458,23 @@ jobs:
           gdn.sanctuary.build.run=$FORGE/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
           PROVENANCE
           )"
+
+          # [LAW:no-silent-failure] Every label must carry a value. `set -u` already aborts
+          # on a variable that is unset, but not on one that is set and empty, which would
+          # publish `gdn.sanctuary.build.ref=` — a label that is present, looks answered,
+          # and says nothing. That is the epic's own bug at the scale of one field.
+          #
+          # [LAW:dataflow-not-control-flow] Asked of the composed block rather than of each
+          # variable before it. Three guards naming three variables would leave a fourth
+          # label added later unchecked, because nothing would tie the guard list to the
+          # label list; this covers every label there is and every label there will be, so
+          # a fact is protected by having been added to the heredoc above.
+          if printf '%s\n' "$provenance" | grep -q '=$'; then
+            echo "ERROR: these labels came out with no value, so the image would carry" >&2
+            echo "       fields that look answered and say nothing:" >&2
+            printf '%s\n' "$provenance" | grep '=$' >&2
+            exit 1
+          fi
 
           echo "$provenance"
           {
