@@ -357,7 +357,11 @@ test("delivery names the path the media actually took", () => {
   assert.equal(transport.selected.protocol, "udp");
   assert.equal(transport.selected.remote.port, 7882);
   assert.equal(transport.selected.remote.address, "192.168.7.208");
+  // Both ends' candidate types, because the report prints them as a pair — `HOST/HOST` at
+  // loopback-acceptance.mjs:278 — and asserting only the local one lets a typo render the
+  // remote half as `undefined` in the line this probe exists to produce.
   assert.equal(transport.selected.local.type, "HOST");
+  assert.equal(transport.selected.remote.type, "HOST");
   assert.equal(transport.pairChanges, 1);
 
   // Both of the transport's own reported states, not the ICE one alone: a path can be ICE
