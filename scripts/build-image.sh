@@ -1,18 +1,62 @@
 #!/usr/bin/env bash
-# Builds the openconv image and publishes it to the homelab registry.
 #
-#   scripts/build-image.sh [tag]
+# DISABLED. This script publishes an image built from a working tree.
 #
-# Prints the published tag on stdout and nothing else, so a caller can read it:
+# `git ls-files --cached --others` below tars the tree in whatever state it is on disk,
+# untracked files included, and streams it over SSH to the gpu node to build there. The
+# image that comes out records no commit, so it cannot be reproduced, bisected, rolled
+# back to a known good, or audited — and nothing turns red when that happens. The build
+# succeeds, the deploy succeeds, and the gap surfaces months later when someone asks what
+# is running. `openconv:2026.08.24.2` was published this way and nothing can say what
+# source produced it.
 #
-#   tag=$(scripts/build-image.sh)
+# Kept rather than deleted because its replacement has to be written against it. Three
+# behaviours below are worth carrying over, and openconv-deploy-690.3 names them: the tag
+# counter derived from what the registry has already published, the manifest check after
+# the push, and the `:latest` alias a break-glass `nomad job run` lands on. Read it — the
+# thing that must not happen is running it.
 #
-# Everything a human wants to watch goes to stderr.
+# The replacement is the openconv-deploy-690 epic: CI builds from a commit it fetched
+# itself, stamps that commit into the image, and files the tag for Atlantis to deploy.
+# See CLAUDE.md, "Never build an image from a working tree".
+
+# [LAW:no-silent-failure] Refuse loudly, at the top, before any line can reach the network
+# or the build host. [LAW:no-mode-explosion] No flag and no environment variable turns
+# this off — an escape hatch is what gets reached for at 2am, which is precisely when the
+# untraceable image gets published.
+cat >&2 <<'REFUSED'
+ERROR: scripts/build-image.sh is disabled and will not run.
+
+It publishes an image built from your working tree. That image records no commit and
+cannot be reproduced, rolled back, or audited — see CLAUDE.md, "Never build an image
+from a working tree".
+
+Build from a commit in CI instead; the openconv-deploy-690 epic tracks that work. This
+file is kept only as the reference its replacement is written against.
+REFUSED
+exit 1
+
+# ===========================================================================
+# REFERENCE ONLY — nothing below this line executes.
 #
-# The build runs on a homelab node rather than here. The image is x86_64 Linux, this
-# machine is arm64 macOS, and the two heavy parts — a prebuilt multi-gigabyte libwebrtc
-# and whisper.cpp compiled from source — turn an emulated cross-build into hours. The
-# node is reached through `ops` because it holds the only key that opens it.
+# The original header, kept because it documents the interface the replacement owes its
+# callers:
+#
+#   Builds the openconv image and publishes it to the homelab registry.
+#
+#     scripts/build-image.sh [tag]
+#
+#   Prints the published tag on stdout and nothing else, so a caller can read it:
+#
+#     tag=$(scripts/build-image.sh)
+#
+#   Everything a human wants to watch goes to stderr.
+#
+#   The build runs on a homelab node rather than here. The image is x86_64 Linux, this
+#   machine is arm64 macOS, and the two heavy parts — a prebuilt multi-gigabyte libwebrtc
+#   and whisper.cpp compiled from source — turn an emulated cross-build into hours. The
+#   node is reached through `ops` because it holds the only key that opens it.
+# ===========================================================================
 set -euo pipefail
 
 registry="${OPENCONV_REGISTRY:-192.168.7.208:5000}"

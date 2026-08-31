@@ -245,17 +245,19 @@ It mints a `roomList` token and calls `ListRooms`, so a failure tells you whethe
 the SFU rejected the signature or was never reachable — two things that look the
 same from inside the app.
 
-openconv itself is deployed beside it at `https://openconv.sanctuary.gdn`, from the
-`Dockerfile` here:
+openconv itself is deployed beside it at `https://openconv.sanctuary.gdn`, built from the
+`Dockerfile` here.
 
-```
-scripts/build-image.sh          # prints the tag it published
-```
+**There is currently no supported way to publish that image.** `scripts/build-image.sh`
+used to do it by shipping a working tree to a build host, which produces images no commit
+can account for; it is disabled and kept only as the reference its replacement is written
+against. Building from a commit in CI is tracked by the `openconv-deploy-690` epic, and
+until that lands nothing here publishes.
 
-The build runs on a homelab node rather than on the development machine, which is
-arm64 and has no Docker. What it produces goes to the cluster registry, and the tag
-it prints is the value that belongs in `service-versions.auto.tfvars.json` over in
-`~/code/home-infra` — a merged PR there is what actually rolls the deployment
+What the replacement owes the deployment, and why the shape is forced: the build has to
+run on an x86_64 Linux host, because the development machine is arm64 and has no Docker.
+The tag it produces is the value that belongs in `service-versions.auto.tfvars.json` over
+in `~/code/home-infra`, where a merged PR is what actually rolls the deployment
 (`jobs/openconv.nomad.hcl`).
 
 Two things about that image are worth knowing before changing its dependencies.
