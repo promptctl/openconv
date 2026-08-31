@@ -272,7 +272,15 @@ test("a recording that declares no sample rate is refused at the parse", () => {
 /// than invented because the shape is the whole difficulty: 64-bit counters arrive as
 /// strings, proto2 optionals vanish when unset, and every entry is a one-key variant. A
 /// hand-written approximation of that would test the approximation.
-const stats = ({ candidate = {}, inbound = {}, transport = {}, arrival = "publisherStats" } = {}) => {
+const stats = ({
+  candidate = {},
+  inbound = {},
+  received = {},
+  pair = {},
+  transport = {},
+  extra = [],
+  arrival = "publisherStats",
+} = {}) => {
   const entries = [
     {
       transport: {
@@ -297,6 +305,7 @@ const stats = ({ candidate = {}, inbound = {}, transport = {}, arrival = "publis
           nominated: true,
           bytesReceived: "2938",
           currentRoundTripTime: 0.027,
+          ...pair,
         },
       },
     },
@@ -322,7 +331,7 @@ const stats = ({ candidate = {}, inbound = {}, transport = {}, arrival = "publis
       inboundRtp: {
         rtc: { id: "IT01A152043745", timestamp: "1788132842843992" },
         stream: { ssrc: 152_043_745, kind: "audio", transportId: "T01" },
-        received: { packetsReceived: "16", packetsLost: "0", jitter: 0.011 },
+        received: { packetsReceived: "16", packetsLost: "0", jitter: 0.011, ...received },
         inbound: {
           packetsDiscarded: "7",
           concealedSamples: "0",
@@ -334,6 +343,7 @@ const stats = ({ candidate = {}, inbound = {}, transport = {}, arrival = "publis
         },
       },
     },
+    ...extra,
   ];
   return { publisherStats: [], subscriberStats: [], [arrival]: entries };
 };
@@ -413,4 +423,87 @@ test("stats are read wherever rtc-node files them", () => {
   // the client's role would go blind on exactly the listener being measured, so both are
   // read and neither is chosen between.
   assert.deepEqual(delivery(stats({ arrival: "subscriberStats" })), delivery(stats()));
+});
+
+test("two peer connections that reuse an id do not overwrite each other", () => {
+  // Ids in these stats are assigned per RTCPeerConnection, so a client that both publishes
+  // and subscribes has two connections each naming their first transport `T01` and their
+  // first pair the same string. Indexed into one map, the second silently overwrites the
+  // first and a transport resolves against the wrong connection's candidates — a corrupted
+  // path reported with total confidence, which is worse than no path at all.
+  const publisher = stats({ candidate: { address: "10.0.0.1", port: 1111 } });
+  const subscriber = stats({ candidate: { address: "10.0.0.2", port: 2222 } });
+  const both = delivery({
+    publisherStats: publisher.publisherStats,
+    subscriberStats: subscriber.publisherStats,
+  });
+
+  assert.equal(both.transports.length, 2, "both connections must be reported");
+  assert.deepEqual(
+    both.transports.map((transport) => transport.selected.local.address),
+    ["10.0.0.1", "10.0.0.2"],
+    "each transport keeps its own connection's candidates",
+  );
+  assert.deepEqual(
+    both.transports.map((transport) => transport.selected.local.port),
+    [1111, 2222],
+  );
+  assert.equal(both.inboundAudio.length, 2);
+});
+
+test("a non-audio stream is excluded from the audio reading", () => {
+  // The filter is only meaningful against something that must be excluded. With every
+  // fixture supplying audio alone, a typo in the field name or the literal would pass the
+  // whole suite while letting video RTP into an audio-only reading.
+  const withVideo = delivery(
+    stats({
+      extra: [
+        {
+          inboundRtp: {
+            rtc: { id: "IT01V900", timestamp: "1788132842843992" },
+            stream: { ssrc: 900, kind: "video", transportId: "T01" },
+            received: { packetsReceived: "5000", packetsLost: "3", jitter: 0.02 },
+            inbound: {
+              packetsDiscarded: "0",
+              concealedSamples: "0",
+              silentConcealedSamples: "0",
+              concealmentEvents: "0",
+              totalSamplesReceived: "0",
+              audioLevel: 0,
+            },
+          },
+        },
+      ],
+    }),
+  );
+
+  assert.equal(withVideo.inboundAudio.length, 1);
+  assert.equal(withVideo.inboundAudio[0].ssrc, 152_043_745);
+});
+
+test("counters that are legitimately zero render as zero, never NaN or undefined", () => {
+  // These stats are proto2 and every field read here is declared `required`, so a zero
+  // arrives as an explicit zero rather than vanishing the way a proto3 scalar would at its
+  // default. That is a claim about the schema, and this is where it stops being a claim: a
+  // guard against absence would be defending a state the wire cannot produce, while a
+  // silent NaN would corrupt the diagnostic this parser exists to print.
+  const quiet = delivery(
+    stats({
+      received: { jitter: 0 },
+      pair: { currentRoundTripTime: 0 },
+      transport: { selectedCandidatePairChanges: 0 },
+      inbound: { audioLevel: 0 },
+    }),
+  );
+
+  assert.strictEqual(quiet.transports[0].selected.rttMs, 0);
+  assert.strictEqual(quiet.transports[0].pairChanges, 0);
+  assert.strictEqual(quiet.inboundAudio[0].jitterMs, 0);
+  assert.strictEqual(quiet.inboundAudio[0].audioLevel, 0);
+
+  // And the rendering those feed, which is where a NaN would actually be seen: every one
+  // of these formats to a number a reader can act on.
+  assert.equal(quiet.transports[0].selected.rttMs.toFixed(1), "0.0");
+  assert.equal(quiet.inboundAudio[0].jitterMs.toFixed(1), "0.0");
+  assert.equal(quiet.inboundAudio[0].audioLevel.toExponential(2), "0.00e+0");
 });
