@@ -3,12 +3,15 @@
 # The deployable openconv: REST endpoints and the voice agent in one process, the way
 # they run from a checkout.
 #
-# Build it on an x86_64 Linux host — the homelab's `gpu` node is the one with the disk
-# for it. libwebrtc arrives as a prebuilt multi-gigabyte archive and whisper.cpp is
-# compiled from source, so a cross-build under emulation is hours where a native build
-# is minutes.
+# To be built in CI, by the self-hosted Gitea act_runner, from a commit the runner
+# fetched itself — never from a working tree. See CLAUDE.md for why that is not
+# negotiable. No job builds it yet: .gitea/workflows/ci-builder.yaml only proves the
+# builder, and the build itself is openconv-deploy-690.3.
 #
-#   scripts/build-image.sh
+# It must be built on x86_64 Linux: libwebrtc arrives as a prebuilt multi-gigabyte
+# archive and whisper.cpp is compiled from source, so a cross-build under emulation is
+# hours where a native build is minutes. The `gpu` node is NOT the builder — it is
+# reserved for workloads that need the GPU. The runner host builds this.
 
 # ---------------------------------------------------------------------------
 # The model the agent hears with.
