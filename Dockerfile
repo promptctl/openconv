@@ -8,7 +8,9 @@
 # compiled from source, so a cross-build under emulation is hours where a native build
 # is minutes.
 #
-#   scripts/build-image.sh
+# Published by CI from a commit it fetched itself — tracked by the openconv-deploy-690
+# epic. `scripts/build-image.sh` used to publish this image from a working tree and is
+# disabled; see CLAUDE.md, "Never build an image from a working tree".
 
 # ---------------------------------------------------------------------------
 # The model the agent hears with.

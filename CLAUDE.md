@@ -6,7 +6,7 @@ Build from a commit, in CI, on a machine that fetched that commit itself. Anythi
 
 Banned: copying, tarring, rsyncing or scp-ing this source tree onto a build host; building an image from anything the builder did not pull from git itself; any build that needs a laptop, a checkout, or an SSH session to run; build scratch directories left on the VMs.
 
-`scripts/build-image.sh` is exactly this and is being replaced — it tars the working tree, including untracked files, and ships it over SSH to the gpu node. Do not copy its shape into another repo, and do not reach for it as a shortcut. Its scratch directory on the gpu node has been deleted; do not recreate one.
+`scripts/build-image.sh` is exactly this — it tars the working tree, including untracked files, and ships it over SSH to the gpu node. It is now disabled: it refuses at the top and exits non-zero before reaching the network, with no flag or environment variable that turns the refusal off. The body is kept below that refusal only as the reference its replacement is written against. Do not copy its shape into another repo, do not reach for it as a shortcut, and do not re-enable it. Its scratch directory on the gpu node has been deleted; do not recreate one.
 
 Three things in it are worth keeping when it is replaced: the tag counter derived from what the registry already published, the manifest check after the push, and the `:latest` alias that break-glass `nomad job run` depends on.
 
