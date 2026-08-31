@@ -1,44 +1,70 @@
 //! Turning text into the samples the agent's track carries.
 //!
-//! Speech is not synthesized here. elvenreader-server already serves the ElevenLabs
-//! `/v1/text-to-speech` surface, and this is the client for it — the HTTP call, and the
-//! two conversions needed to get what comes back onto a LiveKit track.
+//! Speech is not synthesized here. The server behind `OPENCONV_TTS_URL` serves the
+//! ElevenLabs `/v1/text-to-speech` surface, and this is the client for it — the HTTP
+//! call, and the two conversions needed to get what comes back onto a LiveKit track.
+//!
+//! This crate has no opinion on which server that is, which is the point: elvenspeak
+//! (`~/code/elvenspeak`) is what answers today, and it replaced elvenreader-server
+//! without a line changing here.
 //!
 //! # Voices are not mapped here
 //!
-//! Happy's settings screen stores an ElevenLabs voice ID, and elvenreader-server already
-//! owns the table that resolves one: `voices.toml` maps the IDs it does not serve onto
-//! ones it does, and has a catch-all for everything else — an unrecognised ID comes back
-//! as a successful response in a substitute voice, not an error. So the ID is passed
-//! straight through. A second copy of that table here would be a second answer to "which
-//! voice is this", and the two would drift the first time either is edited.
+//! Happy's settings screen stores an ElevenLabs voice ID, and the server owns the table
+//! that resolves one: elvenspeak's `aliases.toml` maps IDs it does not serve onto ones
+//! it does, and falls back for everything else — an unrecognised ID comes back as a
+//! successful response in a substitute voice, not an error. So the ID is passed straight
+//! through. A second copy of that table here would be a second answer to "which voice is
+//! this", and the two would drift the first time either is edited.
+//!
+//! That contract is load-bearing rather than incidental, and it is pinned from the other
+//! side: elvenspeak's `test_unknown_voice_substitutes_and_says_so` names this client in
+//! its docstring. A server that 404s foreign IDs would leave every caller silent while
+//! looking, from here, exactly like a server that is down.
+//!
+//! Substitution is also observable, which is what keeps the passthrough honest: every
+//! response carries `x-elvenspeak-voice` naming what actually spoke, and
+//! `x-elvenspeak-voice-requested` when that differs from what was asked for. Nothing
+//! here reads them — they are for whoever is asking why a caller sounds wrong.
 //!
 //! # What comes back, and what the track wants
 //!
-//! elvenreader-server returns MPEG audio at whatever rate its upstream produced —
-//! 44.1 kHz mono in practice. LiveKit wants signed 16-bit PCM at [`audio::SAMPLE_RATE`].
-//! Neither the decode nor the rate change is optional, and neither assumes the rate:
-//! every frame states its own, so a voice that arrives at some other rate is handled by
-//! the same path rather than quietly playing at the wrong pitch.
+//! MPEG audio, 44.1 kHz mono in practice — elvenspeak's default `output_format` is
+//! `mp3_44100_128`, and it emits no ID3 tag, so the body starts on a frame sync.
+//! LiveKit wants signed 16-bit PCM at [`audio::SAMPLE_RATE`]. Neither the decode nor the
+//! rate change is optional, and neither assumes the rate: every frame states its own, so
+//! a voice that arrives at some other rate is handled by the same path rather than
+//! quietly playing at the wrong pitch.
 //!
 //! # Why the audio is decoded on the way in
 //!
 //! Because the alternative asserts something untrue about audio — that a clause's
-//! samples all exist at one instant — and buys nothing for it.
+//! samples all exist at one instant — and against a server that genuinely streams it is
+//! also what gets the caller talking sooner.
 //!
-//! Be careful reading a win into this today. Measured against elvenreader-server, its
-//! `/stream` endpoint does not currently stream: headers come back after about 3.5
-//! seconds, then nothing for another 1.2, and then the entire hundred kilobytes arrives
-//! within about 20 milliseconds. So decoding on the way in saves roughly a tenth of a
-//! second, not the second the endpoint's name suggests. `tests/live_speech.rs` prints
-//! these numbers; if the day comes that they change, this client already spends the
-//! difference on the caller instead of on a buffer.
+//! # What synthesis costs, and why the number matters
 //!
-//! What *is* worth knowing is that the cost is almost entirely fixed: about five seconds
-//! a request, whether the clause is three seconds of speech or eight. That is why
-//! replies are cut into clauses that overlap rather than into as few requests as
-//! possible — see [`crate::speak`] — and it is the number that dominates everything
-//! else the speech path does.
+//! Measured against elvenspeak's piper engine (`tests/live_speech.rs` prints these; an
+//! idle M-series Mac, not the deployed node): first byte in a few milliseconds, then
+//! roughly **0.1 s fixed per request plus 0.06 s per second of speech**.
+//!
+//! The shape matters more than the figures, because it decides how replies should be
+//! cut. Under a fixed per-request cost the right move is fewer, larger requests; under a
+//! proportional one it is to start the first clause as early as possible, since every
+//! clause pays only for itself. This is firmly the second — the proportional term
+//! dominates by the second or third second of speech — and [`crate::speak`] cuts on that
+//! basis. An earlier version of this document recorded the opposite ("about five seconds
+//! a request, whether the clause is three seconds of speech or eight"). That was true of
+//! elvenreader-server and is wrong now in both magnitude and shape, which is the failure
+//! worth guarding against: a number here that has quietly stopped describing the server.
+//!
+//! Two cautions before anyone tunes against the figures. They move with load — the same
+//! test run beside a `cargo clippy` gave 0.15 s per second of speech, two and a half
+//! times the idle number — so a busy node is the case to design for, not this one. And
+//! throughput is not the tight constraint anyway: across clean runs the first clause's
+//! audio landed within about 0.15 s either side of the model finishing its reply,
+//! sometimes ahead and sometimes behind. Comfortable on total synthesis, break-even on
+//! the only latency a caller experiences.
 //!
 //! [`audio::SAMPLE_RATE`]: crate::audio::SAMPLE_RATE
 
@@ -51,15 +77,15 @@ use minimp3::{Decoder, Error as Mp3Error, Frame};
 use std::fmt;
 use tokio::io::AsyncRead;
 
-/// Speech, as elvenreader-server serves it.
+/// Speech, as the server behind `OPENCONV_TTS_URL` serves it.
 ///
 /// Cloning is cheap and shares one connection pool — [`reqwest::Client`] is a handle,
 /// not a resource — which is what lets each clause be synthesized in its own task.
 #[derive(Clone)]
 pub struct Tts {
     http: reqwest::Client,
-    /// Origin of elvenreader-server, e.g. `http://127.0.0.1:11000`, without a trailing
-    /// slash.
+    /// Origin of the text-to-speech server, e.g. `http://127.0.0.1:11000`, without a
+    /// trailing slash.
     base_url: String,
     /// Used when the client asks for no particular voice. ElevenLabs' own default, which
     /// is what Happy's settings screen starts from, so the untouched path agrees with
@@ -67,9 +93,10 @@ pub struct Tts {
     default_voice: String,
 }
 
-/// Synthesis is slow — a few seconds is normal, most of it fixed overhead rather than
-/// proportional to the text. Long enough not to abandon a working request; short enough
-/// that a wedged one does not hold a clause of the reply hostage indefinitely.
+/// Generous against a local engine on purpose. Synthesis of one clause is well under a
+/// second today, so this is not sized to the expected cost — it is sized so that a slow
+/// engine, a cold model load, or a loaded node does not turn a working request into a
+/// dropped clause, while a wedged one still cannot hold the reply hostage indefinitely.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Tts {
@@ -231,7 +258,7 @@ fn to_mono(interleaved: &[i16], channels: usize) -> Vec<i16> {
 
 #[derive(Debug)]
 pub enum TtsError {
-    /// elvenreader-server could not be reached, or gave up partway.
+    /// The text-to-speech server could not be reached, or gave up partway.
     Unreachable(String),
     /// A non-2xx response. The body is carried because the server explains itself there.
     Refused { status: u16, body: String },
@@ -286,7 +313,7 @@ mod tests {
     /// The one thing a caller can check without a server: real MPEG audio comes back at
     /// the rate and channel count the track publishes.
     ///
-    /// The fixture is a short clause synthesized by elvenreader-server, kept because a
+    /// The fixture is a short clause synthesized by a real server, kept because a
     /// decoder that silently changes behaviour is otherwise only findable by listening.
     #[tokio::test]
     async fn a_real_response_decodes_to_the_tracks_format() {

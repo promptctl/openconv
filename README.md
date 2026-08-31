@@ -31,11 +31,42 @@ It started against elvenreader-server (`~/code/elvenread/server`), which serves 
 ElevenLabs `/v1/text-to-speech` surface. That single upstream account was disabled by
 ElevenLabs for "unusual activity" and took every deployed call's audio down with it —
 see `openconv-openconv-bwy.17` — so the settled design is local, dependency-free TTS:
-point the same URL at a small service under this project's own control instead. Piper
-(`~/code/piper-server`) is that service today: MIT-licensed, ONNX-based, CPU-only, and
-it answers the identical `/v1/text-to-speech/{voice_id}/stream` shape, so this crate
-needed no code change to switch. `crates/openconv-agent/src/tts.rs` has no opinion on
-which server is behind the URL, by design.
+point the same URL at a small service under this project's own control instead.
+[elvenspeak](https://github.com/promptctl/elvenspeak) (`~/code/elvenspeak`) is that
+service: Piper or Kokoro voices running on the machine it starts on, no account and no
+network after first start, answering the identical `/v1/text-to-speech/{voice_id}/stream`
+shape. Switching cost this crate no code change, which is the design working rather than
+a happy accident — `crates/openconv-agent/src/tts.rs` has no opinion on which server is
+behind the URL.
+
+The whole of `tests/live_speech.rs` passes against it unmodified. Run it yourself — the
+server holds the terminal, so this is two of them.
+
+In the first, and leave it running (it needs `ffmpeg` on `PATH`; the piper engine needs
+nothing else):
+
+```
+cd ~/code/elvenspeak
+PORT=11001 ELVENSPEAK_ENGINE=piper uv run --extra piper main.py
+```
+
+In the second, once `curl -s localhost:11001/health` answers:
+
+```
+OPENCONV_TTS_URL=http://127.0.0.1:11001 \
+  cargo test -p openconv-agent --test live_speech -- --ignored --nocapture
+```
+
+`--nocapture` is the point of running it: the tests print what synthesis actually cost,
+which is the number [`tts.rs`](crates/openconv-agent/src/tts.rs) reasons from. Run them
+on an idle machine — a build running alongside moved the per-second figure by 2.5x.
+
+One thing that seam depends on, and that is easy to break from the other side: Happy
+stores ElevenLabs voice IDs, and this crate passes them through untranslated. That is
+only safe because elvenspeak answers an ID it does not know with audio in a substitute
+voice rather than a 404 — pinned by its own
+`test_unknown_voice_substitutes_and_says_so`. A backend without that behaviour makes
+every caller silent while looking, from here, exactly like a backend that is down.
 
 **Rust**, matching elvenreader-server: axum for the REST endpoints, `livekit-api`
 to mint tokens, `livekit` for the agent's room participation. The cost is that
@@ -290,14 +321,43 @@ It holds the room open for three seconds first, because a room created and close
 one second reports a duration of zero — which would satisfy a "has a duration" check
 while proving nothing about it.
 
-The agent cannot speak there yet. `OPENCONV_TTS_URL` resolves a Consul service named
-`elvenreader`, and nothing is deployed under that name in the cluster — so a call
-answers on the control channel and logs `a clause of the reply went unspoken` for
-every clause. That target is stale regardless: `elvenreader` proxied a single
-ElevenLabs account that ElevenLabs has since disabled, so deploying it would only
-trade a silent agent for a 502ing one (`openconv-openconv-bwy.17`). Piper (see above)
-is proven end to end against this crate's own TTS client, locally — see `piper-server`
-— but deploying *it* into the cluster and repointing `OPENCONV_TTS_URL` is still open.
+The agent cannot speak there yet, and the reason is now entirely on the other side of
+the seam. `OPENCONV_TTS_URL` resolves a Consul service named `elvenreader`
+(`home-infra/jobs/openconv.nomad.hcl`), and nothing is deployed under that name — so a
+call answers on the control channel and logs `a clause of the reply went unspoken` for
+every clause. Nothing under that name is coming, either: `elvenreader` proxied the
+single ElevenLabs account that was disabled, and its replacement is named `elvenspeak`.
+
+Two things have to land, both outside this repo:
+
+1. elvenspeak deployed in the cluster, registering under a Consul name that identifies
+   **one engine** — `elvenspeak-piper` rather than `elvenspeak`. See below; this is the
+   part that is easy to get wrong.
+2. That job spec's lookup changed to the same name, in the same commit — a catalog entry
+   naming an engine that is not running is the same class of lie as an image that cannot
+   name its commit.
+
+Nothing here changes for either. The client is already proven against elvenspeak (see
+above), so what remains is a deploy, not an integration.
+
+**Why the service name has to name the engine.** elvenspeak ships as two images with the
+engine in the name — piper and kokoro — and therefore two jobs. `OPENCONV_TTS_URL`
+resolves a *single* Consul service name, so if both jobs register as `elvenspeak`, Consul
+treats them as interchangeable backends and balances between them. They are not
+interchangeable: they speak in different voices. The symptom is the voice changing
+partway through a conversation, which looks exactly like a bug in this crate's clause
+handling and will send whoever chases it into `speak.rs`, where there is nothing wrong.
+
+A rule saying "only one engine job may hold that name" would prevent it and is worth
+nothing, because nothing enforces it — the second job registers happily. Putting the
+engine in the registered name is the same fix with none of the discipline: two engines
+can then both run, this template names the one it wants, and the broken state cannot be
+expressed.
+
+**And `ELVENSPEAK_API_KEY` must be unset.** This crate sends no `xi-api-key`, so a key
+on the server makes every clause `401` and the agent silent for a fresh reason. The
+default is already correct — the risk is someone wiring it to Vault because everything
+else here draws its credentials from Vault. Its *absence* is the configuration.
 
 ## Backlog
 

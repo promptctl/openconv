@@ -22,7 +22,7 @@ pub struct SessionConfig {
     pub language: Option<Language>,
     /// The voice the client picked, as the ElevenLabs ID its settings screen stores.
     ///
-    /// Carried through untranslated: elvenreader-server owns the table that resolves an
+    /// Carried through untranslated: the text-to-speech server owns the table that resolves an
     /// ID onto a voice it can serve, including the fallback for ones it has never heard
     /// of. See [`crate::tts`] for why that table is not copied here.
     pub voice_id: Option<String>,
@@ -247,7 +247,7 @@ mod tests {
         }
     }
 
-    /// Carried through exactly as sent — resolving it is elvenreader-server's job, and
+    /// Carried through exactly as sent — resolving it is the text-to-speech server's job, and
     /// an ID rewritten here would be a second opinion about which voice this is.
     #[test]
     fn the_clients_voice_is_carried_through_untranslated() {
