@@ -5,9 +5,8 @@
 #
 # Built in CI, by the self-hosted Gitea act_runner, from a commit the runner fetched
 # itself — never from a working tree. See CLAUDE.md for why that is not negotiable.
-# .gitea/workflows/publish-image.yaml is the only thing that builds this file; it does so
-# for master and for a manual dispatch, and publishes the result as YYYY.MM.DD.N and
-# :latest.
+# .gitea/workflows/publish-image.yaml is the only thing that builds this file, and it owns
+# which refs get published and how they are tagged.
 #
 # It must be built on x86_64 Linux: libwebrtc arrives as a prebuilt multi-gigabyte
 # archive and whisper.cpp is compiled from source, so a cross-build under emulation is

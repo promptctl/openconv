@@ -356,7 +356,10 @@ jobs:
           highest="$(tr ',[]' '\n\n\n' < "$body" | tr -d '"' \
             | sed -nE "s/^$today_re\.([0-9]+)$/\1/p" | sort -n | tail -n 1)"
 
-          tag="$today.$(( ${highest:-0} + 1 ))"
+          # 10# because `highest` is a digit string from the registry and anyone may
+          # retag: bash reads a leading zero as octal, so a published `.08` would abort
+          # every publish for the day and `.010` would quietly resolve to 9.
+          tag="$today.$(( 10#${highest:-0} + 1 ))"
           echo "publishing as $tag"
           echo "image-tag=$tag" >> "$GITHUB_OUTPUT"
 
