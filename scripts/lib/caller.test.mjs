@@ -359,11 +359,26 @@ test("delivery names the path the media actually took", () => {
   assert.equal(transport.selected.remote.address, "192.168.7.208");
   assert.equal(transport.selected.local.type, "HOST");
   assert.equal(transport.pairChanges, 1);
-  assert.equal(transport.iceState, "ICE_TRANSPORT_CONNECTED");
 
-  // Seconds on the wire, milliseconds in the reading, so a reader comparing this against
-  // the ICMP figures on the ticket is not converting in their head.
-  assert.equal(Math.round(transport.selected.rttMs), 27);
+  // Both of the transport's own reported states, not the ICE one alone: a path can be ICE
+  // connected with DTLS still handshaking, and a reading that showed only the first would
+  // call that settled.
+  assert.equal(transport.iceState, "ICE_TRANSPORT_CONNECTED");
+  assert.equal(transport.dtlsState, "DTLS_TRANSPORT_CONNECTED");
+});
+
+test("seconds on the wire are milliseconds in the reading", () => {
+  // Two fields cross this boundary — the selected pair's round trip and the jitter buffer's
+  // delay — and they are one contract rather than two coincidences, so they are asserted
+  // together: a reader comparing either against the ICMP figures on the ticket must not be
+  // converting in their head. Both are driven nonzero deliberately. Zero is the one input
+  // that survives every way of getting the conversion wrong — a dropped `* 1000`, an
+  // inverted one, a read of the wrong field — so a suite that only ever asserts the zero
+  // case is not testing the conversion at all.
+  const reading = delivery(stats());
+
+  assert.equal(Math.round(reading.transports[0].selected.rttMs), 27);
+  assert.equal(Math.round(reading.inboundAudio[0].jitterMs), 11);
 });
 
 test("a TCP fallback is visible as one, which is the question being asked", () => {
@@ -384,16 +399,31 @@ test("a TCP fallback is visible as one, which is the question being asked", () =
 test("counters are numbers, not the strings the wire carries", () => {
   // 64-bit fields arrive from protobuf as strings, where "0" is truthy and "10" < "9".
   // A comparison against a threshold would silently do the wrong thing on every one.
-  const [audio] = delivery(
-    stats({ inbound: { concealedSamples: "48000", concealmentEvents: "12" } }),
-  ).inboundAudio;
+  const reading = delivery(
+    stats({
+      inbound: {
+        concealedSamples: "48000",
+        silentConcealedSamples: "31000",
+        concealmentEvents: "12",
+      },
+    }),
+  );
+  const [audio] = reading.inboundAudio;
 
   assert.strictEqual(audio.concealedSamples, 48_000);
+  // Distinct from the concealed total above, so a read of the wrong neighbouring field
+  // fails here rather than passing on a number that happens to match.
+  assert.strictEqual(audio.silentConcealedSamples, 31_000);
   assert.strictEqual(audio.concealmentEvents, 12);
   assert.strictEqual(audio.packetsReceived, 16);
   assert.strictEqual(audio.packetsLost, 0);
   assert.strictEqual(audio.packetsDiscarded, 7);
   assert.strictEqual(audio.samplesReceived, 95_520);
+
+  // Same wire representation on the other side of the reading: the selected pair's byte
+  // count arrives as a 64-bit string too, and nothing would notice it staying one until a
+  // threshold comparison quietly went lexicographic.
+  assert.strictEqual(reading.transports[0].selected.bytesReceived, 2938);
 
   // The signature this whole line of investigation keeps finding: a track that arrived
   // complete and decoded to one or two least significant bits of an i16.
