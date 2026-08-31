@@ -196,7 +196,7 @@ jobs:
           set -euo pipefail
           location="$(curl -sS --fail --max-time 20 -X POST -D - -o /dev/null \
             "http://$REGISTRY/v2/$IMAGE/blobs/uploads/" | tr -d '\r' \
-            | awk '/^[Ll]ocation:/{print $2}')"
+            | awk 'tolower($1) == "location:" { print $2 }')"
 
           # [LAW:dataflow-not-control-flow] The spec lets Location come back either
           # absolute or as a bare path, and a registry may name itself differently than
@@ -217,6 +217,14 @@ jobs:
           # 13G free. The trap says so when the cancel does not take, rather than
           # leaving a silent orphan.
           cleanup_upload() {
+            # Two real states, each reported honestly. An unparseable Location leaves
+            # nothing this script can address, so it says that rather than firing a
+            # DELETE at the registry root — a request that means nothing, fails, and
+            # reports a blank session id beside the error that already explained it.
+            if [ -z "$path" ]; then
+              echo "note: no cancellable upload session was parsed; registry GC must reap it" >&2
+              return
+            fi
             curl -sS --fail --max-time 20 -X DELETE "http://$REGISTRY$path" \
               || echo "note: upload session $path was not cancelled; registry GC must reap it" >&2
           }
