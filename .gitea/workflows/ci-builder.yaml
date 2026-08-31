@@ -111,8 +111,14 @@ jobs:
 
           # Every mount kind the real Dockerfile uses must be one the probe below
           # actually exercises, or the probe is testing the wrong daemon capability.
+          # Select the --mount tokens first, then read type= out of each, so the kind is
+          # found wherever it sits among the comma-separated keys. Matching
+          # `--mount=type=` as one pattern only finds the kind when it is written first
+          # and silently misses `--mount=id=x,type=secret` — a guard that reports
+          # nothing because it looked in the wrong place is worse than no guard.
           covered=" cache "
-          for kind in $(grep -o -- '--mount=type=[a-z]*' Dockerfile | cut -d= -f3 | sort -u); do
+          for kind in $(grep -oE -- '--mount=[^[:space:]]+' Dockerfile \
+                        | grep -oE 'type=[a-z]+' | cut -d= -f2 | sort -u); do
             case "$covered" in
               *" $kind "*) ;;
               *)
@@ -127,6 +133,20 @@ jobs:
           # concurrent runs remove each other's image mid-build.
           probe="$(mktemp -d)"
           tag="openconv-buildkit-probe:${GITHUB_RUN_ID}"
+
+          # This is the step designed to fail whenever BuildKit is misconfigured, so its
+          # failure path is a normal case rather than an exceptional one — and `set -e`
+          # aborts past any cleanup written after the build. The trap runs on every exit
+          # path instead. It reports an image that was already gone rather than
+          # silencing the attempt: a quiet cleanup is how a leak stops being visible,
+          # and this runner's disk is the same scarce resource the real build needs.
+          cleanup_probe() {
+            rm -rf "$probe"
+            docker image rm -f "$tag" >/dev/null \
+              || echo "note: probe image $tag was not present to remove" >&2
+          }
+          trap cleanup_probe EXIT
+
           {
             echo "$syntax"
             cat <<'PROBE'
@@ -139,8 +159,6 @@ jobs:
           PROBE
           } > "$probe/Dockerfile"
           DOCKER_BUILDKIT=1 docker build --progress=plain -t "$tag" "$probe"
-          docker image rm "$tag"
-          rm -rf "$probe"
 
       # [LAW:no-silent-failure] The registry answering at all is not the property that
       # matters — the property is that it answers as a registry. A Caddy error page or
@@ -178,8 +196,19 @@ jobs:
           # untouched. Matching only the expected host would degrade to a no-op and
           # build a malformed URL from the leftover.
           path="$(printf '%s' "$location" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*##')"
-          echo "upload session opened, cancelling it"
-          curl -sS --fail --max-time 20 -X DELETE "http://$REGISTRY$path"
+
+          # From here the session occupies registry disk until it is cancelled, and this
+          # workflow runs on every push. A cancel skipped by an abort — or by the runner
+          # losing the network between the POST and the DELETE — accumulates orphaned
+          # uploads on a registry with 13G free. The trap cancels on every exit path and
+          # says so when the cancel does not take, rather than leaving a silent orphan.
+          cleanup_upload() {
+            curl -sS --fail --max-time 20 -X DELETE "http://$REGISTRY$path" \
+              || echo "note: upload session $path was not cancelled; registry GC must reap it" >&2
+          }
+          trap cleanup_upload EXIT
+
+          echo "upload session opened at $path"
 
       - name: Summary
         run: |
