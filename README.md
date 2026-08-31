@@ -316,15 +316,34 @@ single ElevenLabs account that was disabled, and its replacement is named `elven
 
 Two things have to land, both outside this repo:
 
-1. elvenspeak deployed in the cluster, registering in Consul as `elvenspeak`.
-2. That job spec's lookup changed from `elvenreader` to `elvenspeak`, in the same
-   commit — a catalog entry naming an engine that is not running is the same class of
-   lie as an image that cannot name its commit.
+1. elvenspeak deployed in the cluster, registering under a Consul name that identifies
+   **one engine** — `elvenspeak-piper` rather than `elvenspeak`. See below; this is the
+   part that is easy to get wrong.
+2. That job spec's lookup changed to the same name, in the same commit — a catalog entry
+   naming an engine that is not running is the same class of lie as an image that cannot
+   name its commit.
 
 Nothing here changes for either. The client is already proven against elvenspeak (see
-above), so what remains is a deploy, not an integration. One constraint on that deploy:
-this crate sends no `xi-api-key`, so elvenspeak must run with `ELVENSPEAK_API_KEY`
-unset, or every clause comes back `401` and the agent is silent for a new reason.
+above), so what remains is a deploy, not an integration.
+
+**Why the service name has to name the engine.** elvenspeak ships as two images with the
+engine in the name — piper and kokoro — and therefore two jobs. `OPENCONV_TTS_URL`
+resolves a *single* Consul service name, so if both jobs register as `elvenspeak`, Consul
+treats them as interchangeable backends and balances between them. They are not
+interchangeable: they speak in different voices. The symptom is the voice changing
+partway through a conversation, which looks exactly like a bug in this crate's clause
+handling and will send whoever chases it into `speak.rs`, where there is nothing wrong.
+
+A rule saying "only one engine job may hold that name" would prevent it and is worth
+nothing, because nothing enforces it — the second job registers happily. Putting the
+engine in the registered name is the same fix with none of the discipline: two engines
+can then both run, this template names the one it wants, and the broken state cannot be
+expressed.
+
+**And `ELVENSPEAK_API_KEY` must be unset.** This crate sends no `xi-api-key`, so a key
+on the server makes every clause `401` and the agent silent for a fresh reason. The
+default is already correct — the risk is someone wiring it to Vault because everything
+else here draws its credentials from Vault. Its *absence* is the configuration.
 
 ## Backlog
 
