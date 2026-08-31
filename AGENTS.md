@@ -12,7 +12,7 @@ Instead: build in CI from a commit, tag `YYYY.MM.DD.N`, push to the homelab regi
 
 That CI is the homelab's self-hosted Gitea `act_runner`, the only CI executor here: it polls outbound and exposes no inbound port, because this network accepts no inbound connections, ever (`home-infra/CLAUDE.md:11`). No GitHub-hosted runner may join the network and no GitHub Actions job may drive anything inside it. Development, PRs and review stay on GitHub (`git@github.com:promptctl/openconv.git`); that does not change.
 
-Pushing a commit to this repo's second remote — its Gitea repo on `gitea.sanctuary.gdn` — is what triggers a build. No mirror, no polling, no schedule; `.gitea/workflows/ci-builder.yaml` runs on any push and on manual dispatch. Read that remote's name and URL out of `git remote -v`, never from memory — a guessed URL 404s and the build you think you triggered never ran.
+Pushing a commit to this repo's second remote — its Gitea repo on `gitea.sanctuary.gdn` — is what triggers CI. No mirror, no polling, no schedule; `.gitea/workflows/ci-builder.yaml` runs on any push and on manual dispatch. What it runs today only proves the builder — checkout matches the triggering commit, runner is x86_64 with a BuildKit-capable Docker daemon, registry reads and writes. It builds no image; that is `openconv-deploy-690.3`, not written yet. Read that remote's name and URL out of `git remote -v`, never from memory — a guessed URL 404s and the run you think you triggered never happened.
 
 The `gpu` node is not a build host. It is reserved for workloads that need the GPU.
 
