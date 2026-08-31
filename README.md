@@ -39,13 +39,27 @@ shape. Switching cost this crate no code change, which is the design working rat
 a happy accident — `crates/openconv-agent/src/tts.rs` has no opinion on which server is
 behind the URL.
 
-The whole of `tests/live_speech.rs` passes against it unmodified. Run it yourself:
+The whole of `tests/live_speech.rs` passes against it unmodified. Run it yourself — the
+server holds the terminal, so this is two of them.
+
+In the first, and leave it running (it needs `ffmpeg` on `PATH`; the piper engine needs
+nothing else):
 
 ```
-cd ~/code/elvenspeak && PORT=11001 ELVENSPEAK_ENGINE=piper uv run --extra piper main.py
+cd ~/code/elvenspeak
+PORT=11001 ELVENSPEAK_ENGINE=piper uv run --extra piper main.py
+```
+
+In the second, once `curl -s localhost:11001/health` answers:
+
+```
 OPENCONV_TTS_URL=http://127.0.0.1:11001 \
   cargo test -p openconv-agent --test live_speech -- --ignored --nocapture
 ```
+
+`--nocapture` is the point of running it: the tests print what synthesis actually cost,
+which is the number [`tts.rs`](crates/openconv-agent/src/tts.rs) reasons from. Run them
+on an idle machine — a build running alongside moved the per-second figure by 2.5x.
 
 One thing that seam depends on, and that is easy to break from the other side: Happy
 stores ElevenLabs voice IDs, and this crate passes them through untranslated. That is
