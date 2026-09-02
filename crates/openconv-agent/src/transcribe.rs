@@ -32,7 +32,32 @@ impl Transcriber {
     /// model file stops the process instead of turning into an agent that joins calls
     /// and cannot hear.
     pub fn load(model: &Path) -> Result<Self, TranscribeError> {
-        let context = WhisperContext::new_with_params(model, WhisperContextParameters::default())
+        // [LAW:no-silent-failure] whisper.cpp does not refuse to run unaccelerated. It
+        // prints one WARN, transcribes on the CPU, and lets the process report itself
+        // healthy — and for this service that is not a slower conversation but a broken
+        // one. Inference falls behind realtime, the listener stalls inside it, and the
+        // audio sink it has stopped draining drops its oldest frames, so the caller's
+        // words are destroyed rather than delayed. Nothing errors and nothing is missing;
+        // the service simply stops working. Refusing to start is the only way that
+        // failure ever reaches anyone.
+        //
+        // `use_gpu` is whisper-rs's own `cfg!(feature = "_gpu")`, so this asks the one
+        // question that was answered wrongly for the whole life of the deployment: did
+        // this build compile in any GPU backend at all? See the per-target features in
+        // Cargo.toml — a target absent from that list builds fine and lands here.
+        //
+        // Build-time only, and deliberately not claimed as more. A backend that compiles
+        // in and then fails to *initialise* — the card out of memory, a compute
+        // capability the image was not built for — is one whisper.cpp answers by falling
+        // back to the CPU and returning Ok, which this check cannot see. That gap is real
+        // and is openconv-openconv-bwy.34; closing it needs a timing signal rather than a
+        // configuration one, since only latency distinguishes the two at runtime.
+        let parameters = WhisperContextParameters::default();
+        if !parameters.use_gpu {
+            return Err(TranscribeError::NoAcceleration);
+        }
+
+        let context = WhisperContext::new_with_params(model, parameters)
             .map_err(|error| TranscribeError::Load { model: model.to_owned(), error })?;
 
         // Leave a core for everything else in the process — the audio pumps have a
@@ -53,9 +78,30 @@ impl Transcriber {
         transcribe_blocking(&transcriber.context, threads, &vec![0.0; 16_000])
             .map_err(|error| TranscribeError::Warmup(Box::new(error)))?;
 
+        // `backends` records which backend was compiled in and, for CUDA, the device
+        // architectures it was built for. That second part is the reason it earns a
+        // field: it is how `ARCHS = 750` was confirmed to be the single architecture
+        // this image targets rather than the dozen nvcc defaults to, a question the
+        // build log cannot answer because cargo swallows build-script output.
+        //
+        // It is deliberately NOT a claim about which backend served a given inference.
+        // `whisper_print_system_info` reports compile-time flags, so it reads identically
+        // however the run went — and there is no gap here for it to have covered anyway.
+        // A Linux container holding the CUDA backend but no card cannot fall back to the
+        // CPU quietly, because it cannot start: `libcuda.so.1` comes from the nvidia
+        // container runtime, so without it the dynamic loader fails the exec outright,
+        // before `main`. Measured against this image, not assumed.
+        //
+        // Two of the three ways to lose the GPU are therefore loud: no backend compiled
+        // in, caught by the check above; an absent card, caught by the loader. The third
+        // — a backend that initialises and fails — stays silent, and `ready_in_ms` on
+        // this line is the only thing that would betray it, at 84ms against 41601ms for
+        // the CPU. Reading that is currently a human's job. openconv-openconv-bwy.34 is
+        // making it the process's.
         tracing::info!(
             model = %model.display(),
             threads,
+            backends = whisper_rs::print_system_info(),
             ready_in_ms = warmup.elapsed().as_millis(),
             "speech-to-text model loaded"
         );
@@ -164,6 +210,11 @@ fn strip_annotations(text: &str) -> String {
 #[derive(Debug)]
 pub enum TranscribeError {
     Load { model: PathBuf, error: whisper_rs::WhisperError },
+    /// Built with no GPU backend at all, which this service cannot run on.
+    ///
+    /// A property of the binary rather than of the machine it landed on: by the time
+    /// this is returned, no amount of hardware will change the answer.
+    NoAcceleration,
     Inference(whisper_rs::WhisperError),
     /// The model loaded but could not run. A model file that parses and cannot infer
     /// is still a broken deployment, and better found at startup than mid-call.
@@ -180,6 +231,16 @@ impl fmt::Display for TranscribeError {
                 "could not load the speech-to-text model at {}: {error}. Fetch one with \
                  scripts/fetch-whisper-model.sh, or point OPENCONV_WHISPER_MODEL at it",
                 model.display()
+            ),
+            Self::NoAcceleration => write!(
+                f,
+                "this build of openconv compiled no GPU backend into whisper, and \
+                 speech-to-text on the CPU alone runs far behind realtime — it does not \
+                 make calls slow, it makes them lose the caller's words. Nothing names a \
+                 backend for {}: the per-target whisper-rs features in \
+                 crates/openconv-agent/Cargo.toml are the list this check enforces, and \
+                 this target is not on it",
+                std::env::consts::OS,
             ),
             Self::Inference(error) => write!(f, "speech-to-text failed: {error}"),
             Self::Warmup(error) => write!(f, "speech-to-text model failed its first run: {error}"),
