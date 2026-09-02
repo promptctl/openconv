@@ -222,16 +222,15 @@ impl fmt::Display for TranscribeError {
                  scripts/fetch-whisper-model.sh, or point OPENCONV_WHISPER_MODEL at it",
                 model.display()
             ),
-            Self::NoAcceleration => f.write_str(
+            Self::NoAcceleration => write!(
+                f,
                 "this build of openconv compiled no GPU backend into whisper, and \
                  speech-to-text on the CPU alone runs far behind realtime — it does not \
-                 make calls slow, it makes them lose the caller's words. Build for a \
-                 target that names one: the per-target whisper-rs features in \
+                 make calls slow, it makes them lose the caller's words. Nothing names a \
+                 backend for {}: the per-target whisper-rs features in \
                  crates/openconv-agent/Cargo.toml are the list this check enforces, and \
-                 naming them again here would be a second copy to go stale. Reaching \
-                 this message at all rules out a missing card as the cause — a container \
-                 without the GPU fails earlier and louder, at the dynamic loader, on \
-                 libcuda.so.1",
+                 this target is not on it",
+                std::env::consts::OS,
             ),
             Self::Inference(error) => write!(f, "speech-to-text failed: {error}"),
             Self::Warmup(error) => write!(f, "speech-to-text model failed its first run: {error}"),
