@@ -8,9 +8,15 @@
 //! both about the page being *this* deployment's client rather than a client in
 //! general. Same-origin means the token mint is an ordinary `fetch` — no CORS layer
 //! widened across a credentialed API for a page's sake. And the SFU to dial comes from
-//! [`LiveKit::signaling_url`] rather than from a text box, because a token minted here
-//! and offered to a different deployment's SFU does not error: the client joins a room
-//! the agent is not in and the caller hears silence.
+//! the deployment's own configuration rather than from a text box, because a token
+//! minted here and offered to a different deployment's SFU does not error: the client
+//! joins a room the agent is not in and the caller hears silence.
+//!
+//! The page is given [`LiveKit::public_signaling_url`], not the address the agent uses.
+//! They are usually the same string and were once the same value, which is the bug this
+//! separation fixes: the homelab points the agent at a LAN address from Consul, and
+//! serving that to a browser produced a `ws://` URL on an `https://` page that browsers
+//! refuse as mixed content, reported only as a transport error naming nothing.
 
 use crate::state::AppState;
 use axum::extract::State;
@@ -94,7 +100,7 @@ struct CallConfig {
 /// Unauthenticated, like `/health`: the SFU hostname is what every client dials and is
 /// not a credential. The token is the credential, and that mint is authenticated.
 async fn config(State(state): State<AppState>) -> impl IntoResponse {
-    Json(CallConfig { livekit_url: state.livekit.signaling_url() })
+    Json(CallConfig { livekit_url: state.livekit.public_signaling_url() })
 }
 
 #[cfg(test)]
