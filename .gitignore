@@ -3,3 +3,8 @@
 # The conversation record, written into the working directory by a server run from a
 # checkout. Real call data, and a different file on every machine.
 /conversations.jsonl
+
+# Agent working state — session scratch and git worktrees, all of it machine-local.
+# The worktrees are the reason this is not merely untidy: each carries its own .git
+# file, so a `git add -A` commits a gitlink to a checkout that exists on one laptop.
+/.claude/
