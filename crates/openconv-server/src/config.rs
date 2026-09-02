@@ -13,9 +13,28 @@ use std::path::PathBuf;
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Origin of the LiveKit deployment, e.g. `https://livekit.sanctuary.gdn`. Room
-    /// service calls are Twirp POSTs against this; clients reach the same host over
-    /// `wss://` for signaling.
+    /// service calls are Twirp POSTs against this, and the agent dials the same host
+    /// over `wss://` for its own signaling.
+    ///
+    /// This is the address *this process* uses, which a deployment is free to make an
+    /// in-cluster one the outside world cannot resolve.
     pub livekit_url: String,
+    /// The same deployment, at the address a browser can reach.
+    ///
+    /// [`Self::livekit_url`] answers "how does this process reach the SFU"; a browser
+    /// asks a different question, and the two have different answers whenever the
+    /// service and the SFU sit behind the same private network. The homelab is exactly
+    /// that case: the agent takes a LAN address straight from Consul to keep its own
+    /// signaling off the tailnet, and a browser cannot route to it — and, served from
+    /// an `https://` page, would refuse the `ws://` it implies as mixed content before
+    /// ever trying.
+    ///
+    /// Defaults to [`Self::livekit_url`], so a deployment whose SFU is reachable the
+    /// same way from both sides configures nothing and cannot drift. Setting it is a
+    /// deliberate statement that the two routes differ — it must still name the *same*
+    /// deployment, because a token minted here and offered to another deployment's SFU
+    /// does not error: the caller joins a room the agent is not in and hears silence.
+    pub public_livekit_url: String,
     /// Credentials from Vault at `secret/livekit`, used both to sign participant
     /// tokens and to authenticate our own room service calls.
     pub livekit_api_key: String,
@@ -71,6 +90,13 @@ impl Config {
             .trim_end_matches('/')
             .to_owned();
 
+        // [LAW:one-source-of-truth] Defaulting to `livekit_url` rather than to a second
+        // literal keeps one value until a deployment says otherwise, so the pair cannot
+        // silently disagree about which SFU is meant.
+        let public_livekit_url = optional("OPENCONV_PUBLIC_LIVEKIT_URL", &livekit_url)
+            .trim_end_matches('/')
+            .to_owned();
+
         let bind_spec = optional("OPENCONV_BIND", "0.0.0.0:8080");
         let bind = bind_spec
             .parse()
@@ -78,6 +104,7 @@ impl Config {
 
         Ok(Self {
             livekit_url,
+            public_livekit_url,
             livekit_api_key,
             livekit_api_secret,
             xi_api_key: XiApiKey(xi_api_key),
