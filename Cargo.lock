@@ -1877,6 +1877,7 @@ dependencies = [
  "openconv-protocol",
  "ort",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",

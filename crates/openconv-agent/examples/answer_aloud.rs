@@ -13,6 +13,7 @@
 //! `http://127.0.0.1:11000`). The WAV it writes is what the caller would have heard.
 
 use openconv_agent::audio::SAMPLE_RATE;
+use openconv_agent::speak::Voicing;
 use openconv_agent::clause::Clauses;
 use openconv_agent::llm::{Claude, Llm, Piece, Turn};
 use openconv_agent::speak::collect;
@@ -40,7 +41,13 @@ async fn main() {
         std::env::var("OPENCONV_TTS_URL").unwrap_or_else(|_| "http://127.0.0.1:11000".to_owned()),
         std::env::var("OPENCONV_TTS_VOICE").unwrap_or_else(|_| "21m00Tcm4TlvDq8ikWAM".to_owned()),
     ));
-    let voice = std::env::var("OPENCONV_TTS_VOICE").ok();
+    // Both axes reachable, because this is the tool for diagnosing either against a
+    // real server. Unset means the client asked for nothing, which is what a
+    // conversation that overrode nothing sends.
+    let voicing = Voicing {
+        voice_id: std::env::var("OPENCONV_TTS_VOICE").ok(),
+        model_id: std::env::var("OPENCONV_TTS_MODEL").ok(),
+    };
 
     let turns = [Turn::Caller(line.clone())];
     let started = Instant::now();
@@ -60,13 +67,13 @@ async fn main() {
         for clause in clauses.push(&said) {
             first_clause_at.get_or_insert_with(|| started.elapsed());
             println!("[{:>6.2}s] clause: {clause}", started.elapsed().as_secs_f32());
-            synthesis.push(spawn(&tts, voice.clone(), clause));
+            synthesis.push(spawn(&tts, voicing.clone(), clause));
         }
     }
     if let Some(clause) = clauses.flush() {
         first_clause_at.get_or_insert_with(|| started.elapsed());
         println!("[{:>6.2}s] clause: {clause}", started.elapsed().as_secs_f32());
-        synthesis.push(spawn(&tts, voice.clone(), clause));
+        synthesis.push(spawn(&tts, voicing.clone(), clause));
     }
 
     let wrote_at = started.elapsed();
@@ -118,12 +125,12 @@ async fn main() {
 
 fn spawn(
     tts: &Arc<Tts>,
-    voice: Option<String>,
+    voicing: Voicing,
     clause: String,
 ) -> tokio::task::JoinHandle<Result<Vec<i16>, openconv_agent::tts::TtsError>> {
     let tts = tts.clone();
     // Gathered rather than queued: this measures the path, it does not drive a track.
-    tokio::spawn(async move { collect(tts.synthesize(voice.as_deref(), &clause).await?).await })
+    tokio::spawn(async move { collect(tts.synthesize(&voicing, &clause).await?).await })
 }
 
 /// A 16-bit mono WAV, so the result can be played rather than described.
