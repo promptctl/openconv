@@ -80,8 +80,8 @@ ENV PATH=/usr/local/cuda/bin:$PATH \
 # Build device code for exactly the card this deploys to — an RTX 2070, Turing, compute
 # capability 7.5. The default is every architecture nvcc knows, which is many minutes of
 # compilation and a fat binary, all but one slice of it for cards this cluster does not
-# have. A different card means changing this number and rebuilding; a wrong number fails
-# loudly at load rather than silently on the CPU, which the transcriber now refuses.
+# have. A different card means changing this number and rebuilding, and nothing catches
+# a mismatch: it falls back to the CPU and returns Ok (openconv-openconv-bwy.34).
 ENV CUDAARCHS=75
 
 WORKDIR /src
