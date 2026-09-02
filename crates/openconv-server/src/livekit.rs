@@ -34,6 +34,7 @@ const TOKEN_TTL: Duration = Duration::from_secs(6 * 3600);
 pub struct LiveKit {
     rooms: RoomClient,
     url: String,
+    public_url: String,
     api_key: String,
     api_secret: String,
 }
@@ -47,6 +48,7 @@ impl LiveKit {
                 &config.livekit_api_secret,
             ),
             url: config.livekit_url.clone(),
+            public_url: config.public_livekit_url.clone(),
             api_key: config.livekit_api_key.clone(),
             api_secret: config.livekit_api_secret.clone(),
         }
@@ -144,8 +146,28 @@ impl LiveKit {
     /// Derived from the one configured origin rather than configured separately, so the
     /// REST calls and the agent can never end up pointed at different deployments.
     pub fn signaling_url(&self) -> String {
-        self.url.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1)
+        signaling(&self.url)
     }
+
+    /// The signaling URL a browser dials, which is the same deployment by a route that
+    /// leaves the private network.
+    ///
+    /// Separate from [`Self::signaling_url`] because the two answer different questions
+    /// and a deployment can make them different answers — see
+    /// [`Config::public_livekit_url`]. When it does not, this is that same string.
+    pub fn public_signaling_url(&self) -> String {
+        signaling(&self.public_url)
+    }
+}
+
+/// An origin as a signaling URL, which is the same host under the scheme LiveKit's
+/// clients speak.
+///
+/// [LAW:one-source-of-truth] One mapping, used for both routes: two copies of this
+/// substitution would be two chances to map one of them wrong, and a wrongly-schemed
+/// SFU URL fails in the transport without naming a cause.
+fn signaling(origin: &str) -> String {
+    origin.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1)
 }
 
 /// What the client shows for the agent, and how it appears in the room.
@@ -240,6 +262,9 @@ mod tests {
     fn test_config() -> Config {
         Config {
             livekit_url: "https://livekit.example".to_owned(),
+            // What `from_env` produces when nothing sets the public route: the two are
+            // one value until a deployment separates them.
+            public_livekit_url: "https://livekit.example".to_owned(),
             livekit_api_key: "openconv".to_owned(),
             livekit_api_secret: "secret-secret-secret-secret-secret".to_owned(),
             xi_api_key: XiApiKey::new("sk-test"),
@@ -251,6 +276,33 @@ mod tests {
             tts_url: "http://127.0.0.1:11000".to_owned(),
             tts_voice: "21m00Tcm4TlvDq8ikWAM".to_owned(),
         }
+    }
+
+    /// The default: one configured SFU, so both routes name it identically and there is
+    /// nothing that can drift.
+    #[test]
+    fn both_routes_agree_when_the_deployment_configures_one() {
+        let livekit = LiveKit::new(&test_config());
+
+        assert_eq!(livekit.signaling_url(), "wss://livekit.example");
+        assert_eq!(livekit.public_signaling_url(), livekit.signaling_url());
+    }
+
+    /// The homelab's shape: the agent holds a private address it can reach and the page
+    /// is handed the public one. The agent's route must not move when the page's does —
+    /// sending in-cluster signaling out through the ingress is the regression this
+    /// separation exists to avoid.
+    #[test]
+    fn a_separated_public_route_moves_only_the_page() {
+        let config = Config {
+            livekit_url: "http://192.168.7.208:7880".to_owned(),
+            public_livekit_url: "https://livekit.example".to_owned(),
+            ..test_config()
+        };
+        let livekit = LiveKit::new(&config);
+
+        assert_eq!(livekit.signaling_url(), "ws://192.168.7.208:7880");
+        assert_eq!(livekit.public_signaling_url(), "wss://livekit.example");
     }
 
     fn record_with_user(user: Option<HappyUserId>) -> ConversationRecord {
