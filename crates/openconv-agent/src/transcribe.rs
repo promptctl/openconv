@@ -71,13 +71,23 @@ impl Transcriber {
         transcribe_blocking(&transcriber.context, threads, &vec![0.0; 16_000])
             .map_err(|error| TranscribeError::Warmup(Box::new(error)))?;
 
-        // `backends` is whisper.cpp's own account of what it can use, and it is here
-        // because the check above cannot cover the whole failure. That one proves a
-        // backend was *compiled in*; a container that was then started without the
-        // nvidia runtime has the backend and no card, and whisper.cpp answers that by
-        // falling back to the CPU just as quietly. Naming the backends on the line that
-        // already reports the load turns "which one is it actually running on" from an
-        // afternoon into a grep, which is what this cost the first time.
+        // `backends` records which backend was compiled in and, for CUDA, the device
+        // architectures it was built for. That second part is the reason it earns a
+        // field: it is how `ARCHS = 750` was confirmed to be the single architecture
+        // this image targets rather than the dozen nvcc defaults to, a question the
+        // build log cannot answer because cargo swallows build-script output.
+        //
+        // It is deliberately NOT a claim about which backend served a given inference.
+        // `whisper_print_system_info` reports compile-time flags, so it reads identically
+        // however the run went — and there is no gap here for it to have covered anyway.
+        // A Linux container holding the CUDA backend but no card cannot fall back to the
+        // CPU quietly, because it cannot start: `libcuda.so.1` comes from the nvidia
+        // container runtime, so without it the dynamic loader fails the exec outright,
+        // before `main`. Measured against this image, not assumed.
+        //
+        // So each way of losing the GPU lands somewhere loud: no backend compiled in is
+        // caught by the check above, an absent card by the loader, and which backend a
+        // working build actually holds by this line.
         tracing::info!(
             model = %model.display(),
             threads,
@@ -216,10 +226,12 @@ impl fmt::Display for TranscribeError {
                 "this build of openconv compiled no GPU backend into whisper, and \
                  speech-to-text on the CPU alone runs far behind realtime — it does not \
                  make calls slow, it makes them lose the caller's words. Build for a \
-                 target that names its backend in crates/openconv-agent/Cargo.toml \
-                 (macOS: metal, Linux: cuda). A Linux image also needs the CUDA runtime \
-                 libraries and a container started with the nvidia runtime, or the \
-                 binary will not have loaded this far",
+                 target that names one: the per-target whisper-rs features in \
+                 crates/openconv-agent/Cargo.toml are the list this check enforces, and \
+                 naming them again here would be a second copy to go stale. Reaching \
+                 this message at all rules out a missing card as the cause — a container \
+                 without the GPU fails earlier and louder, at the dynamic loader, on \
+                 libcuda.so.1",
             ),
             Self::Inference(error) => write!(f, "speech-to-text failed: {error}"),
             Self::Warmup(error) => write!(f, "speech-to-text model failed its first run: {error}"),
