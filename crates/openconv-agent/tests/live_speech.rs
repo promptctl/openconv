@@ -10,6 +10,7 @@
 //! is arranged around, so it is worth being able to measure rather than assume.
 
 use openconv_agent::audio::SAMPLE_RATE;
+use openconv_agent::speak::Voicing;
 use openconv_agent::clause::Clauses;
 use futures_util::StreamExt;
 use openconv_agent::speak::collect;
@@ -35,7 +36,7 @@ async fn a_clause_comes_back_as_audible_audio_at_the_tracks_rate() {
     let spoken = "Both suites passed on the first attempt.";
 
     let started = Instant::now();
-    let speech = tts().synthesize(None, spoken).await.expect("the server answered");
+    let speech = tts().synthesize(&Voicing::default(), spoken).await.expect("the server answered");
     let samples = collect(speech).await.expect("the audio decoded");
     let took = started.elapsed();
 
@@ -81,7 +82,7 @@ async fn what_a_clause_costs_fixed_versus_per_second() {
     let tts = tts();
 
     let short = Instant::now();
-    let short_audio = collect(tts.synthesize(None, "They passed.").await.expect("short clause"))
+    let short_audio = collect(tts.synthesize(&Voicing::default(), "They passed.").await.expect("short clause"))
         .await
         .expect("short clause audio");
     let short = short.elapsed();
@@ -89,7 +90,7 @@ async fn what_a_clause_costs_fixed_versus_per_second() {
     let long = Instant::now();
     let long_audio = collect(
         tts.synthesize(
-            None,
+            &Voicing::default(),
             "Both suites passed on the first attempt, and the whole run took a little \
              under four minutes from a cold cache.",
         )
@@ -140,7 +141,7 @@ async fn the_first_clause_is_measured_against_when_the_reply_ended() {
         .expect("the reply produced a clause");
 
     let started = Instant::now();
-    let mut speech = tts().synthesize(None, &clause).await.expect("the server answered");
+    let mut speech = tts().synthesize(&Voicing::default(), &clause).await.expect("the server answered");
 
     // Time to the *first* stretch of audio, not the last — that is the moment the caller
     // starts hearing something, and the whole reason this decodes as the bytes arrive.

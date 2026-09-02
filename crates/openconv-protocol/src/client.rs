@@ -118,6 +118,26 @@ pub struct PromptOverride {
 pub struct ConversationConfigOverrideTts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_id: Option<String>,
+    /// Which engine synthesizes, where `voice_id` says which voice.
+    ///
+    /// **An extension, and the only field here not transcribed from the published
+    /// types.** `ConversationConfigOverrideTts` in `@elevenlabs/types` declares
+    /// `voice_id`, `stability`, `speed` and `similarity_boost` and nothing else — the
+    /// sole `model_id` in that file is on `Config`, which configures audio input. So
+    /// `scripts/check-against-published-types.mjs` reports this field as undeclared, and
+    /// that report is correct rather than a fault in the script.
+    ///
+    /// It is here because the engine is a per-conversation choice on this deployment:
+    /// elvenspeak serves several engines behind one endpoint and picks between them by
+    /// `model_id`, and with nowhere to put one a caller cannot reach any but the
+    /// default. Optional and skipped when unset, so a payload from the real SDK parses
+    /// unchanged and one openconv sends is byte-identical to before unless a caller
+    /// asks for an engine.
+    ///
+    /// Carried through untranslated for the same reason `voice_id` is: the
+    /// text-to-speech server owns what an id means, including which ids it refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stability: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

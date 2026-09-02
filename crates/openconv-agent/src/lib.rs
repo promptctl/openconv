@@ -670,7 +670,7 @@ fn start_turn(
                     speak::speak(
                         &voice,
                         services.tts.clone(),
-                        config.voice_id.clone(),
+                        config.voicing.clone(),
                         interrupted.clone(),
                         reply,
                     )

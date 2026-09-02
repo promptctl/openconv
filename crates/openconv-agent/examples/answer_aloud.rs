@@ -13,6 +13,7 @@
 //! `http://127.0.0.1:11000`). The WAV it writes is what the caller would have heard.
 
 use openconv_agent::audio::SAMPLE_RATE;
+use openconv_agent::speak::Voicing;
 use openconv_agent::clause::Clauses;
 use openconv_agent::llm::{Claude, Llm, Piece, Turn};
 use openconv_agent::speak::collect;
@@ -123,7 +124,7 @@ fn spawn(
 ) -> tokio::task::JoinHandle<Result<Vec<i16>, openconv_agent::tts::TtsError>> {
     let tts = tts.clone();
     // Gathered rather than queued: this measures the path, it does not drive a track.
-    tokio::spawn(async move { collect(tts.synthesize(voice.as_deref(), &clause).await?).await })
+    tokio::spawn(async move { collect(tts.synthesize(&Voicing { voice_id: voice, model_id: None }, &clause).await?).await })
 }
 
 /// A 16-bit mono WAV, so the result can be played rather than described.

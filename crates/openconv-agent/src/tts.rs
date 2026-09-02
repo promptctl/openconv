@@ -71,7 +71,8 @@
 use crate::audio;
 use crate::llm::with_cause;
 use crate::resample::Resampler;
-use crate::speak::{Speech, Synthesizer};
+use crate::speak::{Speech, Synthesizer, Voicing};
+use serde::Serialize;
 use futures_util::stream::{self, StreamExt};
 use minimp3::{Decoder, Error as Mp3Error, Frame};
 use std::fmt;
@@ -115,14 +116,34 @@ impl Tts {
     ///
     /// The request is made here so that a service that is down, or that refuses the
     /// voice, fails before any of it is queued for the caller to hear.
-    pub async fn synthesize(&self, voice: Option<&str>, text: &str) -> Result<Speech, TtsError> {
-        let voice = voice.unwrap_or(&self.default_voice);
-        let url = format!("{}/v1/text-to-speech/{voice}/stream", self.base_url);
+    /// Where a clause asking for this voicing is sent.
+    ///
+    /// Falling back to the deployment's default happens here, at the one place holding
+    /// both the request and the default, so a caller that asked for no voice gets one
+    /// and a caller that asked for one is never quietly given another.
+    fn url_for(&self, voicing: &Voicing) -> String {
+        let voice = voicing.voice_id.as_deref().unwrap_or(&self.default_voice);
+        format!("{}/v1/text-to-speech/{voice}/stream", self.base_url)
+    }
+
+    /// What is sent with it.
+    ///
+    /// Separated from the call for the reason [`decode`] is: what has to be got right is
+    /// a shape, and asserting a shape against a value costs nothing while asserting it
+    /// against a running server costs a server. A function rather than an expression
+    /// inlined below, so a test drives the same one the request does instead of a copy
+    /// that agrees with itself.
+    fn body_for<'a>(voicing: &'a Voicing, text: &'a str) -> Request<'a> {
+        Request { text, model_id: voicing.model_id.as_deref() }
+    }
+
+    pub async fn synthesize(&self, voicing: &Voicing, text: &str) -> Result<Speech, TtsError> {
+        let url = self.url_for(voicing);
 
         let response = self
             .http
             .post(&url)
-            .json(&serde_json::json!({"text": text}))
+            .json(&Self::body_for(voicing, text))
             .send()
             .await
             .map_err(|error| TtsError::Unreachable(with_cause(&error)))?;
@@ -144,6 +165,22 @@ impl Tts {
 
 }
 
+/// The request body, as the server reads it.
+///
+/// A struct rather than a `json!` literal so the wire shape is declarative: an absent
+/// `model_id` is skipped by serde rather than by a branch, and the field names are
+/// stated once beside the type carrying them.
+///
+/// Skipped rather than sent as null, and the difference is visible to a caller:
+/// elvenspeak names a `model_id` it could not act on in `x-elvenspeak-ignored`, so a
+/// null on every request would report a field nobody asked for in every response.
+#[derive(Serialize)]
+struct Request<'a> {
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_id: Option<&'a str>,
+}
+
 /// Everything but the network, for the tests: decodes bytes already in hand.
 #[cfg(test)]
 async fn decode_bytes(mpeg: &[u8]) -> Result<Vec<i16>, TtsError> {
@@ -151,7 +188,7 @@ async fn decode_bytes(mpeg: &[u8]) -> Result<Vec<i16>, TtsError> {
 }
 
 impl Synthesizer for Tts {
-    fn speak(&self, voice: Option<String>, text: String) -> Speech {
+    fn speak(&self, voicing: Voicing, text: String) -> Speech {
         // Owns its inputs so the clause can be synthesized in a task of its own, which
         // is what lets several be in flight at once.
         let tts = self.clone();
@@ -160,7 +197,7 @@ impl Synthesizer for Tts {
         // first item — there is no other channel to report it on.
         Box::pin(
             stream::once(async move {
-                match tts.synthesize(voice.as_deref(), &text).await {
+                match tts.synthesize(&voicing, &text).await {
                     Ok(speech) => speech,
                     Err(error) => Box::pin(stream::once(async move { Err(error) })) as Speech,
                 }
@@ -283,6 +320,45 @@ impl std::error::Error for TtsError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_engine_the_caller_asked_for_reaches_the_request() {
+        let voicing = Voicing { voice_id: None, model_id: Some("kokoro".into()) };
+        let body =
+            serde_json::to_value(Tts::body_for(&voicing, "hello")).expect("serializes");
+
+        assert_eq!(body, serde_json::json!({"text": "hello", "model_id": "kokoro"}));
+    }
+
+    #[test]
+    fn asking_for_no_engine_sends_no_model_id_at_all() {
+        // Not `null`. elvenspeak names a `model_id` it could not act on in
+        // `x-elvenspeak-ignored`, so sending one on every request would report a field
+        // nobody asked for in every response — and what a caller who overrode nothing
+        // sends stays byte-for-byte what they sent before this existed.
+        let body = serde_json::to_value(Tts::body_for(&Voicing::default(), "hello"))
+            .expect("serializes");
+
+        assert_eq!(body, serde_json::json!({"text": "hello"}));
+    }
+
+    #[test]
+    fn the_voice_asked_for_is_the_one_in_the_path_and_absent_means_the_default() {
+        let tts = Tts::new("http://server:11000/".into(), "default-voice".into());
+
+        let asked = Voicing { voice_id: Some("af_heart".into()), model_id: None };
+        assert_eq!(
+            tts.url_for(&asked),
+            "http://server:11000/v1/text-to-speech/af_heart/stream"
+        );
+
+        // Substituting the default for a voice that *was* asked for is the failure this
+        // guards: the caller hears a different speaker and nothing says so.
+        assert_eq!(
+            tts.url_for(&Voicing::default()),
+            "http://server:11000/v1/text-to-speech/default-voice/stream"
+        );
+    }
 
     #[test]
     fn stereo_is_averaged_down_to_one_channel() {
