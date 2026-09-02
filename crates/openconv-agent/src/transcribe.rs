@@ -45,6 +45,13 @@ impl Transcriber {
         // question that was answered wrongly for the whole life of the deployment: did
         // this build compile in any GPU backend at all? See the per-target features in
         // Cargo.toml — a target absent from that list builds fine and lands here.
+        //
+        // Build-time only, and deliberately not claimed as more. A backend that compiles
+        // in and then fails to *initialise* — the card out of memory, a compute
+        // capability the image was not built for — is one whisper.cpp answers by falling
+        // back to the CPU and returning Ok, which this check cannot see. That gap is real
+        // and is openconv-openconv-bwy.34; closing it needs a timing signal rather than a
+        // configuration one, since only latency distinguishes the two at runtime.
         let parameters = WhisperContextParameters::default();
         if !parameters.use_gpu {
             return Err(TranscribeError::NoAcceleration);
@@ -85,9 +92,12 @@ impl Transcriber {
         // container runtime, so without it the dynamic loader fails the exec outright,
         // before `main`. Measured against this image, not assumed.
         //
-        // So each way of losing the GPU lands somewhere loud: no backend compiled in is
-        // caught by the check above, an absent card by the loader, and which backend a
-        // working build actually holds by this line.
+        // Two of the three ways to lose the GPU are therefore loud: no backend compiled
+        // in, caught by the check above; an absent card, caught by the loader. The third
+        // — a backend that initialises and fails — stays silent, and `ready_in_ms` on
+        // this line is the only thing that would betray it, at 84ms against 41601ms for
+        // the CPU. Reading that is currently a human's job. openconv-openconv-bwy.34 is
+        // making it the process's.
         tracing::info!(
             model = %model.display(),
             threads,
