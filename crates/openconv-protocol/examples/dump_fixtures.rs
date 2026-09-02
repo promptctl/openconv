@@ -196,6 +196,12 @@ fn fixtures() -> Vec<serde_json::Value> {
                 }),
                 tts: Some(ConversationConfigOverrideTts {
                     voice_id: Some("x".to_owned()),
+                    // Populated even though `check-against-published-types` reports it
+                    // as undeclared, because it is: `model_id` is openconv's own
+                    // extension to this object and the script is right to say so. One
+                    // known finding, reported every run, is worth more than a field
+                    // hidden from the check that exists to find exactly this.
+                    model_id: Some("x".to_owned()),
                     stability: Some(0.5),
                     speed: Some(1.0),
                     similarity_boost: Some(0.5),

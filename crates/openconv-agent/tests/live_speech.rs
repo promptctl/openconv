@@ -10,6 +10,7 @@
 //! is arranged around, so it is worth being able to measure rather than assume.
 
 use openconv_agent::audio::SAMPLE_RATE;
+use openconv_agent::speak::Voicing;
 use openconv_agent::clause::Clauses;
 use futures_util::StreamExt;
 use openconv_agent::speak::collect;
@@ -27,6 +28,36 @@ fn seconds(samples: &[i16]) -> f32 {
     samples.len() as f32 / SAMPLE_RATE as f32
 }
 
+/// The engine axis, against a server that really has more than one.
+///
+/// `OPENCONV_TTS_MODEL` names one — `piper`, `kokoro`, or an ElevenLabs model id that
+/// deployment maps — and the point is that it *reaches* the server: elvenspeak refuses a
+/// `model_id` naming an engine it is not running with a 422, so a wrong one here comes
+/// back as [`TtsError::Refused`] rather than as silence or as the default engine
+/// answering in its place. That refusal is the behaviour this axis exists to get, and
+/// the only place to see it is against a real deployment.
+///
+/// Skipped rather than failed when the variable is unset, because which engines a
+/// server runs is that deployment's business and this test cannot know one to name.
+#[tokio::test]
+#[ignore = "needs a running text-to-speech server"]
+async fn an_engine_the_caller_names_reaches_the_server() {
+    let Ok(model) = std::env::var("OPENCONV_TTS_MODEL") else {
+        println!("set OPENCONV_TTS_MODEL to a model id the server serves to run this");
+        return;
+    };
+
+    let voicing = Voicing { voice_id: None, model_id: Some(model.clone()) };
+    let speech = tts()
+        .synthesize(&voicing, "Both suites passed.")
+        .await
+        .unwrap_or_else(|error| panic!("the server refused model_id {model:?}: {error}"));
+
+    let samples = collect(speech).await.expect("the audio decoded");
+    assert!(!samples.is_empty(), "model_id {model:?} produced no audio");
+    println!("{:?} spoke {:.2}s of audio", model, seconds(&samples));
+}
+
 /// The whole client, end to end: a clause goes out, audible speech comes back at the
 /// rate the agent's track publishes.
 #[tokio::test]
@@ -35,7 +66,7 @@ async fn a_clause_comes_back_as_audible_audio_at_the_tracks_rate() {
     let spoken = "Both suites passed on the first attempt.";
 
     let started = Instant::now();
-    let speech = tts().synthesize(None, spoken).await.expect("the server answered");
+    let speech = tts().synthesize(&Voicing::default(), spoken).await.expect("the server answered");
     let samples = collect(speech).await.expect("the audio decoded");
     let took = started.elapsed();
 
@@ -81,7 +112,7 @@ async fn what_a_clause_costs_fixed_versus_per_second() {
     let tts = tts();
 
     let short = Instant::now();
-    let short_audio = collect(tts.synthesize(None, "They passed.").await.expect("short clause"))
+    let short_audio = collect(tts.synthesize(&Voicing::default(), "They passed.").await.expect("short clause"))
         .await
         .expect("short clause audio");
     let short = short.elapsed();
@@ -89,7 +120,7 @@ async fn what_a_clause_costs_fixed_versus_per_second() {
     let long = Instant::now();
     let long_audio = collect(
         tts.synthesize(
-            None,
+            &Voicing::default(),
             "Both suites passed on the first attempt, and the whole run took a little \
              under four minutes from a cold cache.",
         )
@@ -140,7 +171,7 @@ async fn the_first_clause_is_measured_against_when_the_reply_ended() {
         .expect("the reply produced a clause");
 
     let started = Instant::now();
-    let mut speech = tts().synthesize(None, &clause).await.expect("the server answered");
+    let mut speech = tts().synthesize(&Voicing::default(), &clause).await.expect("the server answered");
 
     // Time to the *first* stretch of audio, not the last — that is the moment the caller
     // starts hearing something, and the whole reason this decodes as the bytes arrive.

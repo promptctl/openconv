@@ -10,6 +10,7 @@
 //! Everything here is a pure transformation of that message into the settled
 //! configuration a turn runs against.
 
+use crate::speak::Voicing;
 use openconv_protocol::{ConversationInitiationClientData, JsonObject, Language};
 
 /// A conversation's configuration, after the client's overrides have been applied.
@@ -20,12 +21,13 @@ pub struct SessionConfig {
     /// What the agent says before the caller says anything, if the client asked for one.
     pub first_message: Option<String>,
     pub language: Option<Language>,
-    /// The voice the client picked, as the ElevenLabs ID its settings screen stores.
+    /// The voice the client picked, and the engine it asked to hear it in.
     ///
-    /// Carried through untranslated: the text-to-speech server owns the table that resolves an
-    /// ID onto a voice it can serve, including the fallback for ones it has never heard
-    /// of. See [`crate::tts`] for why that table is not copied here.
-    pub voice_id: Option<String>,
+    /// Carried through untranslated: the text-to-speech server owns the tables that resolve
+    /// either ID onto something it can serve, including the fallback for voices it has
+    /// never heard of and the refusal for an engine it is not running. See [`crate::tts`]
+    /// for why neither table is copied here.
+    pub voicing: Voicing,
 }
 
 impl SessionConfig {
@@ -50,10 +52,16 @@ impl SessionConfig {
             system_prompt: substitute(&prompt, &variables),
             first_message: agent.first_message.filter(|message| !message.trim().is_empty()),
             language: agent.language,
-            voice_id: overrides
-                .tts
-                .and_then(|tts| tts.voice_id)
-                .filter(|voice| !voice.trim().is_empty()),
+            voicing: {
+                let tts = overrides.tts.unwrap_or_default();
+                // Blank is unsaid on both axes. A settings screen that stores an empty
+                // string means the client picked nothing, and forwarding it would ask
+                // the server to resolve `""`.
+                Voicing {
+                    voice_id: tts.voice_id.filter(|voice| !voice.trim().is_empty()),
+                    model_id: tts.model_id.filter(|model| !model.trim().is_empty()),
+                }
+            },
         }
     }
 }
@@ -258,19 +266,80 @@ mod tests {
                 ..Default::default()
             }),
         );
-        assert_eq!(config.voice_id.as_deref(), Some("21m00Tcm4TlvDq8ikWAM"));
+        assert_eq!(config.voicing.voice_id.as_deref(), Some("21m00Tcm4TlvDq8ikWAM"));
     }
 
     /// No voice and a blank voice mean the same thing — use whatever the service
     /// defaults to — and collapsing them here saves every caller the check.
     #[test]
     fn an_absent_or_blank_voice_leaves_the_default_standing() {
-        assert_eq!(SessionConfig::settle("p", Default::default()).voice_id, None);
+        assert_eq!(SessionConfig::settle("p", Default::default()).voicing.voice_id, None);
 
         let blank = SessionConfig::settle(
             "p",
             tts_override(ConversationConfigOverrideTts { voice_id: Some("  ".into()), ..Default::default() }),
         );
-        assert_eq!(blank.voice_id, None);
+        assert_eq!(blank.voicing.voice_id, None);
+    }
+
+    #[test]
+    fn the_clients_engine_is_carried_through_untranslated() {
+        // The second axis, and the one this deployment has more than one of: elvenspeak
+        // serves several engines behind one endpoint and picks between them by
+        // `model_id`. Untranslated for the same reason the voice is — which engine an id
+        // names, and whether this deployment runs it, is that server's answer.
+        let config = SessionConfig::settle(
+            "p",
+            tts_override(ConversationConfigOverrideTts {
+                model_id: Some("kokoro".into()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(config.voicing.model_id.as_deref(), Some("kokoro"));
+    }
+
+    #[test]
+    fn an_absent_or_blank_engine_leaves_the_default_standing() {
+        let unset = SessionConfig::settle("p", Default::default());
+        assert_eq!(unset.voicing.model_id, None);
+
+        let blank = SessionConfig::settle(
+            "p",
+            tts_override(ConversationConfigOverrideTts {
+                model_id: Some("  ".into()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(blank.voicing.model_id, None);
+    }
+
+    #[test]
+    fn the_two_axes_are_settled_independently() {
+        // They arrive in one object and are two decisions. A client that picked a voice
+        // and no engine must not have the voice read as an engine, nor either dropped
+        // because the other was absent.
+        let voice_only = SessionConfig::settle(
+            "p",
+            tts_override(ConversationConfigOverrideTts {
+                voice_id: Some("21m00Tcm4TlvDq8ikWAM".into()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            voice_only.voicing.voice_id.as_deref(),
+            Some("21m00Tcm4TlvDq8ikWAM")
+        );
+        assert_eq!(voice_only.voicing.model_id, None);
+
+        let both = SessionConfig::settle(
+            "p",
+            tts_override(ConversationConfigOverrideTts {
+                voice_id: Some("af_heart".into()),
+                model_id: Some("kokoro".into()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(both.voicing.voice_id.as_deref(), Some("af_heart"));
+        assert_eq!(both.voicing.model_id.as_deref(), Some("kokoro"));
     }
 }

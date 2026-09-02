@@ -84,7 +84,28 @@ const READ_AHEAD: usize = 32;
 /// not be — the failure it prevents only shows up when requests finish out of order.
 pub trait Synthesizer: Send + Sync + 'static {
     /// Owned arguments so the returned stream outlives this call and can be spawned.
-    fn speak(&self, voice: Option<String>, text: String) -> Speech;
+    fn speak(&self, voicing: Voicing, text: String) -> Speech;
+}
+
+/// Which voice speaks, and which engine speaks it.
+///
+/// One value rather than two arguments, because these travel together through five
+/// signatures and are both `Option<String>`: as separate parameters nothing but argument
+/// order tells them apart, and swapping them compiles. Named, that mistake stops being
+/// expressible.
+///
+/// Both are the client's, carried untranslated. ElevenLabs models them as independent
+/// axes, and the text-to-speech server owns what either id means — including which it
+/// refuses. Neither is resolved here; a table on this side would be a second answer to a
+/// question that server already answers.
+///
+/// `None` is "the client asked for no particular one", which is not the same as asking
+/// for a default: the default belongs to whoever is serving, so it is applied there and
+/// not invented here.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Voicing {
+    pub voice_id: Option<String>,
+    pub model_id: Option<String>,
 }
 
 /// One clause's audio, arriving as it is decoded rather than all at the end.
@@ -193,7 +214,7 @@ impl Speaking {
 pub async fn speak(
     voice: &Voice,
     synthesizer: Arc<dyn Synthesizer>,
-    voice_id: Option<String>,
+    voicing: Voicing,
     interrupted: CancellationToken,
     mut reply: Reply<'_>,
 ) -> (Spoken, Speaking) {
@@ -276,7 +297,7 @@ pub async fn speak(
 
                 said.push_str(&text);
                 for clause in clauses.push(&text) {
-                    send(&dispatch, &synthesizer, voice_id.as_deref(), clause).await;
+                    send(&dispatch, &synthesizer, &voicing, clause).await;
                 }
             }
             // Gathered, never synthesized. A tool call is the model addressing the
@@ -290,7 +311,7 @@ pub async fn speak(
     // after its full stop, so it is still held here on every turn — and on a broken one,
     // so is whatever was written before the break. An empty buffer yields nothing.
     if let Some(clause) = clauses.flush() {
-        send(&dispatch, &synthesizer, voice_id.as_deref(), clause).await;
+        send(&dispatch, &synthesizer, &voicing, clause).await;
     }
 
     // Closes the drain once it has taken everything already dispatched.
@@ -364,15 +385,15 @@ async fn queue_in_order(
 async fn send(
     dispatch: &mpsc::Sender<mpsc::Receiver<Result<Vec<i16>, TtsError>>>,
     synthesizer: &Arc<dyn Synthesizer>,
-    voice_id: Option<&str>,
+    voicing: &Voicing,
     clause: String,
 ) {
     let synthesizer = synthesizer.clone();
-    let voice_id = voice_id.map(str::to_owned);
+    let voicing = voicing.clone();
     let (decoded, audio) = mpsc::channel(READ_AHEAD);
 
     tokio::spawn(async move {
-        let mut speech = synthesizer.speak(voice_id, clause);
+        let mut speech = synthesizer.speak(voicing, clause);
         while let Some(chunk) = speech.next().await {
             // A closed receiver is the conversation ending mid-clause. Stop decoding
             // rather than finishing a sentence nobody is listening to.
@@ -406,7 +427,7 @@ mod tests {
     }
 
     impl Synthesizer for Fake {
-        fn speak(&self, _voice: Option<String>, text: String) -> Speech {
+        fn speak(&self, _voicing: Voicing, text: String) -> Speech {
             self.asked.lock().expect("not poisoned").push(text.clone());
 
             let found = self
@@ -497,7 +518,7 @@ mod tests {
         ]);
 
         let (_, speaking) =
-            speak(&voice, synthesizer, None, interrupted.clone(), reply).await;
+            speak(&voice, synthesizer, Voicing::default(), interrupted.clone(), reply).await;
         wait_until_speaking(&voice).await;
 
         interrupted.cancel();
@@ -521,7 +542,7 @@ mod tests {
 
         let reply = reply_of(&["This reply is never read."]);
         let (spoken, speaking) =
-            speak(&test_voice(), synthesizer, None, interrupted, reply).await;
+            speak(&test_voice(), synthesizer, Voicing::default(), interrupted, reply).await;
         speaking.finish().await;
 
         assert!(matches!(spoken, Spoken::Nothing(Stopped::Interrupted)), "{spoken:?}");
@@ -543,7 +564,7 @@ mod tests {
             "And this is the second sentence of it.",
         ]);
 
-        let (spoken, speaking) = speak(&voice, synthesizer, None, CancellationToken::new(), reply).await;
+        let (spoken, speaking) = speak(&voice, synthesizer, Voicing::default(), CancellationToken::new(), reply).await;
         speaking.finish().await;
 
         assert!(matches!(spoken, Spoken::Did(Made { cut_short: None, .. })));
@@ -565,7 +586,7 @@ mod tests {
         let (spoken, speaking) = speak(
             &test_voice(),
             synthesizer,
-            None,
+            Voicing::default(),
             CancellationToken::new(),
             reply_calling("", "skip_turn"),
         )
@@ -596,7 +617,7 @@ mod tests {
         let (spoken, speaking) = speak(
             &test_voice(),
             synthesizer,
-            None,
+            Voicing::default(),
             CancellationToken::new(),
             reply_calling("Sending that now.", "sendMessageToSession"),
         )
@@ -628,7 +649,7 @@ mod tests {
         ]);
 
         let started = std::time::Instant::now();
-        let (_, speaking) = speak(&voice, synthesizer, None, CancellationToken::new(), reply).await;
+        let (_, speaking) = speak(&voice, synthesizer, Voicing::default(), CancellationToken::new(), reply).await;
         speaking.finish().await;
 
         assert!(
@@ -650,7 +671,7 @@ mod tests {
             "This is the first sentence of the reply. ",
             "And this is the second sentence of it.",
         ]);
-        let (spoken, speaking) = speak(&test_voice(), synthesizer, None, CancellationToken::new(), reply).await;
+        let (spoken, speaking) = speak(&test_voice(), synthesizer, Voicing::default(), CancellationToken::new(), reply).await;
         speaking.finish().await;
 
         match spoken {
@@ -668,7 +689,7 @@ mod tests {
         let synthesizer = Arc::new(Fake { script: vec![], asked: Arc::new(Mutex::new(Vec::new())) });
         let reply: Reply<'static> = Box::pin(stream::iter(vec![Err(LlmError::Declined)]));
 
-        let (spoken, speaking) = speak(&test_voice(), synthesizer, None, CancellationToken::new(), reply).await;
+        let (spoken, speaking) = speak(&test_voice(), synthesizer, Voicing::default(), CancellationToken::new(), reply).await;
         speaking.finish().await;
 
         assert!(matches!(spoken, Spoken::Nothing(Stopped::Failed(LlmError::Declined))), "{spoken:?}");
@@ -688,7 +709,7 @@ mod tests {
             LlmError::Transport("connection reset".to_owned()),
         );
 
-        let (spoken, speaking) = speak(&voice, synthesizer, None, CancellationToken::new(), reply).await;
+        let (spoken, speaking) = speak(&voice, synthesizer, Voicing::default(), CancellationToken::new(), reply).await;
         speaking.finish().await;
 
         match spoken {
@@ -716,7 +737,7 @@ mod tests {
             "And this is the second sentence of it.",
         ]);
 
-        let (_, speaking) = speak(&voice, synthesizer, None, CancellationToken::new(), reply).await;
+        let (_, speaking) = speak(&voice, synthesizer, Voicing::default(), CancellationToken::new(), reply).await;
         speaking.finish().await;
 
         assert_eq!(voice.queued(), vec![2, 2, 2, 2], "the surviving clause was dropped too");

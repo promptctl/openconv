@@ -8,6 +8,7 @@ description = "The voice agent that joins a conversation room and talks to the c
 
 [dependencies]
 openconv-protocol = { path = "../openconv-protocol" }
+serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
 tracing = "0.1"
