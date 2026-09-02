@@ -98,6 +98,18 @@ impl Voice {
         self.pending.lock().expect("voice queue poisoned").clear();
     }
 
+    /// Whether the caller is still hearing a reply.
+    ///
+    /// The only honest answer to "is the agent speaking right now", and deliberately not
+    /// the same question as "is a turn still running". Synthesis outruns playback, so a
+    /// turn finishes the moment its last clause is *enqueued* and the caller goes on
+    /// hearing it for as long as this queue takes to drain — seconds, for an ordinary
+    /// reply. Anything that asks the turn instead gets the right answer only until the
+    /// two diverge, which is exactly when a caller talks over the tail of an answer.
+    pub fn is_speaking(&self) -> bool {
+        !self.pending.lock().expect("voice queue poisoned").is_empty()
+    }
+
     /// Takes exactly one frame, padding with silence when the queue runs short.
     ///
     /// Silence is the identity value here rather than a special case, which is what
@@ -232,6 +244,25 @@ mod tests {
         let voice = voice_with(queue(&[1; 5_000]));
         voice.silence();
         assert!(voice.next_frame().iter().all(|&sample| sample == 0));
+    }
+
+    /// The distinction barge-in rests on, and the one that was missing.
+    ///
+    /// A reply stays audible for as long as this queue holds it, which is well past the
+    /// moment the turn that produced it reported itself finished. Anything that reads
+    /// "is the agent speaking" off the turn instead of off here goes deaf to a caller
+    /// interrupting the tail of an answer — the whole window in which people actually
+    /// interrupt.
+    #[test]
+    fn a_reply_still_queued_counts_as_speaking() {
+        let voice = voice_with(queue(&[]));
+        assert!(!voice.is_speaking(), "an empty queue is not a reply");
+
+        voice.enqueue(&[1; 5_000]);
+        assert!(voice.is_speaking(), "audio the caller has yet to hear read as silence");
+
+        voice.silence();
+        assert!(!voice.is_speaking(), "a discarded reply still read as speaking");
     }
 
     /// What the speech pipeline's tests read, so it is worth pinning that it reads the
