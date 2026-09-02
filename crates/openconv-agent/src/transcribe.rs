@@ -32,30 +32,8 @@ impl Transcriber {
     /// model file stops the process instead of turning into an agent that joins calls
     /// and cannot hear.
     pub fn load(model: &Path) -> Result<Self, TranscribeError> {
-        // [LAW:no-silent-failure] whisper.cpp does not refuse to run unaccelerated. It
-        // prints one WARN, transcribes on the CPU, and lets the process report itself
-        // healthy — and for this service that is not a slower conversation but a broken
-        // one. Inference falls behind realtime, the listener stalls inside it, and the
-        // audio sink it has stopped draining drops its oldest frames, so the caller's
-        // words are destroyed rather than delayed. Nothing errors and nothing is missing;
-        // the service simply stops working. Refusing to start is the only way that
-        // failure ever reaches anyone.
-        //
-        // `use_gpu` is whisper-rs's own `cfg!(feature = "_gpu")`, so this asks the one
-        // question that was answered wrongly for the whole life of the deployment: did
-        // this build compile in any GPU backend at all? See the per-target features in
-        // Cargo.toml — a target absent from that list builds fine and lands here.
-        //
-        // Build-time only, and deliberately not claimed as more. A backend that compiles
-        // in and then fails to *initialise* — the card out of memory, a compute
-        // capability the image was not built for — is one whisper.cpp answers by falling
-        // back to the CPU and returning Ok, which this check cannot see. That gap is real
-        // and is openconv-openconv-bwy.34; closing it needs a timing signal rather than a
-        // configuration one, since only latency distinguishes the two at runtime.
         let parameters = WhisperContextParameters::default();
-        if !parameters.use_gpu {
-            return Err(TranscribeError::NoAcceleration);
-        }
+        require_acceleration(parameters.use_gpu)?;
 
         let context = WhisperContext::new_with_params(model, parameters)
             .map_err(|error| TranscribeError::Load { model: model.to_owned(), error })?;
@@ -117,6 +95,39 @@ impl Transcriber {
         tokio::task::spawn_blocking(move || transcribe_blocking(&context, threads, &samples))
             .await
             .map_err(|_| TranscribeError::Cancelled)?
+    }
+}
+
+/// Refuses a build that compiled no GPU backend at all.
+///
+/// [LAW:no-silent-failure] whisper.cpp does not refuse to run unaccelerated. It prints
+/// one WARN, transcribes on the CPU, and lets the process report itself healthy — and
+/// for this service that is not a slower conversation but a broken one. Inference falls
+/// behind realtime, the listener stalls inside it, and the audio sink it has stopped
+/// draining drops its oldest frames, so the caller's words are destroyed rather than
+/// delayed. Nothing errors and nothing is missing; the service simply stops working.
+/// Refusing to start is the only way that failure ever reaches anyone.
+///
+/// Callers pass whisper-rs's own `cfg!(feature = "_gpu")`, which answers the one
+/// question that was answered wrongly for the whole life of the deployment: did this
+/// build compile in any GPU backend at all? See the per-target features in Cargo.toml —
+/// a target absent from that list builds fine and lands here.
+///
+/// Build-time only, and deliberately not claimed as more. A backend that compiles in and
+/// then fails to *initialise* — the card out of memory, a compute capability the image
+/// was not built for — is one whisper.cpp answers by falling back to the CPU and
+/// returning Ok, which this cannot see. That gap is real and is openconv-openconv-bwy.34;
+/// closing it needs a timing signal rather than a configuration one, since only latency
+/// distinguishes the two at runtime.
+///
+/// A function rather than an `if` in `load`, because the flag it reads is fixed at
+/// compile time: inline, the one check this file exists to add would be the only line in
+/// it that no test could ever drive, and an edit inverting it would compile clean and
+/// surface the way the original incident did — in production, silently.
+fn require_acceleration(use_gpu: bool) -> Result<(), TranscribeError> {
+    match use_gpu {
+        true => Ok(()),
+        false => Err(TranscribeError::NoAcceleration),
     }
 }
 
@@ -297,6 +308,22 @@ mod tests {
             Transcript::from_model_output("(clears throat) yes please"),
             Transcript::Speech("yes please".to_owned())
         );
+    }
+
+    /// The guard that exists so the original incident cannot recur. Inverting its
+    /// condition compiles; this is what notices.
+    #[test]
+    fn a_build_with_no_gpu_backend_refuses_to_start() {
+        assert!(require_acceleration(true).is_ok());
+
+        let Err(error) = require_acceleration(false) else {
+            panic!("a build with no GPU backend was allowed to start");
+        };
+        assert!(matches!(error, TranscribeError::NoAcceleration));
+
+        // The message has to send a reader somewhere. Naming the target it was built
+        // for is the part that turns it into an actionable report rather than a verdict.
+        assert!(error.to_string().contains(std::env::consts::OS));
     }
 
     #[test]
