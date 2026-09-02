@@ -42,8 +42,47 @@ FROM rust:1.93-bookworm AS build
 # cmake and clang are whisper-rs's: it compiles whisper.cpp with the former and
 # generates its bindings with the latter, and neither is in the rust image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      cmake clang libclang-dev pkg-config \
+      cmake clang libclang-dev pkg-config curl ca-certificates gnupg \
  && rm -rf /var/lib/apt/lists/*
+
+# CUDA, because crates/openconv-agent/Cargo.toml compiles whisper-rs with the `cuda`
+# feature on Linux and that feature builds whisper.cpp with nvcc. No GPU is needed to
+# *compile* CUDA, which is what lets the runner — which has no card — build this.
+#
+# Toolkit only, not the driver: the driver belongs to the host, and the container is
+# handed it at runtime by the nvidia container runtime. Installing one here would be a
+# second copy of a thing the host already owns, at the version this file happened to
+# name. [LAW:one-source-of-truth]
+#
+# 12.8 matches the deployment's driver (570.195.03, "CUDA Version: 12.8"). CUDA's minor
+# version compatibility means a 12.x runtime works against any 12.x-capable driver, so
+# this tracks the card rather than pinning to it exactly.
+ARG CUDA_RELEASE=12-8
+RUN <<'SHELL'
+set -eu
+curl --fail --location --silent --show-error \
+  --output /tmp/cuda-keyring.deb \
+  https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+dpkg -i /tmp/cuda-keyring.deb
+rm /tmp/cuda-keyring.deb
+apt-get update
+# nvcc to compile it, cudart/cublas headers and import libraries to link against. The
+# matching runtime .so files are copied into the final stage below.
+apt-get install -y --no-install-recommends \
+  "cuda-nvcc-${CUDA_RELEASE}" \
+  "cuda-cudart-dev-${CUDA_RELEASE}" \
+  "libcublas-dev-${CUDA_RELEASE}"
+rm -rf /var/lib/apt/lists/*
+SHELL
+
+ENV PATH=/usr/local/cuda/bin:$PATH \
+    CUDA_PATH=/usr/local/cuda
+# Build device code for exactly the card this deploys to — an RTX 2070, Turing, compute
+# capability 7.5. The default is every architecture nvcc knows, which is many minutes of
+# compilation and a fat binary, all but one slice of it for cards this cluster does not
+# have. A different card means changing this number and rebuilding; a wrong number fails
+# loudly at load rather than silently on the CPU, which the transcriber now refuses.
+ENV CUDAARCHS=75
 
 WORKDIR /src
 COPY . .
@@ -103,6 +142,28 @@ if [ -z "$library" ]; then
   exit 1
 fi
 cp "$library" /libonnxruntime.so
+
+# The CUDA libraries the binary now links against, gathered for the runtime stage. Only
+# these three: whisper.cpp's CUDA backend calls into the runtime and cuBLAS, and the rest
+# of the toolkit is compiler and headers that nothing at runtime reads. libcuda.so itself
+# is deliberately NOT here — that one is the driver, and the nvidia container runtime
+# injects the host's copy. Shipping ours would override the host's and mismatch the kernel
+# module.
+#
+# Resolved through the symlinks with `readlink -f`, matching what is done for ONNX
+# Runtime above, and named without their minor version so the copy does not have to be
+# re-pinned every toolkit bump.
+mkdir -p /cuda-runtime
+for soname in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
+  found="$(readlink -f "/usr/local/cuda/lib64/$soname" || true)"
+  if [ -z "$found" ] || [ ! -f "$found" ]; then
+    echo "ERROR: $soname is not in the CUDA toolkit this stage installed." >&2
+    echo "       The runtime stage would build fine and the binary would fail to" >&2
+    echo "       start, so this stops here instead." >&2
+    exit 1
+  fi
+  cp "$found" "/cuda-runtime/$soname"
+done
 SHELL
 
 # ---------------------------------------------------------------------------
@@ -123,6 +184,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=model /models/ggml-base.en.bin /opt/openconv/models/ggml-base.en.bin
 COPY --from=build /libonnxruntime.so /opt/openconv/lib/libonnxruntime.so
 COPY --from=build /openconv-server /usr/local/bin/openconv-server
+
+# Into the loader's own search path rather than behind LD_LIBRARY_PATH: these are linked,
+# not dlopen'd, so the binary names them in DT_NEEDED and the loader has to find them
+# before main runs. An environment variable is something a `docker run --env` or an
+# entrypoint wrapper can drop, and dropping it fails the container at exec with a message
+# about a shared object rather than about openconv. [LAW:single-enforcer]
+COPY --from=build /cuda-runtime/ /usr/local/lib/
+RUN ldconfig
 
 # The defaults that only make sense inside the image. Everything else — credentials, the
 # SFU's address, where TTS lives — is the deployment's to say, and the process refuses

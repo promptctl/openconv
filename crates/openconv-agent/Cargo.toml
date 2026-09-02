@@ -33,11 +33,32 @@ tokio-util = { version = "0.7.19", features = ["io"] }
 
 # whisper-rs ships with no acceleration compiled in — its default feature set is empty,
 # so inference runs on the CPU alone and lands well behind realtime, which for a
-# conversation is the same as not working. Metal is the one that matters on Apple
-# Silicon. Declared per-target because the feature does not exist elsewhere; cargo
-# unions it with the base dependency above.
+# conversation is the same as not working. Each platform names the backend it has;
+# declared per-target because a feature that does not exist elsewhere is a build error
+# elsewhere, and cargo unions these with the base dependency above.
+#
+# [LAW:one-type-per-behavior] Metal and CUDA are not two decisions, they are one — "the
+# acceleration this target has" — instantiated twice. Every supported target must appear
+# here, because a target that is merely absent still builds, and what it builds is the
+# CPU-only inference this comment exists to forbid.
+#
+# Linux was that absent target until 2026-09-02, and it is the one openconv deploys on.
+# whisper-rs sets `use_gpu: cfg!(feature = "_gpu")`, so the container came up with
+# `use gpu = 0`, fell back to the CPU behind a WARN, reported itself healthy, and lost
+# 97% of every caller's speech: inference stalled the listener for tens of seconds and
+# the audio sink, which drops its oldest frames, discarded the front of every utterance.
+# Nothing failed. It just did not work. See `Transcriber::load`, which now refuses to
+# start rather than let that recur, and openconv-openconv-bwy.33.
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.16", features = ["metal"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# CUDA rather than Vulkan: the deployment's card is an RTX 2070 on a host that already
+# runs CUDA for Ollama, and the container gets the driver by way of the nvidia container
+# runtime. The build needs nvcc, which is why the Dockerfile's build stage installs a
+# CUDA toolkit and why a Linux build without one now fails at compile time — loudly, and
+# before an image exists — instead of at 2am inside a call.
+whisper-rs = { version = "0.16", features = ["cuda"] }
 
 # The VAD's ONNX Runtime, reached only through voice_activity_detector — named here
 # solely to choose how it is linked.
@@ -51,5 +72,4 @@ whisper-rs = { version = "0.16", features = ["metal"] }
 #
 # Linux-only because the cost is a shared library that has to be shipped beside the
 # binary, which the container image does and a `cargo run` from a checkout does not.
-[target.'cfg(target_os = "linux")'.dependencies]
 ort = { version = "=2.0.0-rc.10", features = ["load-dynamic"] }
