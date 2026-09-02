@@ -53,6 +53,7 @@ use futures_util::{Stream, StreamExt};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -196,6 +197,12 @@ pub async fn speak(
     interrupted: CancellationToken,
     mut reply: Reply<'_>,
 ) -> (Spoken, Speaking) {
+    // What the caller is actually waiting through, split where it can be acted on. The
+    // endpointer's silence window is measurable from the listener's own log; these two
+    // are not, and without them "the agent takes too long to answer" cannot be told from
+    // "the model takes too long to start" or "synthesis takes too long to sound".
+    let started = Instant::now();
+
     let (dispatch, mut pending) =
         mpsc::channel::<mpsc::Receiver<Result<Vec<i16>, TtsError>>>(IN_FLIGHT);
 
@@ -212,7 +219,7 @@ pub async fn speak(
             tokio::select! {
                 biased;
                 _ = interrupted.cancelled() => voice.silence(),
-                _ = queue_in_order(&voice, &mut pending) => {}
+                _ = queue_in_order(&voice, &mut pending, started) => {}
             }
         }
     });
@@ -256,6 +263,17 @@ pub async fn speak(
 
         match piece {
             Piece::Say(text) => {
+                // Splits the wait in two at the only place it can be split. Everything
+                // before this is the model thinking; everything between here and
+                // `first_audio_ms` is synthesis. They are fixed by different work, and
+                // one number covering both says which is worth doing.
+                if said.is_empty() && !text.is_empty() {
+                    tracing::info!(
+                        first_word_ms = started.elapsed().as_millis(),
+                        "the model wrote its first words"
+                    );
+                }
+
                 said.push_str(&text);
                 for clause in clauses.push(&text) {
                     send(&dispatch, &synthesizer, voice_id.as_deref(), clause).await;
@@ -305,11 +323,26 @@ pub async fn speak(
 async fn queue_in_order(
     voice: &Voice,
     pending: &mut mpsc::Receiver<mpsc::Receiver<Result<Vec<i16>, TtsError>>>,
+    since: Instant,
 ) {
+    let mut silent_so_far = true;
+
     while let Some(mut clause) = pending.recv().await {
         while let Some(chunk) = clause.recv().await {
             match chunk {
-                Ok(samples) => voice.enqueue(&samples),
+                Ok(samples) => {
+                    // The end of the caller's wait, and the only latency they experience
+                    // directly: every later clause is queued behind audio already
+                    // playing. Measured here rather than when synthesis returned, because
+                    // a clause that has been decoded but not queued is still silence.
+                    if std::mem::take(&mut silent_so_far) {
+                        tracing::info!(
+                            first_audio_ms = since.elapsed().as_millis(),
+                            "the agent started speaking"
+                        );
+                    }
+                    voice.enqueue(&samples)
+                }
                 // A clause that cannot be synthesized leaves a hole in a sentence the
                 // caller is already hearing. Saying so and carrying on beats dropping
                 // the rest of the reply, but it is never silent about it — the published
