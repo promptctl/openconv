@@ -213,7 +213,7 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                     }
 
                     Noticed::Started => {
-                        if stop_answering(&mut answering, control.as_deref()).await? {
+                        if stop_answering(&mut answering, &stage.voice, control.as_deref()).await? {
                             tracing::info!(
                                 conversation = %assignment.conversation_id,
                                 "the caller spoke over the agent; stopping"
@@ -419,7 +419,9 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                                 // talking at once is the one thing a caller cannot listen
                                 // through. The app queues prompts until the room is quiet,
                                 // so this is the race it loses rather than the normal path.
-                                if stop_answering(&mut answering, control.as_deref()).await? {
+                                if stop_answering(&mut answering, &stage.voice, control.as_deref())
+                                    .await?
+                                {
                                     tracing::info!(
                                         conversation = %assignment.conversation_id,
                                         "a typed message arrived mid-answer; stopping"
@@ -947,13 +949,36 @@ async fn publish_score(
 /// what stopping involves.
 async fn stop_answering(
     answering: &mut Option<CancellationToken>,
+    voice: &Voice,
     control: Option<&ControlChannel>,
 ) -> Result<bool, AgentError> {
-    match answering.take() {
-        // The caller is opening a turn, not cutting one off.
-        None => Ok(false),
-        Some(turn) => {
+    // [LAW:one-source-of-truth] Two facts, because a running turn and an audible reply
+    // are not the same thing and the gap between them is where barge-in used to fail. A
+    // turn ends when its last clause is enqueued; the caller keeps hearing it until the
+    // queue drains. Asking only the turn made every interruption in that window a no-op:
+    // the token was already gone, so nothing was cancelled, nothing was silenced, and the
+    // agent talked over the caller to the end of its buffer while the detector scored
+    // their speech at 0.99 and the loop did nothing with it.
+    match (answering.take(), voice.is_speaking()) {
+        // Silence, and no turn behind it. The caller is opening a turn, not cutting one
+        // off, and there is nothing to interrupt.
+        (None, false) => Ok(false),
+
+        // A turn is still running, so cancelling it is the whole job: its drain task
+        // holds the queue and throws it away on cancellation. Silencing from here as well
+        // would put a second writer on a queue whose single-writer discipline is what
+        // lets it be discarded safely at all — see `speak`.
+        (Some(turn), _) => {
             turn.cancel();
+            publish_interruption(control).await?;
+            Ok(true)
+        }
+
+        // The turn is over and the caller is still listening to it. Nothing owns the
+        // queue now, which is precisely why this can — and must — empty it directly:
+        // there is no drain task left to receive a cancellation.
+        (None, true) => {
+            voice.silence();
             publish_interruption(control).await?;
             Ok(true)
         }
