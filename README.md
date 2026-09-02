@@ -57,6 +57,13 @@ OPENCONV_TTS_URL=http://127.0.0.1:11001 \
   cargo test -p openconv-agent --test live_speech -- --ignored --nocapture
 ```
 
+Add `OPENCONV_TTS_MODEL` to exercise the engine axis as well as the voice. A
+conversation can override both — `conversation_config_override.tts.voice_id` picks the
+voice and `.model_id` picks the engine — and elvenspeak refuses an engine it is not
+running rather than answering in the one it is, so a wrong id here comes back as a
+refusal instead of as plausible audio in the wrong voice. `answer_aloud` reads the same
+two variables.
+
 `--nocapture` is the point of running it: the tests print what synthesis actually cost,
 which is the number [`tts.rs`](crates/openconv-agent/src/tts.rs) reasons from. Run them
 on an idle machine — a build running alongside moved the per-second figure by 2.5x.

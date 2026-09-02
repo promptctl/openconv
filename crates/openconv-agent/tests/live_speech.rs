@@ -28,6 +28,36 @@ fn seconds(samples: &[i16]) -> f32 {
     samples.len() as f32 / SAMPLE_RATE as f32
 }
 
+/// The engine axis, against a server that really has more than one.
+///
+/// `OPENCONV_TTS_MODEL` names one — `piper`, `kokoro`, or an ElevenLabs model id that
+/// deployment maps — and the point is that it *reaches* the server: elvenspeak refuses a
+/// `model_id` naming an engine it is not running with a 422, so a wrong one here comes
+/// back as [`TtsError::Refused`] rather than as silence or as the default engine
+/// answering in its place. That refusal is the behaviour this axis exists to get, and
+/// the only place to see it is against a real deployment.
+///
+/// Skipped rather than failed when the variable is unset, because which engines a
+/// server runs is that deployment's business and this test cannot know one to name.
+#[tokio::test]
+#[ignore = "needs a running text-to-speech server"]
+async fn an_engine_the_caller_names_reaches_the_server() {
+    let Ok(model) = std::env::var("OPENCONV_TTS_MODEL") else {
+        println!("set OPENCONV_TTS_MODEL to a model id the server serves to run this");
+        return;
+    };
+
+    let voicing = Voicing { voice_id: None, model_id: Some(model.clone()) };
+    let speech = tts()
+        .synthesize(&voicing, "Both suites passed.")
+        .await
+        .unwrap_or_else(|error| panic!("the server refused model_id {model:?}: {error}"));
+
+    let samples = collect(speech).await.expect("the audio decoded");
+    assert!(!samples.is_empty(), "model_id {model:?} produced no audio");
+    println!("{:?} spoke {:.2}s of audio", model, seconds(&samples));
+}
+
 /// The whole client, end to end: a clause goes out, audible speech comes back at the
 /// rate the agent's track publishes.
 #[tokio::test]

@@ -112,10 +112,6 @@ impl Tts {
         }
     }
 
-    /// Says one piece of text, as samples arriving for [`crate::audio::Voice::enqueue`].
-    ///
-    /// The request is made here so that a service that is down, or that refuses the
-    /// voice, fails before any of it is queued for the caller to hear.
     /// Where a clause asking for this voicing is sent.
     ///
     /// Falling back to the deployment's default happens here, at the one place holding
@@ -137,6 +133,10 @@ impl Tts {
         Request { text, model_id: voicing.model_id.as_deref() }
     }
 
+    /// Says one piece of text, as samples arriving for [`crate::audio::Voice::enqueue`].
+    ///
+    /// The request is made here so that a service that is down, or that refuses the
+    /// voice or the engine, fails before any of it is queued for the caller to hear.
     pub async fn synthesize(&self, voicing: &Voicing, text: &str) -> Result<Speech, TtsError> {
         let url = self.url_for(voicing);
 
