@@ -44,9 +44,15 @@
 //!
 //! # What synthesis costs, and why the number matters
 //!
-//! Measured against elvenspeak's piper engine (`tests/live_speech.rs` prints these; an
-//! idle M-series Mac, not the deployed node): first byte in a few milliseconds, then
-//! roughly **0.1 s fixed per request plus 0.06 s per second of speech**.
+//! Two figures for elvenspeak's piper engine, because they disagree by a factor of four
+//! and only one of them describes what a caller waits through. On an idle M-series Mac
+//! (`tests/live_speech.rs` prints these): first byte in a few milliseconds, then roughly
+//! **0.1 s fixed per request plus 0.06 s per second of speech**. Against the deployed
+//! `elvenspeak-router`, timed 2026-09-03 with the measured ~20 ms network baseline
+//! subtracted: **0.18 s fixed plus 0.27 s per second of speech**, on the
+//! `en_US-lessac-high` voice that deployment actually answers with. Tune against the
+//! deployed pair; the Mac pair is kept only to show how far a laptop figure can be from
+//! the node.
 //!
 //! The shape matters more than the figures, because it decides how replies should be
 //! cut. Under a fixed per-request cost the right move is fewer, larger requests; under a
@@ -58,10 +64,10 @@
 //! elvenreader-server and is wrong now in both magnitude and shape, which is the failure
 //! worth guarding against: a number here that has quietly stopped describing the server.
 //!
-//! Two cautions before anyone tunes against the figures. They move with load — the same
+//! Two cautions before anyone tunes against the figures. They move with load — the Mac
 //! test run beside a `cargo clippy` gave 0.15 s per second of speech, two and a half
-//! times the idle number — so a busy node is the case to design for, not this one. And
-//! throughput is not the tight constraint anyway: across clean runs the first clause's
+//! times its own idle number — so a busy node is the case to design for. And throughput
+//! is not the tight constraint anyway: across clean runs the first clause's
 //! audio landed within about 0.15 s either side of the model finishing its reply,
 //! sometimes ahead and sometimes behind. Comfortable on total synthesis, break-even on
 //! the only latency a caller experiences.
