@@ -49,6 +49,7 @@ use crate::clause::Clauses;
 use crate::llm::{LlmError, Piece, Reply};
 use crate::tools::ToolCall;
 use crate::tts::TtsError;
+use openconv_protocol::Language;
 use futures_util::{Stream, StreamExt};
 use std::fmt;
 use std::pin::Pin;
@@ -87,25 +88,36 @@ pub trait Synthesizer: Send + Sync + 'static {
     fn speak(&self, voicing: Voicing, text: String) -> Speech;
 }
 
-/// Which voice speaks, and which engine speaks it.
+/// Which voice speaks, which engine speaks it, and which language it is speaking.
 ///
-/// One value rather than two arguments, because these travel together through five
-/// signatures and are both `Option<String>`: as separate parameters nothing but argument
-/// order tells them apart, and swapping them compiles. Named, that mistake stops being
-/// expressible.
+/// One value rather than three arguments, because these travel together through five
+/// signatures and two of them are both `Option<String>`: as separate parameters nothing
+/// but argument order tells those two apart, and swapping them compiles. Named, that
+/// mistake stops being expressible.
 ///
-/// Both are the client's, carried untranslated. ElevenLabs models them as independent
-/// axes, and the text-to-speech server owns what either id means — including which it
-/// refuses. Neither is resolved here; a table on this side would be a second answer to a
-/// question that server already answers.
+/// All three are the client's, carried untranslated. ElevenLabs models them as
+/// independent axes, and the text-to-speech server owns what any of them means —
+/// including which it refuses. None is resolved here; a table on this side would be a
+/// second answer to a question that server already answers.
+///
+/// The language is this crate's own closed union rather than a string, unlike the two
+/// ids beside it, and the difference is the direction each one faces. A voice or engine
+/// id is the *server's* vocabulary — an open set this crate must not have an opinion
+/// about. A language is the client's, out of the published list [`Language`] already is,
+/// so keeping it typed to the moment it is serialized means the spelling on the wire has
+/// exactly one source: that enum's own serde renames, where `pt-br` lives.
 ///
 /// `None` is "the client asked for no particular one", which is not the same as asking
 /// for a default: the default belongs to whoever is serving, so it is applied there and
-/// not invented here.
+/// not invented here. That matters most for the language, because there is a plausible
+/// default to invent — every conversation before this field existed was in English —
+/// and inventing it would send `en` on behalf of an agent that configured nothing,
+/// pinning to English the deployments that today let the server decide.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Voicing {
     pub voice_id: Option<String>,
     pub model_id: Option<String>,
+    pub language: Option<Language>,
 }
 
 /// One clause's audio, arriving as it is decoded rather than all at the end.
