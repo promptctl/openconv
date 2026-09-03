@@ -11,7 +11,7 @@
 //! configuration a turn runs against.
 
 use crate::speak::Voicing;
-use openconv_protocol::{ConversationInitiationClientData, JsonObject, Language};
+use openconv_protocol::{ConversationInitiationClientData, JsonObject};
 
 /// A conversation's configuration, after the client's overrides have been applied.
 #[derive(Clone, Debug, PartialEq)]
@@ -20,13 +20,21 @@ pub struct SessionConfig {
     pub system_prompt: String,
     /// What the agent says before the caller says anything, if the client asked for one.
     pub first_message: Option<String>,
-    pub language: Option<Language>,
-    /// The voice the client picked, and the engine it asked to hear it in.
+    /// The voice the client picked, the engine it asked to hear it in, and the language
+    /// it asked to be spoken.
+    ///
+    /// The language used to sit beside this as a field of its own, written here and read
+    /// nowhere — so an operator who configured `language: es` configured nothing, and the
+    /// reply came back Spanish text read with English phonemes, which plays perfectly and
+    /// is nonsense. It is a fact about how the reply is *spoken*, so it belongs in the one
+    /// value that reaches the synthesizer, not in a second home that can hold a different
+    /// answer.
     ///
     /// Carried through untranslated: the text-to-speech server owns the tables that resolve
-    /// either ID onto something it can serve, including the fallback for voices it has
-    /// never heard of and the refusal for an engine it is not running. See [`crate::tts`]
-    /// for why neither table is copied here.
+    /// any of the three onto something it can serve, including the fallback for voices it
+    /// has never heard of, the refusal for an engine it is not running, and the substitute
+    /// voice for a language it cannot speak. See [`crate::tts`] for why no table is copied
+    /// here.
     pub voicing: Voicing,
 }
 
@@ -51,15 +59,21 @@ impl SessionConfig {
         Self {
             system_prompt: substitute(&prompt, &variables),
             first_message: agent.first_message.filter(|message| !message.trim().is_empty()),
-            language: agent.language,
             voicing: {
                 let tts = overrides.tts.unwrap_or_default();
-                // Blank is unsaid on both axes. A settings screen that stores an empty
-                // string means the client picked nothing, and forwarding it would ask
-                // the server to resolve `""`.
+                // Blank is unsaid on both id axes. A settings screen that stores an
+                // empty string means the client picked nothing, and forwarding it would
+                // ask the server to resolve `""`. The language needs no such filter: it
+                // arrives already parsed out of a closed union, so the only way to say
+                // nothing is to omit it.
                 Voicing {
                     voice_id: tts.voice_id.filter(|voice| !voice.trim().is_empty()),
                     model_id: tts.model_id.filter(|model| !model.trim().is_empty()),
+                    // The client sends this under `agent`, beside the prompt, rather
+                    // than under `tts` where the other two are — so it is read from
+                    // there and settled here, which is where every axis of the voicing
+                    // is settled regardless of which half of the message carried it.
+                    language: agent.language,
                 }
             },
         }
@@ -123,7 +137,7 @@ mod tests {
     use super::*;
     use openconv_protocol::{
         ConversationConfigOverride, ConversationConfigOverrideAgent, ConversationConfigOverrideTts,
-        PromptOverride,
+        Language, PromptOverride,
     };
 
     fn client_data(agent: ConversationConfigOverrideAgent) -> ConversationInitiationClientData {
@@ -311,6 +325,69 @@ mod tests {
             }),
         );
         assert_eq!(blank.voicing.model_id, None);
+    }
+
+    /// The read that did not exist, from the settling end.
+    ///
+    /// `language` was copied into a field of `SessionConfig` and read nowhere — grep for
+    /// it before this change and the write is the only hit — so an operator who
+    /// configured `language: es` configured nothing at all. It now lands in the one
+    /// value that reaches the synthesizer, which is the only place a fact about how the
+    /// reply is spoken can be read from.
+    ///
+    /// Carried untranslated like the two ids beside it, though for the opposite reason:
+    /// those are the server's vocabulary and this is the published one, and either way
+    /// the crate that re-spells it is the crate that gets it wrong.
+    #[test]
+    fn the_clients_language_reaches_the_voicing_rather_than_stopping_here() {
+        let config = SessionConfig::settle(
+            "p",
+            client_data(ConversationConfigOverrideAgent {
+                language: Some(Language::Es),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(config.voicing.language, Some(Language::Es));
+    }
+
+    /// An unconfigured agent keeps saying nothing, which is not the same as saying English.
+    ///
+    /// The tempting default is right here: every conversation before this field was read
+    /// was in English, so `unwrap_or(Language::En)` looks like a no-op. It is not — the
+    /// server picks the voice when nobody names a language, and an `en` sent on the
+    /// agent's behalf takes that decision away from the deployment that was making it.
+    #[test]
+    fn an_agent_that_configured_no_language_asks_for_none() {
+        assert_eq!(SessionConfig::settle("p", Default::default()).voicing.language, None);
+    }
+
+    /// The language arrives under `agent` and the ids under `tts`, and all three settle.
+    ///
+    /// Two halves of the client's message reaching one value is the shape this test is
+    /// about: a settling that read the voicing only out of the `tts` override would drop
+    /// the language of a client that sent both, and every test above would still pass.
+    #[test]
+    fn a_language_and_a_voice_arriving_in_different_halves_both_land() {
+        let config = SessionConfig::settle(
+            "p",
+            ConversationInitiationClientData {
+                conversation_config_override: Some(ConversationConfigOverride {
+                    agent: Some(ConversationConfigOverrideAgent {
+                        language: Some(Language::Es),
+                        ..Default::default()
+                    }),
+                    tts: Some(ConversationConfigOverrideTts {
+                        voice_id: Some("es_MX-claude-high".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(config.voicing.language, Some(Language::Es));
+        assert_eq!(config.voicing.voice_id.as_deref(), Some("es_MX-claude-high"));
     }
 
     #[test]

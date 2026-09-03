@@ -41,12 +41,22 @@ async fn main() {
         std::env::var("OPENCONV_TTS_URL").unwrap_or_else(|_| "http://127.0.0.1:11000".to_owned()),
         std::env::var("OPENCONV_TTS_VOICE").unwrap_or_else(|_| "21m00Tcm4TlvDq8ikWAM".to_owned()),
     ));
-    // Both axes reachable, because this is the tool for diagnosing either against a
-    // real server. Unset means the client asked for nothing, which is what a
+    // Every axis reachable, because this is the tool for diagnosing any of them against
+    // a real server. Unset means the client asked for nothing, which is what a
     // conversation that overrode nothing sends.
     let voicing = Voicing {
         voice_id: std::env::var("OPENCONV_TTS_VOICE").ok(),
         model_id: std::env::var("OPENCONV_TTS_MODEL").ok(),
+        // Parsed through the published union rather than passed as text, so this tool
+        // answers the same way the agent does: a code outside the list is a client that
+        // has outrun this crate, and it fails here rather than reaching the server as a
+        // language nothing speaks. Loudly, because the wav this writes would otherwise
+        // be a perfectly fluent recording of the wrong phonemes.
+        language: std::env::var("OPENCONV_TTS_LANGUAGE").ok().map(|code| {
+            serde_json::from_value(serde_json::Value::String(code.clone())).unwrap_or_else(|_| {
+                panic!("OPENCONV_TTS_LANGUAGE={code:?} is not a language this crate publishes")
+            })
+        }),
     };
 
     let turns = [Turn::Caller(line.clone())];
