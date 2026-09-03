@@ -231,9 +231,10 @@ pub async fn speak(
     mut reply: Reply<'_>,
 ) -> (Spoken, Speaking) {
     // What the caller is actually waiting through, split where it can be acted on. The
-    // endpointer's silence window is measurable from the listener's own log; these two
+    // endpointer's silence window is measurable from the listener's own log; these three
     // are not, and without them "the agent takes too long to answer" cannot be told from
-    // "the model takes too long to start" or "synthesis takes too long to sound".
+    // "the model takes too long to start", "the first clause runs long", or "synthesis
+    // takes too long to sound".
     let started = Instant::now();
 
     let (dispatch, mut pending) =
@@ -296,10 +297,10 @@ pub async fn speak(
 
         match piece {
             Piece::Say(text) => {
-                // Splits the wait in two at the only place it can be split. Everything
-                // before this is the model thinking; everything between here and
-                // `first_audio_ms` is synthesis. They are fixed by different work, and
-                // one number covering both says which is worth doing.
+                // The first of the three marks the caller's wait is cut at. Everything
+                // before it is the model starting to write; `first_clause_ms` closes the
+                // stretch where it is finishing a clause, and `first_audio_ms` closes
+                // synthesis.
                 if said.is_empty() && !text.is_empty() {
                     tracing::info!(
                         first_word_ms = started.elapsed().as_millis(),
@@ -353,14 +354,35 @@ pub async fn speak(
 /// The whole ordering guarantee, in one place. The clauses behind the one being drained
 /// keep decoding into their own queues meanwhile, so waiting here costs nothing but the
 /// order it enforces.
+///
+/// Also where two of the three marks on the caller's wait are taken, because both are
+/// points on this loop: a clause arriving is it going to the synthesizer, and its first
+/// samples arriving is the caller hearing something.
 async fn queue_in_order(
     voice: &Voice,
     pending: &mut mpsc::Receiver<mpsc::Receiver<Result<Vec<i16>, TtsError>>>,
     since: Instant,
 ) {
+    let mut nothing_dispatched_yet = true;
     let mut silent_so_far = true;
 
     while let Some(mut clause) = pending.recv().await {
+        // Splits what used to be one gap. A clause lands in this channel when it is handed
+        // to the synthesizer, not when its audio comes back, so everything before this is
+        // the model reaching a clause boundary and everything after it is synthesis. The
+        // two are fixed by opposite work — cutting the first clause shorter, or making
+        // elvenspeak faster — and one number spanning both cannot say which.
+        //
+        // [LAW:one-source-of-truth] measured off `since` here rather than at either
+        // `send` callsite: the caller's wait has one clock, and both the streaming loop
+        // and the post-loop flush reach the caller through this channel.
+        if std::mem::take(&mut nothing_dispatched_yet) {
+            tracing::info!(
+                first_clause_ms = since.elapsed().as_millis(),
+                "the first clause went to the synthesizer"
+            );
+        }
+
         while let Some(chunk) = clause.recv().await {
             match chunk {
                 Ok(samples) => {
