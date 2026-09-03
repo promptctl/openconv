@@ -15,6 +15,7 @@ use openconv_agent::clause::Clauses;
 use futures_util::StreamExt;
 use openconv_agent::speak::collect;
 use openconv_agent::tts::Tts;
+use openconv_protocol::Language;
 use std::time::Instant;
 
 fn tts() -> Tts {
@@ -47,7 +48,8 @@ async fn an_engine_the_caller_names_reaches_the_server() {
         return;
     };
 
-    let voicing = Voicing { voice_id: None, model_id: Some(model.clone()) };
+    let voicing =
+        Voicing { voice_id: None, model_id: Some(model.clone()), language: None };
     let speech = tts()
         .synthesize(&voicing, "Both suites passed.")
         .await
@@ -56,6 +58,46 @@ async fn an_engine_the_caller_names_reaches_the_server() {
     let samples = collect(speech).await.expect("the audio decoded");
     assert!(!samples.is_empty(), "model_id {model:?} produced no audio");
     println!("{:?} spoke {:.2}s of audio", model, seconds(&samples));
+}
+
+/// The language axis, against a server that really speaks more than one.
+///
+/// The same shape as the engine axis above and for the same reason: what has to be true
+/// is that the field *reaches* the server, and the only place to see that is a real
+/// deployment. A Spanish reply read with English phonemes plays perfectly and is
+/// nonsense, so no assertion about the samples can tell the two apart — the confirmation
+/// that the language was honoured is `x-elvenspeak-ignored`, which this client
+/// deliberately does not read (see [`openconv_agent::tts`]) and which is therefore read
+/// by hand:
+///
+///   curl -sD- -o/dev/null -XPOST $OPENCONV_TTS_URL/v1/text-to-speech/<voice>/stream \
+///     -H 'content-type: application/json' \
+///     -d '{"text":"Hola","language_code":"es"}' | grep x-elvenspeak
+///
+/// `language_code` absent from that header, and `x-elvenspeak-voice` naming a Spanish
+/// voice, is what "honoured" looks like. What this test adds is the half that curl
+/// cannot check: that the bytes reaching the server are the ones `body_for` builds out
+/// of a real [`Voicing`], rather than a body someone typed by hand into a shell.
+///
+/// Answered rather than refused is the assertion, because a `language_code` the server
+/// cannot act on is reported and spoken anyway — so a failure here is the request being
+/// rejected or the field being malformed, not the deployment lacking the language.
+#[tokio::test]
+#[ignore = "needs a running text-to-speech server"]
+async fn a_language_the_caller_names_reaches_the_server() {
+    let voicing = Voicing {
+        voice_id: None,
+        model_id: None,
+        language: Some(Language::Es),
+    };
+    let speech = tts()
+        .synthesize(&voicing, "Hola, ¿cómo estás?")
+        .await
+        .expect("the server accepted a request carrying language_code");
+
+    let samples = collect(speech).await.expect("the audio decoded");
+    assert!(!samples.is_empty(), "a Spanish request produced no audio");
+    println!("spoke {:.2}s of audio", seconds(&samples));
 }
 
 /// The whole client, end to end: a clause goes out, audible speech comes back at the

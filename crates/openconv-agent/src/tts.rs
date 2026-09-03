@@ -72,6 +72,7 @@ use crate::audio;
 use crate::llm::with_cause;
 use crate::resample::Resampler;
 use crate::speak::{Speech, Synthesizer, Voicing};
+use openconv_protocol::Language;
 use serde::Serialize;
 use futures_util::stream::{self, StreamExt};
 use minimp3::{Decoder, Error as Mp3Error, Frame};
@@ -130,7 +131,11 @@ impl Tts {
     /// inlined below, so a test drives the same one the request does instead of a copy
     /// that agrees with itself.
     fn body_for<'a>(voicing: &'a Voicing, text: &'a str) -> Request<'a> {
-        Request { text, model_id: voicing.model_id.as_deref() }
+        Request {
+            text,
+            model_id: voicing.model_id.as_deref(),
+            language_code: voicing.language,
+        }
     }
 
     /// Says one piece of text, as samples arriving for [`crate::audio::Voice::enqueue`].
@@ -173,12 +178,26 @@ impl Tts {
 ///
 /// Skipped rather than sent as null, and the difference is visible to a caller:
 /// elvenspeak names a `model_id` it could not act on in `x-elvenspeak-ignored`, so a
-/// null on every request would report a field nobody asked for in every response.
+/// null on every request would report a field nobody asked for in every response. The
+/// language reads the same header for the same reason, which makes that header the
+/// cheapest integration test either side has: send one, and the response says whether
+/// the far end could act on it.
+///
+/// `language_code` is the name elvenspeak declares (its `api.py`, `SpeechRequest`),
+/// which is ElevenLabs' own name for the field — matched rather than invented, because
+/// a field this server does not recognise is a field it reports ignored and drops.
+///
+/// Serialized as the enum rather than as a string this side spelled itself. `Language`
+/// carries the renames the published list uses — `pt-br` is not `ptbr` — and a `&str`
+/// here would need a mapping to produce them, which is a second spelling of the same
+/// vocabulary and wrong the first time either copy is edited.
 #[derive(Serialize)]
 struct Request<'a> {
     text: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     model_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language_code: Option<Language>,
 }
 
 /// Everything but the network, for the tests: decodes bytes already in hand.
@@ -323,7 +342,8 @@ mod tests {
 
     #[test]
     fn an_engine_the_caller_asked_for_reaches_the_request() {
-        let voicing = Voicing { voice_id: None, model_id: Some("kokoro".into()) };
+        let voicing =
+            Voicing { voice_id: None, model_id: Some("kokoro".into()), language: None };
         let body =
             serde_json::to_value(Tts::body_for(&voicing, "hello")).expect("serializes");
 
@@ -331,22 +351,91 @@ mod tests {
     }
 
     #[test]
-    fn asking_for_no_engine_sends_no_model_id_at_all() {
-        // Not `null`. elvenspeak names a `model_id` it could not act on in
-        // `x-elvenspeak-ignored`, so sending one on every request would report a field
-        // nobody asked for in every response — and what a caller who overrode nothing
-        // sends stays byte-for-byte what they sent before this existed.
+    fn asking_for_nothing_in_particular_sends_the_text_and_nothing_else() {
+        // Not `null`, and not a default. elvenspeak names a `model_id` or a
+        // `language_code` it could not act on in `x-elvenspeak-ignored`, so sending
+        // either on every request would report a field nobody asked for in every
+        // response — and what a caller who overrode nothing sends stays byte-for-byte
+        // what they sent before either existed.
+        //
+        // Whole-body equality rather than two absence checks, which is what makes this
+        // the guard against the tempting default: the day someone reads "no language
+        // configured" as "English" and writes `en` in here, this fails. Nothing else
+        // would — an agent that had configured nothing would simply start being pinned
+        // to English by a caller that used to let the server decide.
         let body = serde_json::to_value(Tts::body_for(&Voicing::default(), "hello"))
             .expect("serializes");
 
         assert_eq!(body, serde_json::json!({"text": "hello"}));
     }
 
+    /// The wire this ticket exists to run, from the sending end.
+    ///
+    /// The language was parsed out of the agent's config and dropped one struct short
+    /// of the request for the whole life of the feature: an operator who set
+    /// `language: es` got Spanish text read with English phonemes, which plays
+    /// perfectly and is nonsense — the failure is inaudible as a failure, so nothing
+    /// downstream of here can be the thing that catches it.
+    ///
+    /// `language_code` rather than `language`, because that is the field elvenspeak
+    /// declares and ElevenLabs named. A field the server does not recognise is a field
+    /// it reports ignored and drops, so the name is the whole of the contract.
+    #[test]
+    fn a_language_the_caller_asked_for_reaches_the_request() {
+        let voicing = Voicing {
+            voice_id: None,
+            model_id: None,
+            language: Some(Language::Es),
+        };
+        let body = serde_json::to_value(Tts::body_for(&voicing, "hola")).expect("serializes");
+
+        assert_eq!(body, serde_json::json!({"text": "hola", "language_code": "es"}));
+    }
+
+    /// The one spelling a mapping written on this side would get wrong.
+    ///
+    /// `PtBr` is `pt-br` on the wire, and the enum already says so. This is here to fail
+    /// if the language is ever converted to a string by anything other than that enum's
+    /// own serde renames — the second copy of a vocabulary, which is wrong the first
+    /// time either copy is edited and silent when it is.
+    #[test]
+    fn a_language_code_that_is_not_its_variant_name_is_spelled_as_the_wire_spells_it() {
+        let voicing = Voicing {
+            voice_id: None,
+            model_id: None,
+            language: Some(Language::PtBr),
+        };
+        let body = serde_json::to_value(Tts::body_for(&voicing, "olá")).expect("serializes");
+
+        assert_eq!(body["language_code"], serde_json::json!("pt-br"));
+    }
+
+    /// All three axes at once, which no test above covers.
+    ///
+    /// Each of the others names one field and leaves the rest unset, so a `body_for`
+    /// that could only carry one at a time would pass every one of them. A real request
+    /// from a configured agent carries all three.
+    #[test]
+    fn the_three_axes_travel_together() {
+        let voicing = Voicing {
+            voice_id: Some("es_MX-claude-high".into()),
+            model_id: Some("piper".into()),
+            language: Some(Language::Es),
+        };
+        let body = serde_json::to_value(Tts::body_for(&voicing, "hola")).expect("serializes");
+
+        assert_eq!(
+            body,
+            serde_json::json!({"text": "hola", "model_id": "piper", "language_code": "es"})
+        );
+    }
+
     #[test]
     fn the_voice_asked_for_is_the_one_in_the_path_and_absent_means_the_default() {
         let tts = Tts::new("http://server:11000/".into(), "default-voice".into());
 
-        let asked = Voicing { voice_id: Some("af_heart".into()), model_id: None };
+        let asked =
+            Voicing { voice_id: Some("af_heart".into()), model_id: None, language: None };
         assert_eq!(
             tts.url_for(&asked),
             "http://server:11000/v1/text-to-speech/af_heart/stream"
