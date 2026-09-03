@@ -95,6 +95,36 @@ async function usage(query) {
   return { status: response.status, ...(await response.json()) };
 }
 
+/// Returns once the service's clock has left the second it stamped on `conversationId`,
+/// so the next conversation minted is recorded in a later second than this one.
+///
+/// Start times are whole seconds, and a `created_after` cutoff can only fall *between*
+/// two conversations that started in different ones — mint both inside a single tick and
+/// there is no value that admits the later and excludes the earlier, so the cutoff checks
+/// below have nothing to assert.
+///
+/// The service is asked rather than guessed at. While a conversation is unfinished its
+/// `call_duration_secs` is `now - start_time` computed service-side, so a full second of
+/// it is the service itself reporting that its clock has moved on. A sleep here would be
+/// this script's clock betting on the service's tick boundary instead.
+async function waitForALaterSecondThan(conversationId, userId) {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const page = await usage(`user_id=${userId}`);
+    const conversation = page.conversations.find((c) => c.conversation_id === conversationId);
+    if (!conversation) {
+      throw new Error(
+        `${conversationId} was minted but the usage endpoint does not list it (HTTP ${page.status})`,
+      );
+    }
+    if (conversation.call_duration_secs >= 1) return;
+    if (Date.now() > deadline) {
+      throw new Error(`the service's clock did not leave ${conversationId}'s start second in 5s`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 // A fresh user per run, so a log left over from an earlier run cannot make this pass.
 const user = `u_acc${randomUUID().replaceAll("-", "").slice(0, 12)}`;
 const other = `u_other${randomUUID().replaceAll("-", "").slice(0, 8)}`;
@@ -102,6 +132,7 @@ console.log(`openconv ${config.openconv}, user ${user}\n`);
 
 // ---- two conversations for one user, both completed ----
 const first = await mint(user);
+await waitForALaterSecondThan(first, user);
 const second = await mint(user);
 check("two conversations minted", first !== second, `${first}, ${second}`);
 
@@ -115,6 +146,13 @@ const started = Object.fromEntries(
 );
 
 check("both appear before they finish", Object.keys(started).length === 2);
+// What the two cutoff checks below stand on. Named here so that losing it reads as the
+// lost precondition rather than as the filter returning the wrong set.
+check(
+  "the two start in different seconds",
+  started[first] < started[second],
+  `${started[first]}, ${started[second]}`,
+);
 
 const firstEnd = started[first] + 60;
 const secondEnd = started[second] + 120;
@@ -138,7 +176,12 @@ const summed = all.conversations.reduce((total, c) => total + (c.call_duration_s
 check("Happy's sum over the window", summed === 180, `${summed}s`);
 
 // ---- a cutoff between the two returns only the later one ----
-const cutoff = Math.floor((started[first] + started[second]) / 2) + 1;
+// `created_after` is inclusive — usage.rs matches on `started_at_unix_secs >= cutoff` — so
+// the later conversation's own recorded start second is exactly the cutoff that admits it
+// and excludes the earlier one. Taken from what the service recorded rather than computed
+// between the two: any value this script invents is a guess about a resolution it does not
+// own, and at second resolution a midpoint lands past both as readily as between them.
+const cutoff = started[second];
 const later = await usage(`user_id=${user}&created_after=${cutoff}`);
 check(
   "a cutoff between them returns only the later",
