@@ -1199,3 +1199,71 @@ impl fmt::Display for AgentError {
 }
 
 impl std::error::Error for AgentError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use livekit::DisconnectReason;
+
+    /// A room event carrying nothing but something to tell it apart by.
+    ///
+    /// `RemoteParticipant` cannot be built outside the SDK, so these are not the events
+    /// production moves through `next_event`. That costs the test nothing: what is under
+    /// test is which of the two sources is drained first, and that is the same whatever
+    /// the events are. [LAW:behavior-not-structure]
+    fn marked(reason: DisconnectReason) -> RoomEvent {
+        RoomEvent::Disconnected { reason }
+    }
+
+    fn mark_of(event: Option<RoomEvent>) -> DisconnectReason {
+        match event {
+            Some(RoomEvent::Disconnected { reason }) => reason,
+            other => panic!("expected a marked event, got {other:?}"),
+        }
+    }
+
+    /// The announcement rides on a replayed arrival, so it has to reach the loop before
+    /// anything that depends on it — including speech from the caller it announces to.
+    #[tokio::test]
+    async fn what_was_already_here_is_handled_before_what_arrives_next() {
+        let mut missed = VecDeque::from(vec![marked(DisconnectReason::ClientInitiated)]);
+        let (sending, mut events) = mpsc::unbounded_channel();
+        sending.send(marked(DisconnectReason::ServerShutdown)).expect("receiver is alive");
+
+        assert_eq!(
+            mark_of(next_event(&mut missed, &mut events).await),
+            DisconnectReason::ClientInitiated,
+            "the backlog goes first",
+        );
+        assert_eq!(
+            mark_of(next_event(&mut missed, &mut events).await),
+            DisconnectReason::ServerShutdown,
+            "and what the room sent while it drained is still there afterwards",
+        );
+    }
+
+    /// With nothing missed, this is the room's own event stream and nothing else — which
+    /// is every conversation where the agent did win the race into the room.
+    #[tokio::test]
+    async fn an_empty_backlog_is_not_a_case_of_its_own() {
+        let mut missed = VecDeque::new();
+        let (sending, mut events) = mpsc::unbounded_channel();
+        sending.send(marked(DisconnectReason::ServerShutdown)).expect("receiver is alive");
+
+        assert_eq!(
+            mark_of(next_event(&mut missed, &mut events).await),
+            DisconnectReason::ServerShutdown,
+        );
+    }
+
+    /// The loop breaks on `None`, so a closed room has to read as closed rather than as a
+    /// room with nothing to say.
+    #[tokio::test]
+    async fn a_drained_backlog_and_a_closed_room_is_the_end() {
+        let mut missed = VecDeque::new();
+        let (sending, mut events) = mpsc::unbounded_channel::<RoomEvent>();
+        drop(sending);
+
+        assert!(next_event(&mut missed, &mut events).await.is_none());
+    }
+}
