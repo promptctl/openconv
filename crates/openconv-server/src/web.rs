@@ -161,9 +161,12 @@ impl From<TtsError> for NoVoices {
 impl IntoResponse for NoVoices {
     fn into_response(self) -> Response {
         // 502 rather than 500, which is the difference between "restart openconv" and
-        // "go look at the text-to-speech server" — and the body carries what that server
-        // said, because it is the only thing that knows.
-        (StatusCode::BAD_GATEWAY, self.0.to_string()).into_response()
+        // "go look at the text-to-speech server". What that server said goes to the
+        // operator who can act on it rather than into an unauthenticated body, which is
+        // the same split [`ApiError`]'s own upstream arms make. [LAW:one-source-of-truth]
+        tracing::error!(error = %self.0, "could not read the voice listing");
+        let said = "the text-to-speech server did not answer with a voice listing";
+        (StatusCode::BAD_GATEWAY, said).into_response()
     }
 }
 
