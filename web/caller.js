@@ -56,11 +56,17 @@ const reportDetached = (failure) =>
  * Every other failure is a call that never opened and is re-raised untouched, for `join`'s
  * own cleanup to release the room and the microphone. Reported either way, never swallowed.
  * [LAW:no-silent-failure]
+ *
+ * `report` is a parameter, and exported alongside it, because reporting is half of what
+ * this function promises — a failure that costs only the voice must still be seen — and a
+ * promise whose effect nothing can observe is not one a test can hold it to. The page
+ * passes nothing and gets `reportDetached`, which throws where no caller is listening and
+ * so cannot be handed a spy. [LAW:effects-at-boundaries]
  */
-const keepTheCall = (failure) => {
+export const keepTheCall = (failure, report = reportDetached) => {
   if (!(failure instanceof NotTold)) throw failure;
 
-  reportDetached(failure);
+  report(failure);
   return failure.conversationId;
 };
 
