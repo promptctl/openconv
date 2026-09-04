@@ -21,9 +21,11 @@
 use crate::state::AppState;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
-use axum::response::{IntoResponse, Redirect};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use openconv_agent::tts::{TtsError, VoiceListing};
 use serde::Serialize;
 
 /// Where the page lives. The trailing slash is load-bearing: the page imports its own
@@ -75,6 +77,17 @@ const ASSETS: &[Asset] = &[
     },
 ];
 
+/// The names under [`MOUNT`] that answer with something computed rather than with a
+/// file.
+///
+/// Listed because the test that catches a page asking for a name nothing serves reads
+/// [`ASSETS`], which these are not in — and a bare exception for whichever one existed
+/// first is how the second one gets no check at all. Kept here rather than down in the
+/// tests, beside the [`router`] whose `route` calls it mirrors, because two lines apart
+/// is the only distance at which the mirror is checked by anyone reading either.
+#[cfg(test)]
+const ENDPOINTS: &[&str] = &["config", "voices"];
+
 pub fn router() -> Router<AppState> {
     let assets = ASSETS.iter().fold(Router::new(), |router, asset| {
         router.route(
@@ -89,6 +102,7 @@ pub fn router() -> Router<AppState> {
         // that does nothing.
         .route("/call", get(|| async { Redirect::permanent(MOUNT) }))
         .route("/call/config", get(config))
+        .route("/call/voices", get(voices))
 }
 
 /// What the page cannot know about the deployment serving it.
@@ -101,6 +115,59 @@ struct CallConfig {
 /// not a credential. The token is the credential, and that mint is authenticated.
 async fn config(State(state): State<AppState>) -> impl IntoResponse {
     Json(CallConfig { livekit_url: state.livekit.public_signaling_url() })
+}
+
+/// The voices the page can offer, read from the text-to-speech server this deployment
+/// speaks through.
+#[derive(Debug, Serialize)]
+struct CallVoices {
+    voices: Vec<VoiceListing>,
+}
+
+/// What this deployment can be asked to sound like.
+///
+/// A route of its own rather than another field on [`CallConfig`], because the two fail
+/// differently and only one of them is survivable. This one crosses the network to
+/// another service; that one reads a string this process already holds. Answered
+/// together, a text-to-speech server that is down would stop the page learning which SFU
+/// to dial, and nobody could join at all — the whole call lost over the part of it that
+/// is a dropdown. [LAW:decomposition]
+///
+/// Asked of the same [`Tts`] every conversation is spoken through, so the voices offered
+/// are the voices a call in this deployment can actually reach. A client built here
+/// against its own address would be free to list a server nothing speaks through.
+/// [LAW:one-source-of-truth]
+///
+/// [`Tts`]: openconv_agent::tts::Tts
+async fn voices(State(state): State<AppState>) -> Result<Json<CallVoices>, NoVoices> {
+    Ok(Json(CallVoices { voices: state.tts.voices().await? }))
+}
+
+/// Why the page has no voices to offer.
+///
+/// [LAW:no-silent-failure] An empty list would be the answer-shaped void here: it has
+/// exactly the shape of a real answer — "this deployment serves no voices" — while
+/// meaning "nobody could ask". The page draws those two differently because a caller
+/// left on a voice they did not choose deserves to know which of them happened.
+#[derive(Debug)]
+struct NoVoices(TtsError);
+
+impl From<TtsError> for NoVoices {
+    fn from(error: TtsError) -> Self {
+        Self(error)
+    }
+}
+
+impl IntoResponse for NoVoices {
+    fn into_response(self) -> Response {
+        // 502 rather than 500, which is the difference between "restart openconv" and
+        // "go look at the text-to-speech server". What that server said goes to the
+        // operator who can act on it rather than into an unauthenticated body, which is
+        // the same split [`ApiError`]'s own upstream arms make. [LAW:one-source-of-truth]
+        tracing::error!(error = %self.0, "could not read the voice listing");
+        let said = "the text-to-speech server did not answer with a voice listing";
+        (StatusCode::BAD_GATEWAY, said).into_response()
+    }
 }
 
 #[cfg(test)]
@@ -132,9 +199,10 @@ mod tests {
             for name in referenced_by(asset.body) {
                 found += 1;
 
-                // A route rather than a file. That it answers is asserted by the
-                // `config` handler existing at all, which the router below wires.
-                if name == "config" {
+                // A route rather than a file, answered by a handler instead of by
+                // bytes. That each of these answers at all is asserted by its handler
+                // existing, which the router wires.
+                if ENDPOINTS.contains(&name) {
                     continue;
                 }
 
@@ -243,6 +311,42 @@ mod tests {
                     "the agent publishes {name:?}, which the page never reads"
                 );
             }
+        }
+    }
+
+    /// The 502 body is read by a caller who presented no credential, and `TtsError`
+    /// carries the far side's own words: a URL that would not answer, the body it refused
+    /// with, a path off this filesystem. That text reached an unauthenticated caller once
+    /// already and was taken out by hand; this is what keeps it out.
+    ///
+    /// Every variant, because the leak was never about one of them — it was about
+    /// `Display` being handed to the response at all.
+    #[tokio::test]
+    async fn a_refused_voice_listing_tells_the_caller_nothing_about_why() {
+        let carried = [
+            (TtsError::Unreachable("http://10.4.0.7:20977/v1/voices".to_owned()), "10.4.0.7"),
+            (TtsError::Refused { status: 401, body: "bad token sk-abcdef".to_owned() }, "sk-abcdef"),
+            (TtsError::Undecodable("/srv/openconv/voices/heart.onnx".to_owned()), "heart.onnx"),
+            (TtsError::Unreadable("missing `voices` at line 3".to_owned()), "line 3"),
+        ];
+
+        for (error, secret) in carried {
+            let spoken = error.to_string();
+            assert!(spoken.contains(secret), "the fixture stopped carrying {secret:?}");
+
+            let response = NoVoices(error).into_response();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("a body the caller could read");
+            let body = String::from_utf8(body.to_vec()).expect("a body that is text");
+
+            // Non-empty first: a handler that answered with nothing would keep every
+            // secret and pass every `does not contain` below without saying a word.
+            assert!(!body.is_empty(), "the caller is told nothing at all");
+            assert!(!body.contains(secret), "the 502 body leaked {secret:?}: {body}");
+            assert_ne!(body, spoken, "the 502 body is the error's own Display");
         }
     }
 }
