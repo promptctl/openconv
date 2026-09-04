@@ -21,9 +21,11 @@
 use crate::state::AppState;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
-use axum::response::{IntoResponse, Redirect};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use openconv_agent::tts::{TtsError, VoiceListing};
 use serde::Serialize;
 
 /// Where the page lives. The trailing slash is load-bearing: the page imports its own
@@ -75,6 +77,17 @@ const ASSETS: &[Asset] = &[
     },
 ];
 
+/// The names under [`MOUNT`] that answer with something computed rather than with a
+/// file.
+///
+/// Listed because the test that catches a page asking for a name nothing serves reads
+/// [`ASSETS`], which these are not in — and a bare exception for whichever one existed
+/// first is how the second one gets no check at all. Kept here rather than down in the
+/// tests, beside the [`router`] whose `route` calls it mirrors, because two lines apart
+/// is the only distance at which the mirror is checked by anyone reading either.
+#[cfg(test)]
+const ENDPOINTS: &[&str] = &["config", "voices"];
+
 pub fn router() -> Router<AppState> {
     let assets = ASSETS.iter().fold(Router::new(), |router, asset| {
         router.route(
@@ -89,6 +102,7 @@ pub fn router() -> Router<AppState> {
         // that does nothing.
         .route("/call", get(|| async { Redirect::permanent(MOUNT) }))
         .route("/call/config", get(config))
+        .route("/call/voices", get(voices))
 }
 
 /// What the page cannot know about the deployment serving it.
@@ -101,6 +115,56 @@ struct CallConfig {
 /// not a credential. The token is the credential, and that mint is authenticated.
 async fn config(State(state): State<AppState>) -> impl IntoResponse {
     Json(CallConfig { livekit_url: state.livekit.public_signaling_url() })
+}
+
+/// The voices the page can offer, read from the text-to-speech server this deployment
+/// speaks through.
+#[derive(Debug, Serialize)]
+struct CallVoices {
+    voices: Vec<VoiceListing>,
+}
+
+/// What this deployment can be asked to sound like.
+///
+/// A route of its own rather than another field on [`CallConfig`], because the two fail
+/// differently and only one of them is survivable. This one crosses the network to
+/// another service; that one reads a string this process already holds. Answered
+/// together, a text-to-speech server that is down would stop the page learning which SFU
+/// to dial, and nobody could join at all — the whole call lost over the part of it that
+/// is a dropdown. [LAW:decomposition]
+///
+/// Asked of the same [`Tts`] every conversation is spoken through, so the voices offered
+/// are the voices a call in this deployment can actually reach. A client built here
+/// against its own address would be free to list a server nothing speaks through.
+/// [LAW:one-source-of-truth]
+///
+/// [`Tts`]: openconv_agent::tts::Tts
+async fn voices(State(state): State<AppState>) -> Result<Json<CallVoices>, NoVoices> {
+    Ok(Json(CallVoices { voices: state.tts.voices().await? }))
+}
+
+/// Why the page has no voices to offer.
+///
+/// [LAW:no-silent-failure] An empty list would be the answer-shaped void here: it has
+/// exactly the shape of a real answer — "this deployment serves no voices" — while
+/// meaning "nobody could ask". The page draws those two differently because a caller
+/// left on a voice they did not choose deserves to know which of them happened.
+#[derive(Debug)]
+struct NoVoices(TtsError);
+
+impl From<TtsError> for NoVoices {
+    fn from(error: TtsError) -> Self {
+        Self(error)
+    }
+}
+
+impl IntoResponse for NoVoices {
+    fn into_response(self) -> Response {
+        // 502 rather than 500, which is the difference between "restart openconv" and
+        // "go look at the text-to-speech server" — and the body carries what that server
+        // said, because it is the only thing that knows.
+        (StatusCode::BAD_GATEWAY, self.0.to_string()).into_response()
+    }
 }
 
 #[cfg(test)]
@@ -132,9 +196,10 @@ mod tests {
             for name in referenced_by(asset.body) {
                 found += 1;
 
-                // A route rather than a file. That it answers is asserted by the
-                // `config` handler existing at all, which the router below wires.
-                if name == "config" {
+                // A route rather than a file, answered by a handler instead of by
+                // bytes. That each of these answers at all is asserted by its handler
+                // existing, which the router wires.
+                if ENDPOINTS.contains(&name) {
                     continue;
                 }
 

@@ -70,7 +70,8 @@
     text-transform: uppercase;
   }
 
-  input {
+  input,
+  select {
     font: inherit;
     background: var(--bg);
     color: var(--text);
@@ -200,6 +201,23 @@
   <label>
     participant
     <input id="participant-name" value="u_browser" />
+  </label>
+  <!--
+    The one field on this form nobody can type. An id the text-to-speech server does not
+    serve is not refused — it comes back as a successful response in a substitute voice —
+    so a text box here would let someone pick a voice, hear a different one, and have
+    nothing on screen disagree with them. The options are read from `/call/voices`.
+  -->
+  <label>
+    voice
+    <select id="voice">
+      <!--
+        Not a voice: the absence of a choice, which the server answers by applying its
+        own default. Shipped in the markup because it is the only honest thing to offer
+        before the list has arrived, and it stays afterwards as the way back to it.
+      -->
+      <option value="">deployment default</option>
+    </select>
   </label>
   <button id="join">join</button>
 </fieldset>

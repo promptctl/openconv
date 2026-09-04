@@ -66,6 +66,14 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // cannot be billed, and finding that out at startup costs nothing.
     log.read_all().await?;
 
+    // Built before the bundle so that both the agents that speak through it and the
+    // route that lists what it can speak in hold the same client, rather than two built
+    // from the same string. [LAW:one-source-of-truth]
+    let tts = Arc::new(openconv_agent::tts::Tts::new(
+        config.tts_url.clone(),
+        config.tts_voice.clone(),
+    ));
+
     // Loaded here rather than on the first utterance: a missing or corrupt model must
     // stop the process, not produce a service that answers calls and cannot hear.
     let agents = Arc::new(openconv_agent::Services {
@@ -79,14 +87,11 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?,
         ),
-        tts: Arc::new(openconv_agent::tts::Tts::new(
-            config.tts_url.clone(),
-            config.tts_voice.clone(),
-        )),
+        tts: tts.clone(),
         default_prompt: DEFAULT_PROMPT.into(),
     });
 
-    let state = AppState::new(&config, LiveKit::new(&config), log, agents);
+    let state = AppState::new(&config, LiveKit::new(&config), log, agents, tts);
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
 
     tracing::info!(

@@ -6,42 +6,67 @@ import { cell, log, render, show } from "./transcript.js";
 const els = {
   join: document.getElementById("join"),
   audio: document.getElementById("agent-audio"),
-};
-
-/** What each field is called when the page has to say it is empty. */
-const FIELDS = {
-  apiKey: { element: document.getElementById("api-key"), called: "the api key" },
-  agentId: { element: document.getElementById("agent-id"), called: "an agent" },
-  participantName: {
-    element: document.getElementById("participant-name"),
-    called: "a participant",
-  },
+  voice: document.getElementById("voice"),
 };
 
 /**
- * Reads the form, refusing anything blank.
- *
- * The boundary between what somebody typed and what gets minted, and a parser rather
- * than a check: everything downstream runs on values known to be non-empty, so nothing
- * asks again.
- *
- * Blank is refused rather than passed through, because the server takes each of these
- * as a string it does not police. An empty participant mints a metered conversation
- * attributed to nobody; an empty agent names an agent that does not exist. Dropping the
- * parameter instead would be worse than either — an absent participant is the unmetered
- * bring-your-own-key path, and choosing it by clearing a text box is a mode switch
- * nobody asked for.
+ * Every control on the form, under the name its value travels by — into the call, into
+ * the URL that can seed it, and into what the next visit remembers.
  */
-function requireFields() {
-  const typed = Object.entries(FIELDS).map(([name, field]) => [name, field.element.value.trim()]);
-  const blank = typed.filter(([, value]) => value === "");
+const CONTROLS = {
+  apiKey: document.getElementById("api-key"),
+  agentId: document.getElementById("agent-id"),
+  participantName: document.getElementById("participant-name"),
+  voiceId: els.voice,
+};
 
-  if (blank.length > 0) {
-    const missing = blank.map(([name]) => FIELDS[name].called);
-    throw new Error(`fill in ${missing.join(" and ")} before joining`);
+/**
+ * What the mint refuses to be without, and what to call each one when it is empty.
+ *
+ * A second table rather than a flag on the first, because being required is not a
+ * property every control has and never was — it is a property of the three values that
+ * get minted with. The voice's empty value is a real answer, "no particular voice, let
+ * the deployment choose", and refusing it would take away the only state available
+ * before the roster has loaded or when it cannot.
+ */
+const REQUIRED = {
+  apiKey: "the api key",
+  agentId: "an agent",
+  participantName: "a participant",
+};
+
+/**
+ * Reads the form, refusing a blank where blank is not an answer.
+ *
+ * The boundary between what somebody chose and what the call is made with, and a parser
+ * rather than a check: everything downstream runs on values already known to be as
+ * complete as they have to be, so nothing asks again.
+ *
+ * A blank among `REQUIRED` is refused rather than passed through, because the server
+ * takes each of those as a string it does not police. An empty participant mints a
+ * metered conversation attributed to nobody; an empty agent names an agent that does not
+ * exist. Dropping the parameter instead would be worse than either — an absent
+ * participant is the unmetered bring-your-own-key path, and choosing it by clearing a
+ * text box is a mode switch nobody asked for.
+ *
+ * The voice is the control that is complete when it is empty, and it leaves here as the
+ * string the form holds rather than as an absence, so that what is remembered for next
+ * visit is the same kind of value every other control remembers. Turning "" into "no
+ * particular voice" happens once, where the message that says it is built.
+ */
+function readForm() {
+  const chosen = Object.fromEntries(
+    Object.entries(CONTROLS).map(([name, control]) => [name, control.value.trim()]),
+  );
+
+  const missing = Object.keys(REQUIRED).filter((name) => chosen[name] === "");
+  if (missing.length > 0) {
+    throw new Error(
+      `fill in ${missing.map((name) => REQUIRED[name]).join(" and ")} before joining`,
+    );
   }
 
-  return Object.fromEntries(typed);
+  return chosen;
 }
 
 /**
@@ -77,11 +102,11 @@ const REMEMBERED = "openconv.call";
  * That matters more than it looks. `JSON.parse("null")` succeeds, and indexing the
  * result for a field name throws — at module scope, before the form is ever seeded.
  * A stored number or object does not throw; it stringifies into the box as `42` or
- * `[object Object]`, and since seeds are written *into the fields*, `requireFields`
- * sees a non-empty string and mints with it.
+ * `[object Object]`, and since seeds are written *into the controls*, `readForm` sees a
+ * non-empty string and mints with it.
  *
  * An unusable stored value is dropped quietly, because it is not a failure: it is
- * indistinguishable from a first visit, the field falls through to the markup's
+ * indistinguishable from a first visit, the control falls through to the markup's
  * default, and an empty box on screen is the whole of the consequence. A browser that
  * refuses storage outright is a different matter and still says so.
  */
@@ -90,7 +115,7 @@ function remembered() {
     const stored = JSON.parse(localStorage.getItem(REMEMBERED) ?? "{}");
 
     return Object.fromEntries(
-      Object.keys(FIELDS)
+      Object.keys(CONTROLS)
         .filter((name) => typeof stored?.[name] === "string")
         .map((name) => [name, stored[name]]),
     );
@@ -103,28 +128,90 @@ function remembered() {
 /**
  * Fills the form from the URL or from the last visit, so that joining costs one click.
  *
- * These three values change rarely and the shared secret never, so retyping them every
- * visit is friction carrying no information.
+ * These values change rarely and the shared secret never, so retyping them every visit
+ * is friction carrying no information. The voice is seeded the same way as the rest,
+ * which is what makes `?voiceId=af_heart` a bookmark and a chosen voice something that
+ * survives a reload — there is no separate notion of a default voice for this page
+ * because there does not need to be one.
  *
- * Seeds are written *into the fields* rather than read at mint time, which keeps the
- * form the only thing deciding what gets minted — a page whose box shows one key while
- * the request sends another is a bad hour. It also means `requireFields` stays the
+ * Seeds are written *into the controls* rather than read at mint time, which keeps the
+ * form the only thing deciding what the call is made with — a page whose box shows one
+ * key while the request sends another is a bad hour. It also means `readForm` stays the
  * single boundary: nothing routes around the parser.
  *
  * Precedence is URL, then remembered, then whatever the markup shipped, so a link can
  * always override a stale stored value.
+ *
+ * Returns what it wrote. The voice list arrives later than this runs, and a `<select>`
+ * cannot hold a value it has no option for — so the one control that has to be written
+ * twice is written from one read, and the two cannot disagree about what this visit
+ * asked for. [LAW:one-source-of-truth]
  */
 function seedFields() {
   const fromUrl = new URLSearchParams(location.search);
   const stored = remembered();
 
-  for (const [name, field] of Object.entries(FIELDS)) {
-    field.element.value = fromUrl.get(name) ?? stored[name] ?? field.element.value;
+  const seeded = Object.fromEntries(
+    Object.entries(CONTROLS).map(([name, control]) => [
+      name,
+      fromUrl.get(name) ?? stored[name] ?? control.value,
+    ]),
+  );
+
+  for (const [name, control] of Object.entries(CONTROLS)) {
+    control.value = seeded[name];
   }
 
   // The key does not stay in the address bar once it is in the box. A URL is the one
   // place a secret gets bookmarked, screenshotted and pasted into chat.
   history.replaceState(null, "", location.pathname);
+
+  return seeded;
+}
+
+/**
+ * Fills the voice list from the deployment, then puts back the voice this visit asked
+ * for.
+ *
+ * The list is the text-to-speech server's, reached through `/call/voices` because a
+ * browser has no route to that server and no business holding its address — the same
+ * reason the SFU to dial is read from `./config` rather than typed.
+ *
+ * A failure here leaves the page on `deployment default`, which is not a substitute for
+ * the voice that was wanted: it is the same request this page made before the list
+ * existed, it is the one state the server is guaranteed to have an answer for, and it is
+ * said out loud rather than arrived at silently. [LAW:no-silent-failure] The join is
+ * untouched either way — a dropdown that could stop someone talking to their agent would
+ * be a bad trade for a dropdown.
+ */
+async function offerVoices(wanted) {
+  try {
+    const response = await fetch("./voices");
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} ${await response.text()}`);
+    }
+
+    for (const voice of (await response.json()).voices) {
+      // The server's own sentence about the voice — "Kokoro Heart (en-us, female)" —
+      // which already names the engine, the locale and the tier. Composing a label here
+      // out of a voice's several `models` would mean deciding on this page which of them
+      // is really its engine, and that is elvenspeak's answer to give.
+      els.voice.append(new Option(voice.description, voice.voice_id));
+    }
+  } catch (error) {
+    render(log("error", `could not read the voices this deployment serves: ${error.message}`));
+  }
+
+  // Written after the options exist, because a `<select>` silently ignores a value it
+  // has no option for — and read back, because that silence is the whole failure: a
+  // voice that quietly stopped being served would put the caller on the deployment's
+  // default with the form agreeing that nothing was wrong.
+  els.voice.value = wanted;
+  if (els.voice.value !== wanted) {
+    render(
+      log("error", `the voice ${wanted} is not on offer here — using the deployment default`),
+    );
+  }
 }
 
 /**
@@ -174,7 +261,7 @@ async function livekitUrl() {
 }
 
 async function join() {
-  const fields = requireFields();
+  const fields = readForm();
   showButton("joining…", false);
 
   call = await Call.join({
@@ -222,4 +309,4 @@ els.join.addEventListener("click", async () => {
   }
 });
 
-seedFields();
+offerVoices(seedFields().voiceId);
