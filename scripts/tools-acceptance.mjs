@@ -94,12 +94,13 @@ const responses = (caller) =>
 
 /** Opens a conversation configured with one prompt, and waits for the announcement. */
 async function converse(prompt, name) {
-  const caller = await Caller.join({ openconv, livekitUrl, xiApiKey });
+  const caller = await Caller.join({ openconv, livekitUrl, xiApiKey, settings: { prompt } });
+
+  // Before the microphone, and waited for. This used to publish the configuration after
+  // opening one, and reached the agent only because opening one waits for a subscriber —
+  // an ordering nothing stated and nothing checked. [LAW:no-ambient-temporal-coupling]
+  await caller.agentConfigured();
   await caller.microphone();
-  await caller.send({
-    type: "conversation_initiation_client_data",
-    conversation_config_override: { agent: { prompt: { prompt } } },
-  });
 
   const announced = await caller.waitFor(
     () => caller.control("conversation_initiation_metadata"),

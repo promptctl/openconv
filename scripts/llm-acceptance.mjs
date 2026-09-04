@@ -33,26 +33,26 @@ const checks = new Checks();
 
 const recording = recordSpeech(QUESTION, join(mkdtempSync(join(tmpdir(), "openconv-llm-")), "q.wav"));
 
-const caller = await Caller.join({ openconv, livekitUrl, xiApiKey, participantName: "u_llm" });
+const caller = await Caller.join({
+  openconv,
+  livekitUrl,
+  xiApiKey,
+  participantName: "u_llm",
+  // Carried by the handshake rather than published by hand afterwards, so this run and
+  // the browser page configure a conversation by the same code. `web/conversation.js`
+  // owns the message; a script naming `conversation_config_override` was a script that
+  // knew the wire shape, and six of them knowing it is how the seventh got it wrong.
+  settings: { prompt: PROMPT, firstMessage: FIRST_MESSAGE, variables: { sessionId: SESSION_ID } },
+});
 console.log(`configuring ${caller.conversationId}\n`);
 
 checks.record("joined the conversation", true, caller.conversationId);
 
 checks.record(
-  "the agent is present",
-  await caller.waitFor(() => caller.agentPresent(), 30_000, "the agent"),
+  "the agent is present and holds this conversation's configuration",
+  await caller.agentConfigured(30_000),
   caller.roster().join(", "),
 );
-
-// ---- send the session configuration, exactly as the SDK does ----
-await caller.send({
-  type: "conversation_initiation_client_data",
-  conversation_config_override: {
-    agent: { prompt: { prompt: PROMPT }, first_message: FIRST_MESSAGE },
-  },
-  dynamic_variables: { sessionId: SESSION_ID },
-});
-checks.record("sent the conversation configuration", true);
 
 // ---- the first message opens the conversation, before anyone speaks ----
 // The wait is for something to say, the check is for it being the *configured* thing: an

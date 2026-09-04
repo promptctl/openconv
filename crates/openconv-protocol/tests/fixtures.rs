@@ -743,7 +743,20 @@ fn closed_vocabularies_match_their_published_names() {
     ];
     for (language, name) in languages {
         matches_published_shape(language, json!(name));
+
+        // The same code, read back the way anything that has to *print* a language gets
+        // it. Checked here rather than against its own list, so the accessor cannot claim
+        // a code the wire does not carry — `pt-br` being the row where a hand-written
+        // table would say `ptbr` and nobody would notice until a Brazilian caller did.
+        assert_eq!(language.code(), name);
     }
+
+    // The list above transcribes the published union; `Language::ALL` is what the page is
+    // offered. Neither can enumerate the enum on its own, so they are held to each other:
+    // a language reaching one and not the other fails here instead of becoming an option
+    // nobody can pick, or a code nothing ever checked.
+    let transcribed: Vec<Language> = languages.iter().map(|(language, _)| *language).collect();
+    assert_eq!(transcribed, Language::ALL, "the offered languages and the checked ones differ");
 }
 
 /// The four admitted error codes travel as numbers; anything else is rejected rather

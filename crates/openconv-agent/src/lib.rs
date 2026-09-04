@@ -44,7 +44,7 @@ use livekit::track::RemoteTrack;
 use livekit::{Room, RoomEvent, RoomOptions};
 use openconv_protocol::{
     AgentResponseEvent, AudioFormat, ClientEvent, ClientToolCall,
-    ConversationInitiationMetadataEvent, InterruptionEvent, ServerEvent,
+    ConversationInitiationMetadataEvent, InterruptionEvent, Language, ServerEvent,
     TentativeUserTranscriptionEvent, UserTranscriptionEvent, VadScoreEvent,
 };
 use speak::{Made, Spoken, Stopped, Synthesizer};
@@ -469,6 +469,17 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                     // voice, which is a different fact from naming one that got
                     // substituted, and both are readable here.
                     voice = config.voicing.voice_id.as_deref().unwrap_or("<none>"),
+                    // Beside the voice because they are one answer read off two halves of
+                    // the message — the language arrives under `agent` and the voice under
+                    // `tts` — and because a language the client set and a voice it did not
+                    // is precisely how the caller ends up hearing a substituted voice with
+                    // nothing anywhere saying which of the two asked for it. Diagnosing
+                    // that once cost a LiveKit probe written to learn what this line
+                    // should have said.
+                    language = config
+                        .voicing
+                        .language
+                        .map_or_else(|| "<none>".to_owned(), Language::code),
                     "conversation configured by the client"
                 );
 
