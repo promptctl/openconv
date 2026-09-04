@@ -298,10 +298,9 @@ async function join() {
   call = await Call.join({
     ...fields,
     livekitUrl: await livekitUrl(),
-    // A reader of the control rather than the voice `fields` happens to be carrying —
-    // that copy goes on to `remember` and no further. The form stays the one place that
-    // says which voice this call is in, so changing it mid-call reaches the agent through
-    // the same reader with nothing to keep in step. [LAW:one-source-of-truth]
+    // A reader of the control rather than the voice `fields` happens to be carrying. The
+    // form stays the one place that says which voice this call is in, so changing it
+    // mid-call reaches the agent with nothing to keep in step. [LAW:one-source-of-truth]
     chosenVoice: () => els.voice.value,
     onEvent: show,
     onTrack: (track) => track.attach(els.audio),
@@ -319,7 +318,10 @@ async function join() {
   // whichever of the two settled last. [LAW:no-ambient-temporal-coupling]
   await sendChosenVoice();
 
-  remember(fields);
+  // The voice is read here rather than taken from `fields`: that snapshot predates the
+  // microphone prompt, and a voice chosen during the join is the one this call is in, so
+  // it is the one the next visit should open on. [LAW:one-source-of-truth]
+  remember({ ...fields, voiceId: els.voice.value });
   render(cell("call", call.conversationId));
   render(cell("audio", call.audible ? "playing" : "BLOCKED — click the page"));
   showButton("leave", true);
