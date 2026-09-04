@@ -198,19 +198,27 @@ async function offerVoices(wanted) {
       // is really its engine, and that is elvenspeak's answer to give.
       els.voice.append(new Option(voice.description, voice.voice_id));
     }
+
+    // Written after the options exist, because a `<select>` silently ignores a value it
+    // has no option for — and read back, because that silence is the whole failure: a
+    // voice that quietly stopped being served would put the caller on the deployment's
+    // default with the form agreeing that nothing was wrong. Inside the `try`, so it
+    // speaks only for a listing that arrived: a fetch that failed has said so already,
+    // and naming a voice as not on offer would be a second and untrue account of it.
+    els.voice.value = wanted;
+    if (els.voice.value !== wanted) {
+      render(
+        log("error", `the voice ${wanted} is not on offer here — using the deployment default`),
+      );
+    }
+
+    // Assigning `.value` fires no `change`, so a call joined before this listing arrived
+    // would keep speaking in the voice it opened with while the box showed another.
+    // Dispatched rather than told directly, so a voice this page sets and a voice the
+    // caller picks reach the agent by the one path. [LAW:single-enforcer]
+    els.voice.dispatchEvent(new Event("change"));
   } catch (error) {
     render(log("error", `could not read the voices this deployment serves: ${error.message}`));
-  }
-
-  // Written after the options exist, because a `<select>` silently ignores a value it
-  // has no option for — and read back, because that silence is the whole failure: a
-  // voice that quietly stopped being served would put the caller on the deployment's
-  // default with the form agreeing that nothing was wrong.
-  els.voice.value = wanted;
-  if (els.voice.value !== wanted) {
-    render(
-      log("error", `the voice ${wanted} is not on offer here — using the deployment default`),
-    );
   }
 }
 
