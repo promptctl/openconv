@@ -212,6 +212,118 @@ test("an agent a send failed to reach is told again on the next sweep", async ()
   assert.equal(published.length, 1, "the agent the failed send never reached is told again");
 });
 
+/**
+ * A publish the test releases by hand, so that two sweeps can be in flight at once.
+ *
+ * Every test above awaits each sweep before starting the next, which is the one ordering
+ * that cannot show what this module does under overlap — and overlap is the ordinary case:
+ * an agent arriving while `connect` is settling is seen by the sweep inside `open` and by
+ * the caller's arrival handler both.
+ */
+const heldPublish = () => {
+  const published = [];
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+
+  return {
+    published,
+    release: () => release(),
+    publishBytes: async (payload) => {
+      published.push(JSON.parse(new TextDecoder().decode(payload)));
+      await held;
+    },
+  };
+};
+
+/** Lets everything already scheduled run, without releasing anything held. */
+const settleWhatCan = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+test("two sweeps overlapping tell an agent once", async () => {
+  const held = heldPublish();
+  const transport = transportOf(["agent_one"], held.publishBytes);
+  const conversation = conversationWith(transport, () => voiced("af_heart"));
+
+  const first = conversation.arrived();
+  const second = conversation.arrived();
+  held.release();
+  await Promise.all([first, second]);
+
+  assert.equal(held.published.length, 1, "the second sweep joined the first rather than sending again");
+});
+
+test("a sweep that overlaps another still waits for the agent to be told", async () => {
+  // Joining the send in flight rather than skipping it. A sweep that returned early because
+  // someone else was already publishing would let `open` resolve with the handshake still
+  // on the wire, and `caller.js` puts the microphone live on the next statement — an agent
+  // told which voice to use after the caller can speak changes voice partway through a reply.
+  const held = heldPublish();
+  const transport = transportOf(["agent_one"], held.publishBytes);
+  const conversation = conversationWith(transport, () => voiced("af_heart"));
+
+  const first = conversation.arrived();
+  let told = false;
+  const second = conversation.arrived().then(() => {
+    told = true;
+  });
+
+  await settleWhatCan();
+  assert.equal(told, false, "the overlapping sweep resolved before the publish it joined");
+
+  held.release();
+  await Promise.all([first, second]);
+  assert.equal(told, true);
+});
+
+test("settings changed mid-flight are sent afresh rather than joining the send they replace", async () => {
+  // The send in flight carries the answer the caller has just moved off. Joining it would
+  // report the new settings as delivered while the agent is being handed the old ones.
+  const held = heldPublish();
+  let showing = "af_heart";
+  const transport = transportOf(["agent_one"], held.publishBytes);
+  const conversation = conversationWith(transport, () => voiced(showing));
+
+  const sweep = conversation.arrived();
+  showing = "bm_george";
+  const changed = conversation.everyone();
+  held.release();
+  await Promise.all([sweep, changed]);
+
+  assert.deepEqual(
+    held.published.map((message) => message.conversation_config_override.tts.voice_id),
+    ["af_heart", "bm_george"],
+  );
+});
+
+test("a send that fails after the settings moved on does not unrecord the one that replaced it", async () => {
+  // The retraction is of one attempt's own claim, not of whatever the record happens to
+  // hold. Retracting outright would have a stale failure delete the newer send's claim, and
+  // the next sweep would tell an agent that already holds the current answer.
+  let failStale;
+  let calls = 0;
+  const transport = transportOf(["agent_one"], async () => {
+    calls += 1;
+    if (calls === 1) {
+      await new Promise((resolve) => {
+        failStale = resolve;
+      });
+      throw new Error("data channel closed");
+    }
+  });
+  const conversation = conversationWith(transport, () => voiced("af_heart"));
+
+  const stale = conversation.arrived();
+  const fresh = conversation.everyone();
+  await fresh;
+
+  failStale();
+  await assert.rejects(stale, /agent_one could not be told what this conversation is/);
+
+  await conversation.arrived();
+  assert.equal(calls, 2, "the send that succeeded is still recorded as delivered");
+});
+
 test("opening connects before it configures, and configures before it returns", async () => {
   // The sequence, asserted as a sequence. An agent told which voice to use after the
   // caller's microphone is live is an agent that changes voice partway through a reply,
