@@ -433,9 +433,6 @@ els.join.addEventListener("click", async () => {
   }
 });
 
-// Choosing a voice during a call changes the call. Without this the control is only read
-// at the join, and the way to hear a different voice is to hang up and dial again — which
-// makes comparing two voices a thing you do from memory across two conversations.
 // Changing any of these during a call changes the call. Without it a control is only read
 // at the join, and the way to hear a different voice — or language, or opening line — is to
 // hang up and dial again, which makes comparing two of anything a thing you do from memory
