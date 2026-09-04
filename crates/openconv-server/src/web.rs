@@ -313,4 +313,41 @@ mod tests {
             }
         }
     }
+
+    /// The 502 body is read by a caller who presented no credential, and `TtsError`
+    /// carries the far side's own words: a URL that would not answer, the body it refused
+    /// with, a path off this filesystem. That text reached an unauthenticated caller once
+    /// already and was taken out by hand; this is what keeps it out.
+    ///
+    /// Every variant, because the leak was never about one of them — it was about
+    /// `Display` being handed to the response at all, and a variant added later will be
+    /// carried into this list by the compiler rather than by anyone remembering.
+    #[tokio::test]
+    async fn a_refused_voice_listing_tells_the_caller_nothing_about_why() {
+        let carried = [
+            (TtsError::Unreachable("http://10.4.0.7:20977/v1/voices".to_owned()), "10.4.0.7"),
+            (TtsError::Refused { status: 401, body: "bad token sk-abcdef".to_owned() }, "sk-abcdef"),
+            (TtsError::Undecodable("/srv/openconv/voices/heart.onnx".to_owned()), "heart.onnx"),
+            (TtsError::Unreadable("missing `voices` at line 3".to_owned()), "line 3"),
+        ];
+
+        for (error, secret) in carried {
+            let spoken = error.to_string();
+            assert!(spoken.contains(secret), "the fixture stopped carrying {secret:?}");
+
+            let response = NoVoices(error).into_response();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("a body the caller could read");
+            let body = String::from_utf8(body.to_vec()).expect("a body that is text");
+
+            // Non-empty first: a handler that answered with nothing would keep every
+            // secret and pass every `does not contain` below without saying a word.
+            assert!(!body.is_empty(), "the caller is told nothing at all");
+            assert!(!body.contains(secret), "the 502 body leaked {secret:?}: {body}");
+            assert_ne!(body, spoken, "the 502 body is the error's own Display");
+        }
+    }
 }
