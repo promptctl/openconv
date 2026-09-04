@@ -267,6 +267,11 @@ async function join() {
   call = await Call.join({
     ...fields,
     livekitUrl: await livekitUrl(),
+    // A reader of the control rather than the voice `fields` happens to be carrying —
+    // that copy goes on to `remember` and no further. The form stays the one place that
+    // says which voice this call is in, so changing it mid-call reaches the agent through
+    // the same reader with nothing to keep in step. [LAW:one-source-of-truth]
+    chosenVoice: () => els.voice.value,
     onEvent: show,
     onTrack: (track) => track.attach(els.audio),
     onState: (state) => render(cell("room", state)),
@@ -306,6 +311,25 @@ els.join.addEventListener("click", async () => {
     // `Call.join` tears its own half-built call down, so a failure there really has
     // left nothing behind.
     showButton(call ? "leave" : "join", true);
+  }
+});
+
+// Choosing a voice during a call changes the call. Without this the control is only read
+// at the join, and the way to hear a different voice is to hang up and dial again — which
+// makes comparing two voices a thing you do from memory across two conversations.
+//
+// Nothing happens when no call is up, and that arm is complete rather than skipped: with
+// no agent anywhere there is nothing that could disagree with the form, and the next join
+// reads this same control.
+els.voice.addEventListener("change", async () => {
+  try {
+    await call?.useChosenVoice();
+  } catch (error) {
+    // The control keeps showing what was asked for. Putting it back would make the page
+    // agree with an agent nobody can hear yet, which is the silent substitution this
+    // whole control exists to prevent, one level up — so the disagreement is said out
+    // loud instead of tidied away. [LAW:no-silent-failure]
+    render(log("error", `${error} — the voice box is showing a voice this call is not using`));
   }
 });
 
