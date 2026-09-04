@@ -320,8 +320,7 @@ mod tests {
     /// already and was taken out by hand; this is what keeps it out.
     ///
     /// Every variant, because the leak was never about one of them — it was about
-    /// `Display` being handed to the response at all, and a variant added later will be
-    /// carried into this list by the compiler rather than by anyone remembering.
+    /// `Display` being handed to the response at all.
     #[tokio::test]
     async fn a_refused_voice_listing_tells_the_caller_nothing_about_why() {
         let carried = [
