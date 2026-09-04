@@ -171,35 +171,58 @@ export async function mintConversation({ openconv, apiKey, agentId, participantN
  * @param {() => object} readSettings
  */
 export function conversationWith(transport, readSettings) {
-  // Who has actually been reached, written only where a publish resolved. An agent a send
-  // failed to reach is therefore not remembered as told, and the next sweep tries it again
-  // rather than leaving it running the default conversation for the rest of the call.
-  let told = new Set();
+  // Who has been told what this conversation is, against the publish that answers for it.
+  //
+  // An identity is entered the moment its publish *starts* rather than when it settles,
+  // because two sweeps overlapping is the ordinary case here and not a rare one: an agent
+  // that arrives while `connect` is still settling is seen both by the sweep inside `open`
+  // and by the caller's own arrival handler, and the browser SDK buffers
+  // `ParticipantConnected` until the room is connected (`emitWhenConnected`) so the two
+  // land together. Recorded only on fulfilment, both sweeps read that agent as untold and
+  // both published to it. [LAW:no-ambient-temporal-coupling]
+  //
+  // Holding the publish itself rather than a flag saying one is in flight is what lets the
+  // second sweep *join* the first instead of skipping it, so `open` still does not return
+  // until the agent it found has actually been told — the order the microphone goes live
+  // behind in `caller.js`. Absent is untold, pending is being told, settled is told: one
+  // record with a state for each, rather than a second set beside this one that could
+  // disagree with it. [LAW:one-source-of-truth]
+  let telling = new Map();
 
-  /** Publishes the configuration to each of `identities`, one at a time. */
+  /** Publishes the configuration to `identity`, and stands as its record while it flies. */
+  const send = (identity, message) => {
+    const attempt = transport.publishBytes(message).catch((failure) => {
+      // Only this attempt's own claim is retracted, so an agent a send failed to reach is
+      // not remembered as told and the next sweep tries it again rather than leaving it on
+      // the default conversation for the rest of the call. Checked against the record
+      // rather than deleted outright because `everyone` forgets the map to send afresh: a
+      // stale publish failing after that would otherwise delete the newer one's claim.
+      if (telling.get(identity) === attempt) telling.delete(identity);
+
+      throw new Error(
+        `${identity} could not be told what this conversation is: ${failure.message}`,
+        { cause: failure },
+      );
+    });
+
+    telling.set(identity, attempt);
+    return attempt;
+  };
+
+  /** Publishes the configuration to each of `identities`, joining any send already flying. */
   const tell = (identities) => {
+    // Read once for the whole sweep rather than per agent, so that two agents told together
+    // are told the same thing: a control moving while the sweep runs would otherwise leave
+    // one agent on the old answer and the other on the new, with the record claiming both
+    // hold the current one. [LAW:one-source-of-truth]
     const message = new TextEncoder().encode(JSON.stringify(conversationInitiation(readSettings())));
 
     // Told one at a time so that a failure names the agent it could not reach, and so that
     // a partial failure records exactly the ones that were. Telling nobody is an empty list
     // rather than a case of its own: a room with no agent in it yet, and a room whose agent
     // has left, take the same path as a room with one. [LAW:dataflow-not-control-flow]
-    //
-    // Two arms of one `then` rather than a `then` followed by a `catch`, so that the
-    // failure arm sees only a failed publish — a `catch` downstream of the record would
-    // also swallow anything the record itself threw and report it as an unreachable agent.
     return Promise.all(
-      identities.map((identity) =>
-        transport.publishBytes(message).then(
-          () => told.add(identity),
-          (failure) => {
-            throw new Error(
-              `${identity} could not be told what this conversation is: ${failure.message}`,
-              { cause: failure },
-            );
-          },
-        ),
-      ),
+      identities.map((identity) => telling.get(identity) ?? send(identity, message)),
     );
   };
 
@@ -239,18 +262,23 @@ export function conversationWith(transport, readSettings) {
     arrived() {
       const present = new Set(transport.participants().filter(isAgent));
       // An agent that has left drops out, so one that leaves and comes back is told again.
-      told = new Set([...told].filter((identity) => present.has(identity)));
-      return tell([...present].filter((identity) => !told.has(identity)));
+      telling = new Map([...telling].filter(([identity]) => present.has(identity)));
+      return tell([...present]);
     },
 
     /**
      * Tells every agent in the room what the conversation is now, told before or not.
      *
-     * The other half of the arrival sweep, and deliberately the same send: an agent that
-     * arrives late and an agent whose settings were changed both need the current answer,
-     * and there is only one way to say it. What differs is which agents — the ones that
-     * just arrived, or everyone — so that difference is a list of identities rather than
-     * two code paths. [LAW:dataflow-not-control-flow]
+     * The other half of the arrival sweep, and not a second send but the same one: what
+     * changing the settings *means* is that nobody now holds what this conversation is, so
+     * it forgets who was told and runs the arrival sweep, which then owes everybody. An
+     * agent that arrives late and an agent whose settings were changed need the current
+     * answer for the same reason, and there is one path that says it.
+     * [LAW:dataflow-not-control-flow]
+     *
+     * Forgetting rather than re-sending over the record is also what keeps a send already
+     * in flight from being joined by mistake: that one carries the settings the caller has
+     * just moved off, and a sweep that reused it would report the new ones as delivered.
      *
      * The agent takes a second message the same way it took the first: openconv re-settles
      * its `SessionConfig` on every `ConversationInitiation`. Since the message names every
@@ -258,7 +286,8 @@ export function conversationWith(transport, readSettings) {
      * caller is asking for now — it is not a patch, and was never treated as one.
      */
     everyone() {
-      return tell(transport.participants().filter(isAgent));
+      telling = new Map();
+      return this.arrived();
     },
   };
 }
