@@ -25,6 +25,13 @@ import {
   TrackSource,
 } from "@livekit/rtc-node";
 
+// The handshake, shared with the browser page that `web/caller.js` drives. Imported off
+// the filesystem here and fetched from `/call/conversation.js` there; one file either
+// way, which is the point — these two used to hold the sequence separately and drifted,
+// and the page spent months configuring nothing while this side's runs stayed green.
+// [LAW:one-source-of-truth]
+import { conversationOf, conversationWith, isAgent } from "../../web/conversation.js";
+
 /// Frames arrive and are captured in ten-millisecond units, on both sides of the room.
 const FRAMES_PER_SECOND = 100;
 
@@ -340,17 +347,16 @@ export class Caller {
     xiApiKey,
     participantName = "u_acceptance",
     agentId = "agent_happy",
+    settings = {},
   }) {
-    const mint = new URL(`${openconv.replace(/\/$/, "")}/v1/convai/conversation/token`);
-    mint.searchParams.set("agent_id", agentId);
-    mint.searchParams.set("participant_name", participantName);
-
-    const response = await fetch(mint, { headers: { "xi-api-key": xiApiKey } });
-    if (!response.ok) {
-      throw new Error(`mint failed: HTTP ${response.status} ${await response.text()}`);
-    }
-    const { token } = await response.json();
-    return Caller.at(livekitUrl, token);
+    const caller = new Caller(null, livekitUrl, settings);
+    caller.conversationId = await caller.conversation.open({
+      openconv,
+      apiKey: xiApiKey,
+      agentId,
+      participantName,
+    });
+    return caller;
   }
 
   /**
@@ -361,25 +367,59 @@ export class Caller {
    * in it, and building a second client to get one would mean measuring a different
    * program than the acceptance scripts run.
    *
-   * The room name is read from the token rather than passed beside it, because the two
-   * cannot then disagree. For a conversation that name *is* the conversation ID, which is
-   * how both of Happy's clients recover it.
+   * No configuration is published, because there is nobody to publish it to: this is the
+   * path for a room openconv never minted. `join` is the one that opens a *conversation*,
+   * and it is the one that runs the handshake.
    */
   static async at(livekitUrl, token) {
-    const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64").toString());
-    const caller = new Caller(claims.video.room, livekitUrl);
-
-    await Promise.race([
-      caller.room.connect(livekitUrl, token, { autoSubscribe: true, dynacast: false }),
-      rejectAfter(20_000, "the room connection"),
-    ]);
+    const caller = new Caller(conversationOf(token), livekitUrl);
+    await caller.transport.connect(token);
     return caller;
   }
 
-  constructor(conversationId, livekitUrl) {
+  constructor(conversationId, livekitUrl, settings = {}) {
     this.conversationId = conversationId;
     this.livekitUrl = livekitUrl;
     this.room = new Room();
+
+    /**
+     * The three room operations the shared handshake drives, in this SDK's terms.
+     *
+     * `autoSubscribe` and `dynacast` are this side's business and stay here: they are how
+     * @livekit/rtc-node spells "hear everything published", which a browser does by
+     * default and which no part of saying what a conversation is depends on.
+     * [LAW:locality-or-seam]
+     */
+    this.transport = {
+      connect: (token) =>
+        Promise.race([
+          this.room.connect(livekitUrl, token, { autoSubscribe: true, dynacast: false }),
+          rejectAfter(20_000, "the room connection"),
+        ]),
+      participants: () => this.roster(),
+      publishBytes: (payload) =>
+        this.room.localParticipant.publishData(payload, { reliable: true }),
+    };
+
+    /**
+     * This conversation, and what its agents have been told about it.
+     *
+     * The settings are fixed for a run — a script asserts what a call *was* configured
+     * as — so the reader the shared module wants always answers the same thing. That is
+     * the same code path the page takes with a reader that answers differently every
+     * time, not a simpler one. [LAW:dataflow-not-control-flow]
+     */
+    this.conversation = conversationWith(this.transport, () => settings);
+
+    /**
+     * Whatever configuring is still in flight, so a script can wait for it.
+     *
+     * An agent dispatched by the mint is usually in the room before this client, and one
+     * that takes longer arrives on an event — two orders, and the message reaches only
+     * whoever is in the room when it is published. Holding the promise is what lets
+     * `agentConfigured` mean the same thing in both. [LAW:no-ambient-temporal-coupling]
+     */
+    this.configuring = Promise.resolve();
 
     /** Every control event the agent published, in arrival order. */
     this.controlEvents = [];
@@ -406,7 +446,17 @@ export class Caller {
         this.controlEvents.push({ type: "<not json>", raw: text });
       }
     });
-    this.room.on(RoomEvent.ParticipantConnected, (p) => this.participants.push(p.identity));
+    this.room.on(RoomEvent.ParticipantConnected, (p) => {
+      this.participants.push(p.identity);
+
+      // A late agent is told the moment it arrives, off the shared module's own diff, so
+      // the two arrival orders are one path. Deliberately not caught: an acceptance run
+      // whose agent never learned what the conversation is would otherwise go on to
+      // assert against the default prompt and report a green pass on a conversation
+      // nobody configured. Unhandled here, node prints it and exits non-zero.
+      // [LAW:no-silent-failure]
+      this.configuring = this.configuring.then(() => this.conversation.arrived());
+    });
 
     /**
      * Who the SFU has said is talking.
@@ -491,8 +541,23 @@ export class Caller {
 
   /** True once an agent is present, whether it joined before or after this caller. */
   agentPresent() {
-    const isAgent = (identity) => identity.startsWith("agent_");
     return this.participants.some(isAgent) || this.roster().some(isAgent);
+  }
+
+  /**
+   * Waits until an agent is in the room *and* holding this conversation's configuration.
+   *
+   * One call rather than the two lines every script used to write — wait for the agent,
+   * then publish the configuration — because those two lines were an ordering that had to
+   * be remembered, and two of the seven scripts did not: they published before waiting,
+   * and reached the agent only because publishing a microphone happened to wait for a
+   * subscriber first. That is the kind of correctness that holds until something else
+   * gets faster. [LAW:no-ambient-temporal-coupling]
+   */
+  async agentConfigured(ms = 25_000) {
+    const present = await this.waitFor(() => this.agentPresent(), ms, "the agent");
+    await this.configuring;
+    return present;
   }
 
   /** Publishes one client control event, as the SDK does over the data channel. */

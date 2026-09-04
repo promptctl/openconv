@@ -157,6 +157,88 @@ mod tests {
             .collect()
     }
 
+    /// Every caller now sends the same message shape whether it overrides anything or
+    /// not, with `null` standing where nothing was asked for — see `web/conversation.js`,
+    /// which is the one place any of them builds it. That only holds together if a
+    /// message full of nulls means "use the defaults", so this is the claim that lets the
+    /// acceptance runs which used to send *nothing* take the same path as the ones which
+    /// always configured: settling this payload has to land exactly where
+    /// `crates/openconv-agent/src/lib.rs` starts a conversation before any client speaks.
+    #[test]
+    fn a_message_that_overrides_nothing_settles_where_a_conversation_starts() {
+        let sent: ConversationInitiationClientData = serde_json::from_str(
+            r#"{
+                "conversation_config_override": {
+                    "agent": {"prompt": {"prompt": null}, "first_message": null, "language": null},
+                    "tts": {"voice_id": null, "model_id": null}
+                },
+                "dynamic_variables": null
+            }"#,
+        )
+        .expect("the message every caller sends");
+
+        assert_eq!(
+            SessionConfig::settle("default prompt", sent),
+            SessionConfig::settle("default prompt", Default::default()),
+        );
+    }
+
+    /// The same message with every setting filled in, which is the other half of the
+    /// contract: that each one lands where the caller meant it to and not merely that the
+    /// message parses. A field renamed on this side goes on deserializing perfectly — it
+    /// simply stops being read, and the override silently reverts to the default, which is
+    /// this ticket's own bug wearing a different hat. Here that shows up as a failed
+    /// assertion instead of as a conversation running on a prompt nobody chose.
+    ///
+    /// Written out as the wire bytes rather than built from the types, because the types
+    /// are what is under test. `web/conversation.js` is the only thing that produces this
+    /// shape and `web/conversation.test.mjs` pins the identical bytes from that side, so
+    /// the two ends of one wire are each nailed down where they can be checked without the
+    /// other running. [LAW:one-source-of-truth]
+    #[test]
+    fn every_setting_a_caller_can_express_reaches_the_conversation() {
+        let sent: ConversationInitiationClientData = serde_json::from_str(
+            r#"{
+                "conversation_config_override": {
+                    "agent": {
+                        "prompt": {"prompt": "you are a voice interface"},
+                        "first_message": "ready when you are",
+                        "language": "es"
+                    },
+                    "tts": {"voice_id": "bm_george", "model_id": "piper"}
+                },
+                "dynamic_variables": {"sessionId": "sess_42"}
+            }"#,
+        )
+        .expect("the message every caller sends");
+
+        let config = SessionConfig::settle("unused default", sent);
+
+        assert_eq!(config.system_prompt, "you are a voice interface");
+        assert_eq!(config.first_message.as_deref(), Some("ready when you are"));
+        assert_eq!(config.voicing.language, Some(Language::Es));
+        assert_eq!(config.voicing.voice_id.as_deref(), Some("bm_george"));
+        assert_eq!(config.voicing.model_id.as_deref(), Some("piper"));
+    }
+
+    /// An explicit null and an omitted field are the same answer, which is what lets the
+    /// one builder emit a fixed shape rather than assembling itself out of whichever
+    /// settings happen to be set. Asserted on the axis where getting it wrong is silent:
+    /// `""` would reach the text-to-speech server as a voice id to resolve.
+    #[test]
+    fn a_null_and_a_blank_both_mean_no_particular_voice() {
+        let voiced = |json: &str| {
+            let sent: ConversationInitiationClientData =
+                serde_json::from_str(json).expect("a client message");
+            SessionConfig::settle("unused", sent).voicing
+        };
+
+        let nothing = voiced(r#"{"conversation_config_override": {"tts": {"voice_id": null}}}"#);
+        assert_eq!(nothing.voice_id, None);
+        assert_eq!(voiced(r#"{"conversation_config_override": {"tts": {"voice_id": ""}}}"#), nothing);
+        assert_eq!(voiced(r#"{"conversation_config_override": {"tts": {}}}"#), nothing);
+    }
+
     #[test]
     fn an_absent_override_leaves_the_default_prompt() {
         let config = SessionConfig::settle("default prompt", Default::default());

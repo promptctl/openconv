@@ -82,19 +82,25 @@ const transcripts = (caller) =>
     event.type === "user_transcript" || event.type === "tentative_user_transcript",
   );
 
-const caller = await Caller.join({ openconv, livekitUrl, xiApiKey });
+// No `firstMessage`: a configured greeting is a legitimate `agent_response`, and one
+// arriving during the silence window would be indistinguishable from the failure.
+const caller = await Caller.join({
+  openconv,
+  livekitUrl,
+  xiApiKey,
+  settings: { prompt: PROMPT },
+});
+
+// Waited for rather than assumed. This used to publish the configuration and then open
+// the microphone, and reached the agent only because opening one waits for a subscriber —
+// so the ordering held by way of an unrelated wait rather than by anything saying so.
+// [LAW:no-ambient-temporal-coupling]
+await caller.agentConfigured();
 
 // Published before anything is sent, the way a real caller joins: it is what makes the
 // silence below meaningful. An agent with no track to listen to is quiet for a reason
 // that has nothing to do with this ticket.
 await caller.microphone();
-
-// No `first_message`: a configured greeting is a legitimate `agent_response`, and one
-// arriving during the silence window would be indistinguishable from the failure.
-await caller.send({
-  type: "conversation_initiation_client_data",
-  conversation_config_override: { agent: { prompt: { prompt: PROMPT } } },
-});
 
 checks.record(
   "the conversation was announced",

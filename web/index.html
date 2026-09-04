@@ -71,7 +71,8 @@
   }
 
   input,
-  select {
+  select,
+  textarea {
     font: inherit;
     background: var(--bg);
     color: var(--text);
@@ -79,6 +80,20 @@
     border-radius: 4px;
     padding: 0.4rem 0.6rem;
     min-width: 16ch;
+  }
+
+  /* The one control whose useful values run to sentences rather than words. It grows to
+     the row and wraps, so a prompt long enough to be worth testing is readable while it
+     is being typed. */
+  textarea {
+    flex: 1;
+    min-width: 32ch;
+    resize: vertical;
+  }
+
+  label.wide {
+    flex: 1;
+    min-width: 32ch;
   }
 
   button {
@@ -219,7 +234,39 @@
       <option value="">deployment default</option>
     </select>
   </label>
+  <!--
+    Closed for the same reason the voice list is, and a harder failure if it were not: a
+    code openconv's `Language` does not name fails the *whole* control message to
+    deserialize, so a stale option here would drop the prompt and the voice along with the
+    language and leave the conversation on the deployment default in silence. The options
+    come from `/call/config`, which answers from `Language::ALL`.
+  -->
+  <label>
+    language
+    <select id="language">
+      <!-- No language, which is the agent auto-detecting rather than a language named. -->
+      <option value="">auto</option>
+    </select>
+  </label>
   <button id="join">join</button>
+</fieldset>
+
+<!--
+  The two overrides that are sentences, on a row of their own because they need the width.
+  Both are live: changing either during a call re-settles the conversation, which for the
+  first message means the agent opens again — that is how you hear one greeting in two
+  voices without hanging up, and it is why the control is here rather than read once at
+  the join.
+-->
+<fieldset>
+  <label class="wide">
+    first message
+    <input id="first-message" placeholder="the agent's opening line — blank for none" />
+  </label>
+  <label class="wide">
+    prompt
+    <textarea id="prompt" rows="2" placeholder="system prompt — blank uses the deployment's"></textarea>
+  </label>
 </fieldset>
 
 <!--

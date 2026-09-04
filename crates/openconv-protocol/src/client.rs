@@ -205,3 +205,50 @@ pub enum Language {
     Vi,
     Tl,
 }
+
+impl Language {
+    /// Every language a client may ask for, for anything that has to *offer* the choice.
+    ///
+    /// The browser page builds its language control from this, by way of `/call/config`.
+    /// It cannot ship the list in its own markup: a code outside the closed union fails
+    /// the whole message to deserialize, so one stale option in a dropdown does not
+    /// degrade to a wrong language — it silently drops the prompt, the voice and the
+    /// first message along with it, and the conversation runs on the deployment default
+    /// with nothing anywhere saying why. Served from here so the page offers exactly what
+    /// this crate accepts. [LAW:one-source-of-truth]
+    ///
+    /// Be straight about what does and does not check this. Rust cannot enumerate an
+    /// enum's variants without a derive this crate does not depend on, so this is a list
+    /// a person maintains, not one the compiler fills in. What holds it down is
+    /// `languages_travel_as_their_published_codes`, which asserts this list and the wire
+    /// codes that test transcribes cover each other exactly — so a variant reaching one
+    /// of the two and not the other is a failing test rather than a quiet difference. A
+    /// variant added to the enum and to *neither* is caught by nothing, which was equally
+    /// true before this constant existed.
+    pub const ALL: &'static [Language] = &[
+        Language::En, Language::Ja, Language::Zh, Language::De, Language::Hi, Language::Fr,
+        Language::Ko, Language::Pt, Language::PtBr, Language::It, Language::Es, Language::Id,
+        Language::Nl, Language::Tr, Language::Pl, Language::Sv, Language::Bg, Language::Ro,
+        Language::Ar, Language::Cs, Language::El, Language::Fi, Language::Ms, Language::Da,
+        Language::Ta, Language::Uk, Language::Ru, Language::Hu, Language::Hr, Language::Sk,
+        Language::No, Language::Vi, Language::Tl,
+    ];
+
+    /// The code this language travels as on the wire.
+    ///
+    /// Read back out of serde rather than written out again here. The mapping from
+    /// variant to code is already stated once, by the `rename_all` on the enum and the
+    /// one `rename` that departs from it — and a second copy of thirty-two entries is a
+    /// table that goes wrong in exactly one row, silently, for whichever language nobody
+    /// is testing in. [LAW:one-source-of-truth]
+    ///
+    /// Costs an allocation, which is what buys the guarantee. Its caller is a log line
+    /// written once per conversation.
+    pub fn code(self) -> String {
+        let serde_json::Value::String(code) = serde_json::to_value(self).expect("serializes")
+        else {
+            unreachable!("a unit variant with no data serializes as a string")
+        };
+        code
+    }
+}
