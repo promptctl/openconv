@@ -268,6 +268,29 @@ async function livekitUrl() {
   return (await response.json()).livekit_url;
 }
 
+/**
+ * Tells the call which voice the form is showing, and says so out loud when it cannot.
+ *
+ * The one place a voice reaches an agent from this page, used by the join and by the
+ * control's own change event, so a voice this page put in the box and a voice the caller
+ * put there cannot travel by two paths that fail differently. [LAW:single-enforcer]
+ *
+ * A failure leaves the control showing what was asked for. Putting it back would make the
+ * page agree with an agent nobody can hear yet, which is the silent substitution this
+ * whole control exists to prevent, one level up. [LAW:no-silent-failure]
+ *
+ * Nothing happens when no call is up, and that arm is complete rather than skipped: with
+ * no agent anywhere there is nothing that could disagree with the form, and every join
+ * ends by sending this same control.
+ */
+async function sendChosenVoice() {
+  try {
+    await call?.useChosenVoice();
+  } catch (error) {
+    render(log("error", `${error} — the voice box is showing a voice this call is not using`));
+  }
+}
+
 async function join() {
   const fields = readForm();
   showButton("joining…", false);
@@ -288,6 +311,13 @@ async function join() {
     // different problem from one that arrived and stayed quiet.
     onPresence: (identity, presence) => render(log("system", `${identity} ${presence}`)),
   });
+
+  // A voice list that arrived while this join was in flight has already written the
+  // control and dispatched its change at a `call` that was still null. Sent once here,
+  // with nothing awaited between the assignment above and this line, so no dispatch can
+  // land in the gap and every join ends with the agent holding what the form shows —
+  // whichever of the two settled last. [LAW:no-ambient-temporal-coupling]
+  await sendChosenVoice();
 
   remember(fields);
   render(cell("call", call.conversationId));
@@ -325,20 +355,6 @@ els.join.addEventListener("click", async () => {
 // Choosing a voice during a call changes the call. Without this the control is only read
 // at the join, and the way to hear a different voice is to hang up and dial again — which
 // makes comparing two voices a thing you do from memory across two conversations.
-//
-// Nothing happens when no call is up, and that arm is complete rather than skipped: with
-// no agent anywhere there is nothing that could disagree with the form, and the next join
-// reads this same control.
-els.voice.addEventListener("change", async () => {
-  try {
-    await call?.useChosenVoice();
-  } catch (error) {
-    // The control keeps showing what was asked for. Putting it back would make the page
-    // agree with an agent nobody can hear yet, which is the silent substitution this
-    // whole control exists to prevent, one level up — so the disagreement is said out
-    // loud instead of tidied away. [LAW:no-silent-failure]
-    render(log("error", `${error} — the voice box is showing a voice this call is not using`));
-  }
-});
+els.voice.addEventListener("change", sendChosenVoice);
 
 offerVoices(seedFields().voiceId);

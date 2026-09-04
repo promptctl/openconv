@@ -183,11 +183,7 @@ impl Tts {
             .await
             .map_err(|error| TtsError::Unreachable(with_cause(&error)))?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(TtsError::Refused { status: status.as_u16(), body });
-        }
+        let response = ok_or_refused(response).await?;
 
         // `StreamReader` needs one error type, and the only thing downstream does with
         // this one is report it, so the HTTP failure is carried through as its message.
@@ -221,11 +217,7 @@ impl Tts {
             .await
             .map_err(|error| TtsError::Unreachable(with_cause(&error)))?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(TtsError::Refused { status: status.as_u16(), body });
-        }
+        let response = ok_or_refused(response).await?;
 
         // Parsed rather than passed through. Every field this drops is one the page
         // would otherwise be free to start reading, and every field it keeps is one a
@@ -294,6 +286,26 @@ struct Request<'a> {
     model_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     language_code: Option<Language>,
+}
+
+/// A response the far side did not answer successfully, as the refusal this module
+/// speaks in.
+///
+/// One place rather than one per request. Both requests here refuse the same way, and a
+/// rule enforced at two checkpoints is two rules the first time either is edited — a cap
+/// on how much of the body is carried, or a header read out of it, would otherwise have
+/// to be written twice and would be wrong the once it was not. [LAW:single-enforcer]
+///
+/// The body is taken because a refusal is the one case where the far side explains
+/// itself; `unwrap_or_default` because a body that cannot be read is an empty
+/// explanation, not a second failure to report over the top of this one.
+async fn ok_or_refused(response: reqwest::Response) -> Result<reqwest::Response, TtsError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    Err(TtsError::Refused { status: status.as_u16(), body: response.text().await.unwrap_or_default() })
 }
 
 /// Everything but the network, for the tests: decodes bytes already in hand.

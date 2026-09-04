@@ -69,6 +69,19 @@ const isAgent = (identity) => identity.startsWith("agent_");
  * is an empty list rather than a case: a room with no agent in it yet, and a room whose
  * agent has left, both take the same path as a room with one. [LAW:dataflow-not-control-flow]
  */
+/**
+ * Reports a failure nobody is waiting on, by letting the page's own reporter have it.
+ *
+ * Re-raised rather than swallowed: a caller who is about to hear the wrong voice should
+ * be told, and the banner in `index.html` is where this page says so. Detached because
+ * the awaiting code has decided the failure is not worth its own operation.
+ * [LAW:no-silent-failure]
+ */
+const reportDetached = (failure) =>
+  queueMicrotask(() => {
+    throw failure;
+  });
+
 const tellAgents = (room, present, voiceId) =>
   Promise.all(
     present.filter(isAgent).map((identity) =>
@@ -197,9 +210,8 @@ export class Call {
       // dispatched by the mint is found by the sweep, and one that takes longer to arrive
       // is found by the event, each exactly once.
       //
-      // The promise is returned rather than dropped so the sweep inside `join` can wait
-      // on it and fail the join loudly. Reached from an event handler there is nobody to
-      // hand it to, and a rejection there travels to the page's own `unhandledrejection`
+      // The promise is returned rather than dropped so `join` can order its sweep against
+      // the microphone. Either way a rejection reaches the page's `unhandledrejection`
       // reporter, which is what that reporter is for. [LAW:no-silent-failure]
       return tellAgents(room, arrived, chosenVoice());
     };
@@ -230,7 +242,11 @@ export class Call {
       // sweep is also what configures an agent that is already here, and the microphone
       // goes live on the next line. An agent told which voice to use after the caller
       // could already be speaking is an agent that changes voice partway through a reply.
-      await reportPresence();
+      //
+      // Awaited for that ordering and not for its success: a configure that fails costs
+      // this call the voice that was chosen, where failing the join would cost the call
+      // itself over a dropdown.
+      await reportPresence().catch(reportDetached);
 
       await room.localParticipant.publishTrack(microphone, {
         source: Track.Source.Microphone,
