@@ -45,9 +45,10 @@ const isAgent = (identity) => identity.startsWith("agent_");
  * Reports a failure nobody is waiting on, by letting the page's own reporter have it.
  *
  * Re-raised rather than swallowed: a caller who is about to hear the wrong voice should
- * be told, and the banner in `index.html` is where this page says so. Detached because
- * the awaiting code has decided the failure is not worth its own operation.
- * [LAW:no-silent-failure]
+ * be told, and the banner in `index.html` is where this page says so — reached as an
+ * uncaught exception, so by that page's capturing `error` listener and not its
+ * `unhandledrejection` one. Detached because the awaiting code has decided the failure is
+ * not worth its own operation. [LAW:no-silent-failure]
  */
 const reportDetached = (failure) =>
   queueMicrotask(() => {
@@ -211,8 +212,9 @@ export class Call {
       // is found by the event, each exactly once.
       //
       // The promise is returned rather than dropped so `join` can order its sweep against
-      // the microphone. Either way a rejection reaches the page's `unhandledrejection`
-      // reporter, which is what that reporter is for. [LAW:no-silent-failure]
+      // the microphone. Dropped from an event handler a rejection reaches the page's
+      // failure banner unhandled; `join` hands its own to `reportDetached`.
+      // [LAW:no-silent-failure]
       return tellAgents(room, arrived, chosenVoice());
     };
 
