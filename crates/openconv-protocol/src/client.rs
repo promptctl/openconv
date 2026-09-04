@@ -220,8 +220,8 @@ impl Language {
     /// Be straight about what does and does not check this. Rust cannot enumerate an
     /// enum's variants without a derive this crate does not depend on, so this is a list
     /// a person maintains, not one the compiler fills in. What holds it down is
-    /// `languages_travel_as_their_published_codes`, which asserts this list and the wire
-    /// codes that test transcribes cover each other exactly — so a variant reaching one
+    /// `closed_vocabularies_match_their_published_names`, which asserts this list and the
+    /// wire codes that test transcribes cover each other exactly — so a variant reaching one
     /// of the two and not the other is a failing test rather than a quiet difference. A
     /// variant added to the enum and to *neither* is caught by nothing, which was equally
     /// true before this constant existed.
@@ -242,8 +242,7 @@ impl Language {
     /// table that goes wrong in exactly one row, silently, for whichever language nobody
     /// is testing in. [LAW:one-source-of-truth]
     ///
-    /// Costs an allocation, which is what buys the guarantee. Its caller is a log line
-    /// written once per conversation.
+    /// Costs an allocation, which is what buys the guarantee.
     pub fn code(self) -> String {
         let serde_json::Value::String(code) = serde_json::to_value(self).expect("serializes")
         else {
