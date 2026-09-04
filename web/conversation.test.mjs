@@ -192,6 +192,26 @@ test("a send that fails names the agent it could not be delivered to", async () 
   });
 });
 
+test("an agent a send failed to reach is told again on the next sweep", async () => {
+  // The room does not put itself right, so the next sweep is the only thing that can — and
+  // it cannot, if a publish that never landed was recorded as though it had. An agent left
+  // in that state runs the deployment default for the rest of the call while the roster
+  // says it was told.
+  const published = [];
+  let reachable = false;
+  const transport = transportOf(["agent_one"], async (payload) => {
+    if (!reachable) throw new Error("data channel closed");
+    published.push(JSON.parse(new TextDecoder().decode(payload)));
+  });
+  const conversation = conversationWith(transport, () => voiced("af_heart"));
+
+  await assert.rejects(conversation.arrived());
+  reachable = true;
+  await conversation.arrived();
+
+  assert.equal(published.length, 1, "the agent the failed send never reached is told again");
+});
+
 test("opening connects before it configures, and configures before it returns", async () => {
   // The sequence, asserted as a sequence. An agent told which voice to use after the
   // caller's microphone is live is an agent that changes voice partway through a reply,
