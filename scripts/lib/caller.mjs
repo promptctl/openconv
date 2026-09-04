@@ -412,14 +412,21 @@ export class Caller {
     this.conversation = conversationWith(this.transport, () => settings);
 
     /**
-     * Whatever configuring is still in flight, so a script can wait for it.
+     * Every attempt to tell an agent what this conversation is, so a script can wait for
+     * all of them.
      *
      * An agent dispatched by the mint is usually in the room before this client, and one
      * that takes longer arrives on an event — two orders, and the message reaches only
-     * whoever is in the room when it is published. Holding the promise is what lets
+     * whoever is in the room when it is published. Holding the attempts is what lets
      * `agentConfigured` mean the same thing in both. [LAW:no-ambient-temporal-coupling]
+     *
+     * A list, rather than one promise each arrival chains a `then` onto. A chain carries
+     * two facts in one value — the attempts made, and the outcome to wait on — and nothing
+     * runs after a rejection in a chain, so one failed publish would stop every later
+     * agent from being told at all while re-reporting the first agent's error for the rest
+     * of the run. Attempts that cannot reach each other cannot do that.
      */
-    this.configuring = Promise.resolve();
+    this.configuring = [];
 
     /** Every control event the agent published, in arrival order. */
     this.controlEvents = [];
@@ -455,7 +462,7 @@ export class Caller {
       // assert against the default prompt and report a green pass on a conversation
       // nobody configured. Unhandled here, node prints it and exits non-zero.
       // [LAW:no-silent-failure]
-      this.configuring = this.configuring.then(() => this.conversation.arrived());
+      this.configuring.push(this.conversation.arrived());
     });
 
     /**
@@ -556,7 +563,15 @@ export class Caller {
    */
   async agentConfigured(ms = 25_000) {
     const present = await this.waitFor(() => this.agentPresent(), ms, "the agent");
-    await this.configuring;
+
+    // Bounded like every other room operation here. A publish that rejects ends the run
+    // with its own message, but one that never settles at all — a stalled data channel —
+    // would otherwise hang the script forever with nothing said, which is the one failure
+    // this module's timeouts exist to make impossible. [LAW:no-silent-failure]
+    await Promise.race([
+      Promise.all(this.configuring),
+      rejectAfter(ms, "the agent to be told what this conversation is"),
+    ]);
     return present;
   }
 

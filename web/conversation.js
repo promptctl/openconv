@@ -171,27 +171,34 @@ export async function mintConversation({ openconv, apiKey, agentId, participantN
  * @param {() => object} readSettings
  */
 export function conversationWith(transport, readSettings) {
-  // Who has already been told. A departed agent drops out of this by construction — the
-  // set is replaced by the roster rather than added to — so one that leaves and comes back
-  // is told again, which is what it needs.
+  // Who has actually been reached, written only where a publish resolved. An agent a send
+  // failed to reach is therefore not remembered as told, and the next sweep tries it again
+  // rather than leaving it running the default conversation for the rest of the call.
   let told = new Set();
 
   /** Publishes the configuration to each of `identities`, one at a time. */
   const tell = (identities) => {
     const message = new TextEncoder().encode(JSON.stringify(conversationInitiation(readSettings())));
 
-    // Told one at a time so that a failure names the agent it could not reach. Telling
-    // nobody is an empty list rather than a case of its own: a room with no agent in it
-    // yet, and a room whose agent has left, take the same path as a room with one.
-    // [LAW:dataflow-not-control-flow]
+    // Told one at a time so that a failure names the agent it could not reach, and so that
+    // a partial failure records exactly the ones that were. Telling nobody is an empty list
+    // rather than a case of its own: a room with no agent in it yet, and a room whose agent
+    // has left, take the same path as a room with one. [LAW:dataflow-not-control-flow]
+    //
+    // Two arms of one `then` rather than a `then` followed by a `catch`, so that the
+    // failure arm sees only a failed publish — a `catch` downstream of the record would
+    // also swallow anything the record itself threw and report it as an unreachable agent.
     return Promise.all(
       identities.map((identity) =>
-        transport.publishBytes(message).catch((failure) => {
-          throw new Error(
-            `${identity} could not be told what this conversation is: ${failure.message}`,
-            { cause: failure },
-          );
-        }),
+        transport.publishBytes(message).then(
+          () => told.add(identity),
+          (failure) => {
+            throw new Error(
+              `${identity} could not be told what this conversation is: ${failure.message}`,
+              { cause: failure },
+            );
+          },
+        ),
       ),
     );
   };
@@ -231,9 +238,9 @@ export function conversationWith(transport, readSettings) {
      */
     arrived() {
       const present = new Set(transport.participants().filter(isAgent));
-      const arrivals = [...present].filter((identity) => !told.has(identity));
-      told = present;
-      return tell(arrivals);
+      // An agent that has left drops out, so one that leaves and comes back is told again.
+      told = new Set([...told].filter((identity) => present.has(identity)));
+      return tell([...present].filter((identity) => !told.has(identity)));
     },
 
     /**
@@ -251,9 +258,7 @@ export function conversationWith(transport, readSettings) {
      * caller is asking for now — it is not a patch, and was never treated as one.
      */
     everyone() {
-      const present = transport.participants().filter(isAgent);
-      told = new Set(present);
-      return tell(present);
+      return tell(transport.participants().filter(isAgent));
     },
   };
 }
