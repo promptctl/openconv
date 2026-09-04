@@ -42,6 +42,19 @@ import {
 const isAgent = (identity) => identity.startsWith("agent_");
 
 /**
+ * Reports a failure nobody is waiting on, by letting the page's own reporter have it.
+ *
+ * Re-raised rather than swallowed: a caller who is about to hear the wrong voice should
+ * be told, and the banner in `index.html` is where this page says so. Detached because
+ * the awaiting code has decided the failure is not worth its own operation.
+ * [LAW:no-silent-failure]
+ */
+const reportDetached = (failure) =>
+  queueMicrotask(() => {
+    throw failure;
+  });
+
+/**
  * Tells the agents among `present` what this call should sound like.
  *
  * The message the SDK opens every conversation with, carrying only the voice. An
@@ -69,19 +82,6 @@ const isAgent = (identity) => identity.startsWith("agent_");
  * is an empty list rather than a case: a room with no agent in it yet, and a room whose
  * agent has left, both take the same path as a room with one. [LAW:dataflow-not-control-flow]
  */
-/**
- * Reports a failure nobody is waiting on, by letting the page's own reporter have it.
- *
- * Re-raised rather than swallowed: a caller who is about to hear the wrong voice should
- * be told, and the banner in `index.html` is where this page says so. Detached because
- * the awaiting code has decided the failure is not worth its own operation.
- * [LAW:no-silent-failure]
- */
-const reportDetached = (failure) =>
-  queueMicrotask(() => {
-    throw failure;
-  });
-
 const tellAgents = (room, present, voiceId) =>
   Promise.all(
     present.filter(isAgent).map((identity) =>
