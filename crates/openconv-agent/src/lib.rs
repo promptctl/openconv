@@ -485,7 +485,16 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                     }
                 };
 
-                config = SessionConfig::settle(&services.default_prompt, *client_data);
+                // Settled beside the configuration it replaces rather than over it, because
+                // what this message owes the caller is a fact about the *change* and not
+                // about the message: the client publishes every field on every change, so
+                // the greeting arrives again each time a voice or a language is picked.
+                // See `SessionConfig::opening_after`, which is where that is decided and
+                // where it can be tested. [LAW:effects-at-boundaries]
+                let settled = SessionConfig::settle(&services.default_prompt, *client_data);
+                let opening = settled.opening_after(&config).map(str::to_owned);
+                config = settled;
+
                 tracing::info!(
                     conversation = %assignment.conversation_id,
                     prompt_chars = config.system_prompt.len(),
@@ -523,7 +532,7 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                 // Not recorded in `history` here: the turn reports what it said the
                 // moment it has said it, and recording it in both places would give the
                 // model the greeting twice.
-                if let Some(greeting) = config.first_message.clone() {
+                if let Some(greeting) = opening {
                     match control.is_some() {
                         true => {
                             answering = Some(start_turn(

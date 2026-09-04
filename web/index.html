@@ -253,10 +253,15 @@
 
 <!--
   The two overrides that are sentences, on a row of their own because they need the width.
-  Both are live: changing either during a call re-settles the conversation, which for the
-  first message means the agent opens again — that is how you hear one greeting in two
-  voices without hanging up, and it is why the control is here rather than read once at
-  the join.
+  Both are live: changing either during a call re-settles the conversation, and the first
+  message is the one control that reopens it — naming a new opening line is a request to
+  hear it, which is why it is read on every change rather than once at the join.
+
+  The voice and the language re-settle how the reply is spoken and start no turn. They used
+  to reopen the conversation as well, which read as a way to hear one greeting in two
+  voices; what it did was introduce the agent over its own half-finished answer, and leave
+  that answer speaking with nothing able to interrupt it. Auditioning a voice is therefore
+  changing this line, or rejoining.
 -->
 <fieldset>
   <label class="wide">

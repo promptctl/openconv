@@ -78,6 +78,32 @@ impl SessionConfig {
             },
         }
     }
+
+    /// The opening line this configuration owes the caller, given the one it replaces.
+    ///
+    /// A first message *opens* a conversation, and a conversation opens once — so read off
+    /// the difference rather than off the message, the greeting follows the caller naming a
+    /// *new* opening line and nothing else. "The client sent a first message" and "the
+    /// client asked to be greeted" were the same fact only while one control could send
+    /// one: every control on the page now publishes the whole configuration on every
+    /// change, which is what lets one message shape serve every caller
+    /// (`web/conversation.js`), and it means a voice picked mid-call arrives carrying the
+    /// greeting the caller has already heard.
+    ///
+    /// What answering that off the message costs, rather than merely a greeting twice: the
+    /// loop starts a second turn over the one it is already speaking, and since a turn is
+    /// only ever cancelled through `stop_answering`, the first is not stopped but orphaned
+    /// — still speaking, with nothing holding its token left to interrupt it.
+    ///
+    /// There is no "nothing came before" arm because there is no such state: a conversation
+    /// starts settled from an empty payload, whose `first_message` is already `None`, so the
+    /// first configuration to name a greeting differs from it and owes it.
+    /// [LAW:dataflow-not-control-flow]
+    pub fn opening_after(&self, previous: &Self) -> Option<&str> {
+        self.first_message
+            .as_deref()
+            .filter(|line| previous.first_message.as_deref() != Some(*line))
+    }
 }
 
 /// Replaces `{{name}}` placeholders with the client's dynamic variables.
@@ -339,6 +365,95 @@ mod tests {
             }),
         );
         assert_eq!(blank.first_message, None, "whitespace is not a greeting");
+    }
+
+    /// One caller's configuration as the page actually publishes it: every field named
+    /// every time, which is the shape that made the greeting stop meaning "greet me".
+    fn published(
+        first_message: Option<&str>,
+        voice: Option<&str>,
+        language: Option<Language>,
+    ) -> SessionConfig {
+        SessionConfig::settle(
+            "default prompt",
+            ConversationInitiationClientData {
+                conversation_config_override: Some(ConversationConfigOverride {
+                    agent: Some(ConversationConfigOverrideAgent {
+                        first_message: first_message.map(str::to_owned),
+                        language,
+                        ..Default::default()
+                    }),
+                    tts: Some(ConversationConfigOverrideTts {
+                        voice_id: voice.map(str::to_owned),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The conversation the agent is holding before any client has spoken, which is what
+    /// the first configuration is compared against. Built the way `lib.rs` builds it, so a
+    /// starting config that gained a greeting would fail here rather than in a live call.
+    fn before_any_client_spoke() -> SessionConfig {
+        SessionConfig::settle("default prompt", Default::default())
+    }
+
+    #[test]
+    fn the_first_configuration_to_name_an_opening_line_owes_it() {
+        let opened = published(Some("Hola"), Some("es_ES-davefx-medium"), Some(Language::Es));
+        assert_eq!(opened.opening_after(&before_any_client_spoke()), Some("Hola"));
+    }
+
+    /// The bug this method exists for, in the shape it actually occurs.
+    ///
+    /// The page publishes the whole configuration whenever any control changes, so
+    /// switching the voice mid-call sends a message still carrying the greeting the caller
+    /// was opened with. Read off the message, that greeting is said again — over whatever
+    /// the agent is mid-sentence about, and without stopping it, since nothing on this path
+    /// goes through `stop_answering`.
+    ///
+    /// Both axes are asserted because a test naming only the voice would pass while the
+    /// language went on doing it: what is being fixed is not the voice control but the
+    /// question the agent was asking.
+    #[test]
+    fn changing_how_the_reply_is_spoken_owes_no_greeting() {
+        let opened = published(Some("Hola"), Some("es_ES-davefx-medium"), Some(Language::Es));
+
+        let revoiced = published(Some("Hola"), Some("bm_george"), Some(Language::Es));
+        assert_eq!(revoiced.opening_after(&opened), None, "a new voice is not a new opening");
+
+        let relanguaged = published(Some("Hola"), Some("es_ES-davefx-medium"), Some(Language::En));
+        assert_eq!(relanguaged.opening_after(&opened), None, "a new language is not one either");
+    }
+
+    /// The half deliberately kept: naming a new opening line *is* a request to hear it, and
+    /// it is why the control is live on the page rather than read once at the join.
+    #[test]
+    fn a_new_opening_line_is_owed_out_loud() {
+        let opened = published(Some("Hola"), None, None);
+        let changed = published(Some("Buenas"), None, None);
+        assert_eq!(changed.opening_after(&opened), Some("Buenas"));
+    }
+
+    /// Emptying the box asks for no greeting, so it owes none — as against owing the
+    /// caller silence *and* the line it just stopped asking for.
+    #[test]
+    fn an_opening_line_taken_away_owes_nothing() {
+        let opened = published(Some("Hola"), None, None);
+        assert_eq!(published(None, None, None).opening_after(&opened), None);
+        assert_eq!(published(Some("   "), None, None).opening_after(&opened), None);
+    }
+
+    /// A difference, not a once-ever latch: a caller who clears the box and types the same
+    /// line back has asked to hear it again, and the conversation in between was one that
+    /// opened with nothing.
+    #[test]
+    fn an_opening_line_that_comes_back_is_owed_again() {
+        let cleared = published(None, None, None);
+        assert_eq!(published(Some("Hola"), None, None).opening_after(&cleared), Some("Hola"));
     }
 
     fn tts_override(tts: ConversationConfigOverrideTts) -> ConversationInitiationClientData {
