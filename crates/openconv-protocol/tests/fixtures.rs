@@ -441,6 +441,67 @@ fn client_events_match_published_shapes() {
     }
 }
 
+/// The exact message the browser client publishes to carry a voice, read as the agent
+/// reads it.
+///
+/// Pinned here rather than trusted, because `web/caller.js` sends `voice_id` explicitly
+/// and sends it as `null` whenever the caller picked no particular voice — and nothing on
+/// that page can tell an explicit null being read as "none" from an explicit null being
+/// read as some other thing. What the page depends on is that the two spellings of "no
+/// voice named", omitted and null, settle to the same [`Voicing`] the agent had before
+/// any configuration arrived.
+///
+/// The other half of the dependency is asserted alongside: an initiation message
+/// carrying nothing but a voice leaves the prompt, the first message and the language
+/// exactly as an unconfigured conversation has them, which is what makes this page's
+/// message additive rather than a conversation it quietly reshaped.
+///
+/// [`Voicing`]: openconv-agent's `speak::Voicing`
+#[test]
+fn a_voice_the_browser_client_did_not_name_is_no_voice_rather_than_an_empty_one() {
+    let named: ClientEvent = serde_json::from_value(json!({
+        "type": "conversation_initiation_client_data",
+        "conversation_config_override": {"tts": {"voice_id": "af_heart"}}
+    }))
+    .expect("the page's message with a voice picked");
+
+    let unnamed: ClientEvent = serde_json::from_value(json!({
+        "type": "conversation_initiation_client_data",
+        "conversation_config_override": {"tts": {"voice_id": null}}
+    }))
+    .expect("the page's message with no voice picked");
+
+    let omitted: ClientEvent = serde_json::from_value(json!({
+        "type": "conversation_initiation_client_data",
+        "conversation_config_override": {"tts": {}}
+    }))
+    .expect("a message that never mentions a voice");
+
+    let tts = |event: &ClientEvent| match event {
+        ClientEvent::ConversationInitiation(data) => data
+            .conversation_config_override
+            .clone()
+            .expect("an override")
+            .tts
+            .expect("a tts override"),
+        other => panic!("not an initiation message: {other:?}"),
+    };
+
+    assert_eq!(tts(&named).voice_id.as_deref(), Some("af_heart"));
+    assert_eq!(tts(&unnamed).voice_id, None);
+    assert_eq!(tts(&unnamed), tts(&omitted));
+
+    // Everything the page does not send stays unsaid, so nothing but the voice is
+    // decided by this message.
+    let ClientEvent::ConversationInitiation(data) = &named else {
+        panic!("not an initiation message");
+    };
+    let overrides = data.conversation_config_override.clone().expect("an override");
+    assert_eq!(overrides.agent, None);
+    assert_eq!(overrides.conversation, None);
+    assert_eq!(data.dynamic_variables, None);
+}
+
 /// Guards the two enumerations of the same vocabulary against drifting apart: a
 /// subscribable kind that names no real message would let a client silently subscribe
 /// to nothing.

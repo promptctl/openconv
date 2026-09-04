@@ -461,6 +461,14 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                     conversation = %assignment.conversation_id,
                     prompt_chars = config.system_prompt.len(),
                     has_first_message = config.first_message.is_some(),
+                    // What the caller will hear, which is otherwise answerable only by
+                    // listening. The text-to-speech server substitutes a voice it does
+                    // not serve rather than refusing it, so "the agent sounded wrong" and
+                    // "the client asked for the wrong voice" are the same symptom until
+                    // one line says which was asked for. `<none>` is the client naming no
+                    // voice, which is a different fact from naming one that got
+                    // substituted, and both are readable here.
+                    voice = config.voicing.voice_id.as_deref().unwrap_or("<none>"),
                     "conversation configured by the client"
                 );
 

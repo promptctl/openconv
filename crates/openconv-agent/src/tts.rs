@@ -66,11 +66,35 @@
 //!
 //! Two cautions before anyone tunes against the figures. They move with load — the Mac
 //! test run beside a `cargo clippy` gave 0.15 s per second of speech, two and a half
-//! times its own idle number — so a busy node is the case to design for. And throughput
-//! is not the tight constraint anyway: across clean runs the first clause's
+//! times its own idle number — so a busy node is the case to design for. And on piper
+//! throughput is not the tight constraint anyway: across clean runs the first clause's
 //! audio landed within about 0.15 s either side of the model finishing its reply,
 //! sometimes ahead and sometimes behind. Comfortable on total synthesis, break-even on
 //! the only latency a caller experiences.
+//!
+//! # Which voice, not which model, decides what the caller waits through
+//!
+//! Everything above is piper, and piper is barely half of what the deployed router
+//! serves. The four kokoro voices — `af_heart`, `am_michael`, `bf_emma`, `bm_george` —
+//! cost roughly **0.8 s fixed plus 1.8 s per second of speech**, timed 2026-09-03 the
+//! same way, three runs each of a two-second and a nine-second utterance. The five piper
+//! voices sit between 0.04 and 0.22 s per second, so the first clause of a reply is
+//! synthesized in 0.25–0.6 s on one of them and 4.0–4.7 s on a kokoro voice. Same server,
+//! same request, same text: about four seconds of the caller's wait decided by nothing
+//! but the voice id the client asked for.
+//!
+//! Which is what the break-even above is worth reading against, because it is piper's
+//! alone. A slope of 1.8 is above real time — a kokoro clause takes longer to synthesize
+//! than it takes to play, so the first one reaches the caller about four seconds *after*
+//! the model has finished writing the whole reply, and only dispatching later clauses
+//! concurrently keeps the gap from widening with each one.
+//!
+//! Worth setting beside the model, the other candidate for that wait. Across the calls
+//! [`crate::speak`]'s marks were taken from, the model reached its first word in 0.6–0.8 s
+//! on most turns and its first clause boundary by 1.7 s, on `claude-opus-5`. Neither
+//! number moves when the voice changes; `first_audio_ms` moves by four seconds. A reply
+//! that feels slow is a question about the voice first, and about the model only once a
+//! piper voice is slow too.
 //!
 //! [`audio::SAMPLE_RATE`]: crate::audio::SAMPLE_RATE
 
@@ -79,7 +103,7 @@ use crate::llm::with_cause;
 use crate::resample::Resampler;
 use crate::speak::{Speech, Synthesizer, Voicing};
 use openconv_protocol::Language;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use futures_util::stream::{self, StreamExt};
 use minimp3::{Decoder, Error as Mp3Error, Frame};
 use std::fmt;
@@ -159,11 +183,7 @@ impl Tts {
             .await
             .map_err(|error| TtsError::Unreachable(with_cause(&error)))?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(TtsError::Refused { status: status.as_u16(), body });
-        }
+        let response = ok_or_refused(response).await?;
 
         // `StreamReader` needs one error type, and the only thing downstream does with
         // this one is report it, so the HTTP failure is carried through as its message.
@@ -174,6 +194,68 @@ impl Tts {
         Ok(decode(tokio_util::io::StreamReader::new(body)))
     }
 
+    /// Every voice this deployment can be asked for, as the server behind
+    /// `OPENCONV_TTS_URL` lists them.
+    ///
+    /// The counterpart to the passthrough this module's header describes, and the reason
+    /// that passthrough is safe to build a chooser on. Synthesis substitutes a voice it
+    /// does not have; discovery does not — elvenspeak 404s an unknown id on
+    /// `/v1/voices/{id}` rather than answering for it. So this is the only way to find
+    /// out what a deployment will actually speak in, and without it the sole honest
+    /// interface is a text box in which a wrong answer is indistinguishable from a right
+    /// one until somebody listens.
+    ///
+    /// Not cached. The listing is derived per request on the far side — behind
+    /// `elvenspeak-router` it is a union over whichever engines Consul currently carries
+    /// — so a copy held here would be a second answer to "what can this deployment
+    /// speak", stale from the first engine that came or went. [LAW:one-source-of-truth]
+    pub async fn voices(&self) -> Result<Vec<VoiceListing>, TtsError> {
+        let response = self
+            .http
+            .get(format!("{}/v1/voices", self.base_url))
+            .send()
+            .await
+            .map_err(|error| TtsError::Unreachable(with_cause(&error)))?;
+
+        let response = ok_or_refused(response).await?;
+
+        // Parsed rather than passed through. Every field this drops is one the page
+        // would otherwise be free to start reading, and every field it keeps is one a
+        // server that stopped sending fails on here — loudly, naming the shape — instead
+        // of in a dropdown rendering `undefined` for somebody who was debugging
+        // something else. [LAW:parse-dont-validate]
+        Ok(response
+            .json::<VoiceListingResponse>()
+            .await
+            .map_err(|error| TtsError::Unreadable(with_cause(&error)))?
+            .voices)
+    }
+}
+
+/// The envelope elvenspeak wraps its voices in, unwrapped here so nothing downstream
+/// carries a shape whose only purpose was to match ElevenLabs' own.
+#[derive(Debug, Deserialize)]
+struct VoiceListingResponse {
+    voices: Vec<VoiceListing>,
+}
+
+/// One voice a caller can ask for, in the two facts choosing between them needs.
+///
+/// Both halves come from the server and neither is composed here. `voice_id` is what a
+/// request names, and `description` is the sentence that server writes about it —
+/// "Kokoro Heart (en-us, female)", "Piper lessac (en_US, high)" — which already carries
+/// the engine, the locale and the tier. Building a label out of the other fields instead
+/// would mean deciding here which of a voice's several `models` is "really" its engine,
+/// and that is a question elvenspeak answers and this crate must not start answering
+/// twice. [LAW:one-source-of-truth]
+///
+/// Serialized as well as deserialized because the browser client is handed exactly this:
+/// a voice on offer is one fact, so it is one type, whichever direction it is travelling
+/// in. [LAW:one-type-per-behavior]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VoiceListing {
+    pub voice_id: String,
+    pub description: String,
 }
 
 /// The request body, as the server reads it.
@@ -204,6 +286,26 @@ struct Request<'a> {
     model_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     language_code: Option<Language>,
+}
+
+/// A response the far side did not answer successfully, as the refusal this module
+/// speaks in.
+///
+/// One place rather than one per request. Both requests here refuse the same way, and a
+/// rule enforced at two checkpoints is two rules the first time either is edited — a cap
+/// on how much of the body is carried, or a header read out of it, would otherwise have
+/// to be written twice and would be wrong the once it was not. [LAW:single-enforcer]
+///
+/// The body is taken because a refusal is the one case where the far side explains
+/// itself; `unwrap_or_default` because a body that cannot be read is an empty
+/// explanation, not a second failure to report over the top of this one.
+async fn ok_or_refused(response: reqwest::Response) -> Result<reqwest::Response, TtsError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    Err(TtsError::Refused { status: status.as_u16(), body: response.text().await.unwrap_or_default() })
 }
 
 /// Everything but the network, for the tests: decodes bytes already in hand.
@@ -326,6 +428,10 @@ pub enum TtsError {
     Refused { status: u16, body: String },
     /// A response that was not audio this can play.
     Undecodable(String),
+    /// A response that was not the voice listing it has to be. Reached, answered, and
+    /// unreadable — which is a different fault from the three above and points at a
+    /// different repair, so it is a different variant rather than the nearest one.
+    Unreadable(String),
 }
 
 impl fmt::Display for TtsError {
@@ -336,6 +442,7 @@ impl fmt::Display for TtsError {
                 write!(f, "text-to-speech returned HTTP {status}: {body}")
             }
             Self::Undecodable(error) => write!(f, "could not decode the speech audio: {error}"),
+            Self::Unreadable(error) => write!(f, "could not read the voice listing: {error}"),
         }
     }
 }
@@ -345,6 +452,109 @@ impl std::error::Error for TtsError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A voice listing, exactly as `elvenspeak-router` served one on 2026-09-03 — every
+    /// field it sends, in its order, for one voice of each engine behind it.
+    ///
+    /// Kept whole rather than trimmed to the two fields read. The thing worth asserting
+    /// is that a real response parses, and a fixture edited down to what the parser
+    /// already wants can only ever agree with it.
+    const A_REAL_LISTING: &str = r#"{
+      "voices": [
+        {
+          "voice_id": "af_heart",
+          "name": "Heart",
+          "category": "premade",
+          "labels": {"engine": "kokoro", "gender": "female"},
+          "description": "Kokoro Heart (en-us, female)",
+          "preview_url": null,
+          "available_for_tiers": [],
+          "high_quality_base_model_ids": [],
+          "samples": null,
+          "settings": null,
+          "sharing": null,
+          "fine_tuning": {
+            "is_allowed_to_fine_tune": false,
+            "state": {},
+            "verification_failures": [],
+            "verification_attempts_count": 0,
+            "manual_verification_requested": false
+          },
+          "aliases": [],
+          "capabilities": ["speed", "timestamps"],
+          "models": ["eleven_multilingual_v2", "kokoro"],
+          "language": "en"
+        },
+        {
+          "voice_id": "es_MX-claude-high",
+          "name": "claude",
+          "category": "premade",
+          "labels": {"engine": "piper", "quality": "high"},
+          "description": "Piper claude (es_MX, high)",
+          "preview_url": null,
+          "available_for_tiers": [],
+          "high_quality_base_model_ids": [],
+          "samples": null,
+          "settings": null,
+          "sharing": null,
+          "fine_tuning": {
+            "is_allowed_to_fine_tune": false,
+            "state": {},
+            "verification_failures": [],
+            "verification_attempts_count": 0,
+            "manual_verification_requested": false
+          },
+          "aliases": [],
+          "capabilities": ["speed", "timestamps"],
+          "models": ["eleven_flash_v2_5", "eleven_turbo_v2_5", "piper"],
+          "language": "es"
+        }
+      ]
+    }"#;
+
+    /// The half of the seam a running server cannot be asked about cheaply: that the
+    /// response shape this reads is the response shape that server sends.
+    #[test]
+    fn a_real_voice_listing_reads_as_voices_to_offer() {
+        let listing: VoiceListingResponse =
+            serde_json::from_str(A_REAL_LISTING).expect("a real listing parses");
+
+        assert_eq!(
+            listing.voices,
+            vec![
+                VoiceListing {
+                    voice_id: "af_heart".to_owned(),
+                    description: "Kokoro Heart (en-us, female)".to_owned(),
+                },
+                VoiceListing {
+                    voice_id: "es_MX-claude-high".to_owned(),
+                    description: "Piper claude (es_MX, high)".to_owned(),
+                },
+            ],
+        );
+    }
+
+    /// A deployment serving nothing is a listing, not a failure — and the page draws the
+    /// difference between that and a server it could not reach, so the two must not
+    /// arrive here as the same value.
+    #[test]
+    fn a_deployment_with_no_voices_lists_none() {
+        let listing: VoiceListingResponse =
+            serde_json::from_str(r#"{"voices": []}"#).expect("an empty listing parses");
+
+        assert!(listing.voices.is_empty());
+    }
+
+    /// The failure this exists to make loud. A body missing the fields a chooser is
+    /// built from must stop here, because the alternative is a dropdown of blank rows
+    /// that reads as a deployment with nothing to say.
+    #[test]
+    fn a_listing_missing_what_a_chooser_needs_is_refused() {
+        let missing_description = r#"{"voices": [{"voice_id": "af_heart"}]}"#;
+
+        serde_json::from_str::<VoiceListingResponse>(missing_description)
+            .expect_err("a voice with no description is not a voice this can offer");
+    }
 
     #[test]
     fn an_engine_the_caller_asked_for_reaches_the_request() {
