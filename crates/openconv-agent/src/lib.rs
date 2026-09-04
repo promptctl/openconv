@@ -40,6 +40,7 @@ use audio::Voice;
 use control::{ControlChannel, PublishFailed, Unannounced};
 use futures_util::stream;
 use listen::{Noticed, Speech};
+use livekit::participant::ParticipantState;
 use livekit::track::RemoteTrack;
 use livekit::{Room, RoomEvent, RoomOptions};
 use openconv_protocol::{
@@ -48,6 +49,7 @@ use openconv_protocol::{
     TentativeUserTranscriptionEvent, UserTranscriptionEvent, VadScoreEvent,
 };
 use speak::{Made, Spoken, Stopped, Synthesizer};
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -195,9 +197,36 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
     // `DataReceived` arm below — the client's configuration normally lands first.
     let mut greeting_to_say: Option<String> = None;
 
+    // The audience that was already here, as the arrival nobody told this agent about.
+    //
+    // `RoomEvent::ParticipantActive` is dispatched only for a participant the SDK watches
+    // *change* state (livekit-0.8.3 `room/mod.rs:1270`). Anyone already in the room when
+    // this agent connects is built straight from the join response and dispatches nothing
+    // at all — not even `ParticipantConnected` (`room/mod.rs:792`) — so an agent waiting
+    // for the event alone waits forever.
+    //
+    // The agent reaching the room first, as above, is the only reason this has ever
+    // worked — and "normally" there is a race against the caller's network, lost outright
+    // whenever the caller is nearer the SFU than the dispatch is. Every browser call
+    // against a local SFU loses it. What losing it costs is not a missing greeting but a
+    // mute agent: with no control channel the announcement never made, every settled
+    // transcript is dropped at "heard speech before the conversation was announced"
+    // below, and the caller talks to nobody.
+    //
+    // Replayed into the loop as the event that was never sent, rather than handled beside
+    // the arm that already handles it, so an audience that was here first and one that
+    // turns up in a moment are one value taking one path — and the next thing that has to
+    // happen on arrival is still written once. [LAW:no-ambient-temporal-coupling]
+    let mut arrived_before_us: VecDeque<RoomEvent> = room
+        .remote_participants()
+        .into_values()
+        .filter(|participant| participant.state() == ParticipantState::Active)
+        .map(RoomEvent::ParticipantActive)
+        .collect();
+
     loop {
         let event = tokio::select! {
-            event = events.recv() => match event {
+            event = next_event(&mut arrived_before_us, &mut events) => match event {
                 Some(event) => event,
                 None => break,
             },
@@ -954,6 +983,26 @@ async fn publish_score(
         })
         .await?;
     Ok(())
+}
+
+/// The next thing to happen in the room, with anyone already present replayed first.
+///
+/// The one place that knows the backlog exists, so the loop that handles room events has
+/// no idea some of them are older than its own connection — which is what keeps a
+/// participant who was here first and one who walks in later from ever being two cases.
+/// [LAW:dataflow-not-control-flow]
+///
+/// Cancel-safe, as a `tokio::select!` arm has to be: the backlog is only taken from on a
+/// poll that immediately returns it, and `recv` is cancel-safe already, so an event can
+/// never be dropped by another arm winning the race.
+async fn next_event(
+    arrived_before_us: &mut VecDeque<RoomEvent>,
+    events: &mut mpsc::UnboundedReceiver<RoomEvent>,
+) -> Option<RoomEvent> {
+    match arrived_before_us.pop_front() {
+        Some(event) => Some(event),
+        None => events.recv().await,
+    }
 }
 
 /// Stops whatever the agent is saying, because the caller has taken the turn.
