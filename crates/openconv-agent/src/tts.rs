@@ -66,11 +66,35 @@
 //!
 //! Two cautions before anyone tunes against the figures. They move with load — the Mac
 //! test run beside a `cargo clippy` gave 0.15 s per second of speech, two and a half
-//! times its own idle number — so a busy node is the case to design for. And throughput
-//! is not the tight constraint anyway: across clean runs the first clause's
+//! times its own idle number — so a busy node is the case to design for. And on piper
+//! throughput is not the tight constraint anyway: across clean runs the first clause's
 //! audio landed within about 0.15 s either side of the model finishing its reply,
 //! sometimes ahead and sometimes behind. Comfortable on total synthesis, break-even on
 //! the only latency a caller experiences.
+//!
+//! # Which voice, not which model, decides what the caller waits through
+//!
+//! Everything above is piper, and piper is barely half of what the deployed router
+//! serves. The four kokoro voices — `af_heart`, `am_michael`, `bf_emma`, `bm_george` —
+//! cost roughly **0.8 s fixed plus 1.8 s per second of speech**, timed 2026-09-03 the
+//! same way, three runs each of a two-second and a nine-second utterance. The five piper
+//! voices sit between 0.04 and 0.22 s per second, so the first clause of a reply is
+//! synthesized in 0.25–0.6 s on one of them and 4.0–4.7 s on a kokoro voice. Same server,
+//! same request, same text: about four seconds of the caller's wait decided by nothing
+//! but the voice id the client asked for.
+//!
+//! Which is what the break-even above is worth reading against, because it is piper's
+//! alone. A slope of 1.8 is above real time — a kokoro clause takes longer to synthesize
+//! than it takes to play, so the first one reaches the caller about four seconds *after*
+//! the model has finished writing the whole reply, and only dispatching later clauses
+//! concurrently keeps the gap from widening with each one.
+//!
+//! Worth setting beside the model, the other candidate for that wait. Across the calls
+//! [`crate::speak`]'s marks were taken from, the model reached its first word in 0.6–0.8 s
+//! on most turns and its first clause boundary by 1.7 s, on `claude-opus-5`. Neither
+//! number moves when the voice changes; `first_audio_ms` moves by four seconds. A reply
+//! that feels slow is a question about the voice first, and about the model only once a
+//! piper voice is slow too.
 //!
 //! [`audio::SAMPLE_RATE`]: crate::audio::SAMPLE_RATE
 
