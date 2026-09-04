@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { conversationInitiation, conversationWith, isAgent } from "./conversation.js";
+import { NotTold, conversationInitiation, conversationWith, isAgent } from "./conversation.js";
 
 /** A transport that records what was published rather than reaching an SFU. */
 const transportOf = (identities, publishBytes) => {
@@ -361,6 +361,45 @@ test("opening connects before it configures, and configures before it returns", 
 
     assert.equal(conversationId, "conv_abc", "the conversation is recovered from the token");
     assert.deepEqual(order, ["mint", "connect", "configure"]);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("a conversation that opened but could not be told says so, and says which one", async () => {
+  // The failure the page keeps its call over, told apart from the ones it cannot: a room
+  // that never opened has nothing to keep, and a room whose agent could not be reached is
+  // a working call running the deployment's defaults. Distinguished by type rather than by
+  // matching the message, because a caller deciding that on a string decides it wrongly the
+  // first time the sentence changes.
+  const transport = transportOf(["agent_one"], async () => {
+    throw new Error("data channel closed");
+  });
+  const conversation = conversationWith(transport, () => voiced("af_heart"));
+
+  const realFetch = globalThis.fetch;
+  const claims = Buffer.from(JSON.stringify({ video: { room: "conv_abc" } })).toString("base64url");
+  globalThis.fetch = async () => ({
+    ok: true,
+    text: async () => JSON.stringify({ token: `header.${claims}.signature` }),
+  });
+
+  try {
+    await assert.rejects(
+      conversation.open({
+        openconv: "http://127.0.0.1:8080",
+        apiKey: "secret",
+        agentId: "agent_happy",
+        participantName: "u_test",
+      }),
+      (failure) => {
+        assert.ok(failure instanceof NotTold, "a configure that failed is its own kind of failure");
+        assert.equal(failure.conversationId, "conv_abc", "the call it leaves open can still be named");
+        assert.match(failure.message, /agent_one could not be told what this conversation is/);
+        assert.match(failure.cause.message, /data channel closed/);
+        return true;
+      },
+    );
   } finally {
     globalThis.fetch = realFetch;
   }

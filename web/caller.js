@@ -26,7 +26,7 @@ import {
   Track,
 } from "./vendor/livekit-client.js";
 
-import { conversationWith } from "./conversation.js";
+import { NotTold, conversationWith } from "./conversation.js";
 
 /**
  * Reports a failure nobody is waiting on, by letting the page's own reporter have it.
@@ -41,6 +41,28 @@ const reportDetached = (failure) =>
   queueMicrotask(() => {
     throw failure;
   });
+
+/**
+ * Lets a configure that failed cost this call the voice that was chosen, not the call.
+ *
+ * The room is up and the agent is in it by the time this can happen — only the message
+ * saying what the conversation is did not land, which leaves a working call running the
+ * deployment's defaults. Tearing that down answers a dropdown with a hang-up, and the
+ * agent the mint dispatched is in the room being paid for either way.
+ *
+ * The conversation comes off the failure rather than being recovered from somewhere else,
+ * because a `NotTold` is precisely the failure that has one. [LAW:one-source-of-truth]
+ *
+ * Every other failure is a call that never opened and is re-raised untouched, for `join`'s
+ * own cleanup to release the room and the microphone. Reported either way, never swallowed.
+ * [LAW:no-silent-failure]
+ */
+const keepTheCall = (failure) => {
+  if (!(failure instanceof NotTold)) throw failure;
+
+  reportDetached(failure);
+  return failure.conversationId;
+};
 
 /**
  * The three room operations `conversation.js` drives, in this SDK's terms.
@@ -146,12 +168,19 @@ export class Call {
       // statement, which is the ordering that matters: an agent told which voice to use
       // after the caller could already be speaking is an agent that changes voice partway
       // through a reply.
-      const conversationId = await conversation.open({
-        openconv: location.origin,
-        apiKey,
-        agentId,
-        participantName,
-      });
+      //
+      // Awaited for that ordering and not for its success. A configure that fails costs
+      // this call the voice that was chosen, where failing the join would cost the call
+      // itself over a dropdown — so the one failure that leaves a usable call is caught
+      // here and every other one is not.
+      const conversationId = await conversation
+        .open({
+          openconv: location.origin,
+          apiKey,
+          agentId,
+          participantName,
+        })
+        .catch(keepTheCall);
 
       // The rows for anyone already here, which `open`'s own sweep configured but did not
       // announce. Its diff is over agents and this one is over everybody.
