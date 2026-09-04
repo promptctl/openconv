@@ -14,7 +14,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Caller, delivery, millis, readRecording, sounding } from "./caller.mjs";
+import { Caller, delivery, millis, readRecording, sounding, transportOf } from "./caller.mjs";
 
 /// A caller that has "received" these events, with no room behind it. The accessors read
 /// `controlEvents` and nothing else, so this is the whole of their input.
@@ -540,4 +540,81 @@ test("counters that are legitimately zero render as zero, never NaN or undefined
   assert.equal(quiet.transports[0].selected.rttMs.toFixed(1), "0.0");
   assert.equal(quiet.inboundAudio[0].jitterMs.toFixed(1), "0.0");
   assert.equal(quiet.inboundAudio[0].audioLevel.toExponential(2), "0.00e+0");
+});
+
+/** A room that records what it was asked to do rather than reaching an SFU. */
+const roomOf = (identities) => {
+  const published = [];
+
+  return {
+    published,
+    remoteParticipants: new Map(identities.map((identity) => [identity, { identity }])),
+    localParticipant: {
+      publishData: async (payload, options) =>
+        published.push({ message: JSON.parse(new TextDecoder().decode(payload)), options }),
+    },
+  };
+};
+
+test("the roster is read as identities, which is what the handshake matches on", () => {
+  // `remoteParticipants` is keyed by identity and valued by participant objects. Handing
+  // over the values would make every identity `undefined`, no participant would look like
+  // an agent, and the conversation would be configured for nobody — in silence. The script
+  // would then assert against an agent left on the deployment default and blame the agent.
+  const room = roomOf(["agent_one", "u_acceptance"]);
+
+  assert.deepEqual(transportOf(room, "ws://sfu").participants(), ["agent_one", "u_acceptance"]);
+});
+
+test("a control message goes out reliably, because a dropped one is never noticed", async () => {
+  // The data channel's unreliable mode is lossy by design. A configuration lost that way
+  // leaves the agent on the deployment default with every script believing it was told —
+  // and a script that believes it configured a voice will report the wrong thing failing.
+  const room = roomOf([]);
+
+  await transportOf(room, "ws://sfu").publishBytes(new TextEncoder().encode('{"type":"x"}'));
+
+  assert.equal(room.published.length, 1);
+  assert.deepEqual(room.published[0].message, { type: "x" });
+  assert.equal(room.published[0].options.reliable, true);
+});
+
+/// A caller whose agent appears only after `agentAfterMs`, and whose configure never
+/// settles.
+///
+/// `agentConfigured` reads exactly two things — the roster, through the transport, and the
+/// publish attempts recorded on `configuring` — so a roster that answers on a timer is the
+/// whole of its input. No room is constructed and nothing here reaches an SFU.
+const callerAwaiting = (agentAfterMs) => {
+  const start = Date.now();
+
+  return Object.assign(Object.create(Caller.prototype), {
+    participants: [],
+    configuring: [new Promise(() => {})],
+    transport: {
+      participants: () => (Date.now() - start >= agentAfterMs ? ["agent_late"] : []),
+    },
+  });
+};
+
+test("the budget bounds the whole wait, not each wait inside it", async () => {
+  // Two waits run in sequence in `agentConfigured`, and each used to be given the caller's
+  // full argument. An agent arriving late in the window then handed the configure a fresh
+  // budget, so a script that asked for 25 seconds could sit for 50 before saying anything.
+  // The failure still surfaced; the point is when. A CI run left holding a doubled timeout
+  // on every stalled data channel is the cost, and nothing in the call site says it.
+  const ms = 600;
+  const caller = callerAwaiting(500);
+
+  const start = Date.now();
+  await assert.rejects(
+    () => caller.agentConfigured(ms),
+    /timed out waiting for the agent to be told what this conversation is/,
+  );
+  const elapsed = Date.now() - start;
+
+  assert.ok(
+    elapsed < ms * 1.5,
+    `gave up after ${elapsed}ms, past the ${ms}ms the caller asked for`,
+  );
 });

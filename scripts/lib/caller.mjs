@@ -333,6 +333,31 @@ export function recordSpeech(line, path, { sampleRate = 48_000 } = {}) {
   return readRecording(path);
 }
 
+/**
+ * The three room operations the shared handshake drives, in @livekit/rtc-node's terms.
+ *
+ * The node half of the seam whose browser half is `transportOf` in `web/caller.js`.
+ * `autoSubscribe` and `dynacast` are this side's business: they are how this SDK spells
+ * "hear everything published", which a browser does by default and which no part of saying
+ * what a conversation is depends on. [LAW:locality-or-seam]
+ *
+ * Exported for the reason the browser half is — it is the half that can be wrong on its
+ * own, and silently. An unreliable `publishData` drops a configuration under load with
+ * every script believing the agent was told; a roster handed over as participant objects
+ * makes every identity `undefined`, so `isAgent` matches nobody and no agent is told at
+ * all. Both end with a script asserting against a default-configured agent and blaming the
+ * agent. `caller.test.mjs` holds this side to them without a room.
+ */
+export const transportOf = (room, livekitUrl) => ({
+  connect: (token) =>
+    Promise.race([
+      room.connect(livekitUrl, token, { autoSubscribe: true, dynacast: false }),
+      rejectAfter(20_000, "the room connection"),
+    ]),
+  participants: () => Array.from(room.remoteParticipants.values()).map((p) => p.identity),
+  publishBytes: (payload) => room.localParticipant.publishData(payload, { reliable: true }),
+});
+
 /** A client that has joined a conversation. Reaching one means the join worked. */
 export class Caller {
   /**
@@ -382,24 +407,7 @@ export class Caller {
     this.livekitUrl = livekitUrl;
     this.room = new Room();
 
-    /**
-     * The three room operations the shared handshake drives, in this SDK's terms.
-     *
-     * `autoSubscribe` and `dynacast` are this side's business and stay here: they are how
-     * @livekit/rtc-node spells "hear everything published", which a browser does by
-     * default and which no part of saying what a conversation is depends on.
-     * [LAW:locality-or-seam]
-     */
-    this.transport = {
-      connect: (token) =>
-        Promise.race([
-          this.room.connect(livekitUrl, token, { autoSubscribe: true, dynacast: false }),
-          rejectAfter(20_000, "the room connection"),
-        ]),
-      participants: () => this.roster(),
-      publishBytes: (payload) =>
-        this.room.localParticipant.publishData(payload, { reliable: true }),
-    };
+    this.transport = transportOf(this.room, livekitUrl);
 
     /**
      * This conversation, and what its agents have been told about it.
@@ -541,9 +549,15 @@ export class Caller {
     return delivery(stats.toJson());
   }
 
-  /** The remote participants currently in the room. */
+  /**
+   * The remote participants currently in the room.
+   *
+   * Read through the transport rather than off the room, because turning this SDK's
+   * participants into identities is precisely what that seam is for, and a second reading
+   * here could disagree with the one the handshake matches on. [LAW:one-source-of-truth]
+   */
   roster() {
-    return Array.from(this.room.remoteParticipants.values()).map((p) => p.identity);
+    return this.transport.participants();
   }
 
   /** True once an agent is present, whether it joined before or after this caller. */
@@ -560,9 +574,19 @@ export class Caller {
    * and reached the agent only because publishing a microphone happened to wait for a
    * subscriber first. That is the kind of correctness that holds until something else
    * gets faster. [LAW:no-ambient-temporal-coupling]
+   *
+   * `ms` bounds this call, not each wait inside it. The two waits run in sequence, so
+   * giving each its own `ms` would let a caller that asked for 25 seconds wait 50 — an
+   * agent arriving at 24.9s would hand the configure a full fresh budget, and a script
+   * that meant to fail fast would sit twice as long before saying anything. Every call
+   * site passes one number and reads it as one budget, so there is one deadline here and
+   * both waits draw down what is left of it. [LAW:one-source-of-truth]
    */
   async agentConfigured(ms = 25_000) {
-    const present = await this.waitFor(() => this.agentPresent(), ms, "the agent");
+    const until = Date.now() + ms;
+    const remaining = () => until - Date.now();
+
+    const present = await this.waitFor(() => this.agentPresent(), remaining(), "the agent");
 
     // Bounded like every other room operation here. A publish that rejects ends the run
     // with its own message, but one that never settles at all — a stalled data channel —
@@ -570,7 +594,7 @@ export class Caller {
     // this module's timeouts exist to make impossible. [LAW:no-silent-failure]
     await Promise.race([
       Promise.all(this.configuring),
-      rejectAfter(ms, "the agent to be told what this conversation is"),
+      rejectAfter(remaining(), "the agent to be told what this conversation is"),
     ]);
     return present;
   }
