@@ -71,11 +71,19 @@ const said = (value) => value?.trim() || null;
  * Every field of the override, every time, with `null` standing where a caller asked for
  * nothing — rather than a shape assembled out of whichever settings happen to be set.
  * That is not a stylistic choice in either direction: it is what the ElevenLabs SDK
- * actually puts on the wire (`ConversationConfigOverride` in
- * `crates/openconv-protocol/src/client.rs` notes that `tts` and `conversation` routinely
- * arrive as empty objects for exactly this reason), and it means this function has no
- * branches at all — the caller's variability is carried entirely by the values flowing
- * through one fixed shape. [LAW:dataflow-not-control-flow]
+ * actually puts on the wire, which `ConversationConfigOverride` in
+ * `crates/openconv-protocol/src/client.rs` records from the far side — the SDK builds its
+ * sub-objects whenever a caller overrides anything at all, so they arrive filled with nulls
+ * rather than omitted. It is what lets this function have no branches at all: the caller's
+ * variability is carried entirely by the values flowing through one fixed shape.
+ * [LAW:dataflow-not-control-flow]
+ *
+ * Two of that note's three sub-objects, though, and not all three. `conversation` carries
+ * `text_only` and `client_events`, which this page has no control for and `SessionConfig`
+ * does not read — `settle` reads `agent` and `tts` and stops. An empty one would be a field
+ * put on the wire so that a sentence about the wire came out true, and absent is the same
+ * answer as all-null on the far side anyway, which
+ * `a_message_that_overrides_nothing_settles_where_a_conversation_starts` pins from there.
  *
  * Which is also why an all-`null` message is a legitimate thing to send rather than a
  * message worth skipping. `SessionConfig::settle` reads every absent override as "use the
@@ -109,6 +117,31 @@ export const conversationInitiation = (settings) => ({
   },
   dynamic_variables: settings.variables ?? null,
 });
+
+/**
+ * A conversation that opened but could not be told what it is.
+ *
+ * A different failure from a room that never opened, and a type rather than a message to
+ * match on, because what it costs is the caller's decision and not this module's: an
+ * acceptance run that cannot configure its agent has nothing left to assert and should
+ * fail, while the page has a call that works on the deployment's defaults and should not
+ * lose the room over a dropdown. Neither can act on that difference by reading a string.
+ * [LAW:parse-dont-validate]
+ *
+ * It carries the conversation because there is one — that is the whole of what separates
+ * it from a mint or a connect that failed, and a caller that keeps the call still has to
+ * be able to name it. [LAW:one-source-of-truth]
+ */
+export class NotTold extends Error {
+  constructor(conversationId, cause) {
+    // The cause's own sentence, which already names the agent that could not be reached:
+    // this type says which *kind* of failure it is, and has nothing to add about what went
+    // wrong that the failure underneath has not already said.
+    super(cause.message, { cause });
+    this.name = "NotTold";
+    this.conversationId = conversationId;
+  }
+}
 
 /**
  * Reads a JWT's payload.
@@ -246,7 +279,9 @@ export function conversationWith(transport, readSettings) {
     async open(credentials) {
       const { token, conversationId } = await mintConversation(credentials);
       await transport.connect(token);
-      await this.arrived();
+      await this.arrived().catch((failure) => {
+        throw new NotTold(conversationId, failure);
+      });
       return conversationId;
     },
 

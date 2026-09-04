@@ -535,6 +535,23 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                 if let Some(greeting) = opening {
                     match control.is_some() {
                         true => {
+                            // Superseding whatever the agent was mid-sentence about, for the
+                            // same reason a typed message does: reopening a conversation over
+                            // a half-finished answer without stopping it leaves two turns
+                            // audible, and the one nothing holds the token for any more can no
+                            // longer be interrupted at all. Assigning over `answering` does not
+                            // stop it — a bare `CancellationToken` cancels nothing when it is
+                            // dropped, and `stop_answering` is the only thing that calls
+                            // `cancel`. [LAW:single-enforcer]
+                            if stop_answering(&mut answering, &stage.voice, control.as_deref())
+                                .await?
+                            {
+                                tracing::info!(
+                                    conversation = %assignment.conversation_id,
+                                    "a new opening line arrived mid-answer; stopping"
+                                );
+                            }
+
                             answering = Some(start_turn(
                                 &stage,
                                 control.clone(),
