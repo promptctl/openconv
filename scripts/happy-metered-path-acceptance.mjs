@@ -71,6 +71,19 @@ function mintOrNothing(text) {
   }
 }
 
+/** A JWT's claims, or `null` for anything that is not one: absent, empty, the wrong number
+ *  of segments, not base64url, not JSON. Asking instead whether a string *looks like* a
+ *  token answers a question nothing downstream had, and throws away the one it did have. */
+function claimsOf(token) {
+  const [, payload, signature] = String(token).split(".");
+  if (payload === undefined || signature === undefined) return null;
+  try {
+    return JSON.parse(Buffer.from(payload, "base64url").toString());
+  } catch {
+    return null;
+  }
+}
+
 const { token, happyServer, livekitUrl, agentId, issuer } = readHappyEnvironment(process.env, process.argv);
 const checks = new Checks();
 
@@ -88,12 +101,14 @@ const body = await res.text();
 const minted = mintOrNothing(body);
 
 // One condition, read by both the check and the stop below, so the two cannot come to
-// disagree about what a usable mint is. [LAW:one-source-of-truth]
-const usable = res.status === 200 && minted?.allowed === true && typeof minted?.conversationToken === "string";
+// disagree about what a usable mint is — and a mint whose conversation cannot be decoded
+// out of it is not one, whatever it says about itself. [LAW:one-source-of-truth]
+const claims = claimsOf(minted?.conversationToken);
+const usable = res.status === 200 && minted?.allowed === true && claims !== null;
 checks.record(
   "happy-server minted a conversation for a real account",
   usable,
-  `HTTP ${res.status} ${minted ? JSON.stringify({ ...minted, conversationToken: minted.conversationToken ? "<jwt>" : undefined }) : JSON.stringify(body.slice(0, 300))}`,
+  `HTTP ${res.status} ${minted ? JSON.stringify({ ...minted, conversationToken: claims ? "<jwt>" : minted.conversationToken }) : JSON.stringify(body.slice(0, 300))}`,
 );
 // Nothing below can run without a token, and a caller that joined nothing would report
 // its own failures as timeouts pointing at the agent. Stop where the truth is still local.
@@ -102,7 +117,6 @@ if (!usable) checks.finish();
 // The room name openconv signs is the whole reason happy can name a conversation at all:
 // happy pulls `conv_...` out of the JWT rather than being told it in a field. An
 // ElevenLabs-signed token would clear an `allowed: true` check and fail this one.
-const claims = JSON.parse(Buffer.from(minted.conversationToken.split(".")[1], "base64url").toString());
 checks.record(
   `the token happy handed back was signed by ${issuer}, for the room happy named`,
   claims.iss === issuer && claims.video?.room === minted.conversationId,
