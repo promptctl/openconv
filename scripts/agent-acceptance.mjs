@@ -27,8 +27,8 @@ console.log(`joined ${caller.conversationId} at ${livekitUrl}\n`);
 checks.record("the client joined the conversation room", true, caller.conversationId);
 
 checks.record(
-  "the agent is a connected participant",
-  await caller.waitFor(() => caller.agentPresent(), 25_000, "the agent to join"),
+  "the agent is a connected participant and holds this conversation's configuration",
+  await caller.agentConfigured(25_000),
   caller.roster().join(", "),
 );
 

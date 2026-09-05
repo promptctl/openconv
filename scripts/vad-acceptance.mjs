@@ -60,19 +60,20 @@ const scratch = mkdtempSync(join(tmpdir(), "openconv-"));
 const opener = recordSpeech(OPENER, join(scratch, "opener.wav"));
 const interjection = recordSpeech(INTERJECTION, join(scratch, "interjection.wav"));
 
-const caller = await Caller.join({ openconv, livekitUrl, xiApiKey, participantName: "u_vad" });
+const caller = await Caller.join({
+  openconv,
+  livekitUrl,
+  xiApiKey,
+  participantName: "u_vad",
+  settings: { prompt: PROMPT },
+});
 console.log(`joined ${caller.conversationId} at ${livekitUrl}\n`);
 
 checks.record(
-  "the agent is in the conversation",
-  await caller.waitFor(() => caller.agentPresent(), 25_000, "the agent to join"),
+  "the agent is in the conversation and holds its configuration",
+  await caller.agentConfigured(25_000),
   caller.roster().join(", "),
 );
-
-await caller.send({
-  type: "conversation_initiation_client_data",
-  conversation_config_override: { agent: { prompt: { prompt: PROMPT } } },
-});
 
 checks.record(
   "the conversation was announced",

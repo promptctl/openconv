@@ -26,6 +26,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use openconv_agent::tts::{TtsError, VoiceListing};
+use openconv_protocol::Language;
 use serde::Serialize;
 
 /// Where the page lives. The trailing slash is load-bearing: the page imports its own
@@ -66,6 +67,14 @@ const ASSETS: &[Asset] = &[
         content_type: "text/javascript; charset=utf-8",
         body: include_str!("../../../web/caller.js"),
     },
+    // The handshake itself, which the acceptance runs under `scripts/` import off the
+    // filesystem while the page fetches it from here. One file with two consumers is the
+    // point of it: they used to hold the sequence separately and drifted apart.
+    Asset {
+        path: "/call/conversation.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: include_str!("../../../web/conversation.js"),
+    },
     // Vendored, not fetched from a CDN at load time: an ES module import carries no
     // Subresource Integrity, and a page holding an API key and an open microphone is
     // worth pinning to bytes rather than to a version string. `web/vendor/PROVENANCE.md`
@@ -105,16 +114,31 @@ pub fn router() -> Router<AppState> {
         .route("/call/voices", get(voices))
 }
 
-/// What the page cannot know about the deployment serving it.
+/// What the page cannot know without being told.
 #[derive(Debug, Serialize)]
 struct CallConfig {
     livekit_url: String,
+    /// The languages a conversation may be switched to.
+    ///
+    /// Here rather than in the page's own markup because the union is closed: a code this
+    /// crate does not accept fails the whole client message to deserialize, taking the
+    /// prompt, the voice and the first message down with it and leaving the conversation
+    /// on the deployment default in silence. Answered from [`Language::ALL`], so the page
+    /// can only offer what openconv can actually be told. [LAW:one-source-of-truth]
+    ///
+    /// Beside the SFU rather than on a route of its own, which is the split [`voices`]
+    /// argues for: both of these are values this process already holds, and neither can
+    /// fail in a way the other should have to survive.
+    languages: Vec<String>,
 }
 
 /// Unauthenticated, like `/health`: the SFU hostname is what every client dials and is
 /// not a credential. The token is the credential, and that mint is authenticated.
 async fn config(State(state): State<AppState>) -> impl IntoResponse {
-    Json(CallConfig { livekit_url: state.livekit.public_signaling_url() })
+    Json(CallConfig {
+        livekit_url: state.livekit.public_signaling_url(),
+        languages: Language::ALL.iter().map(|language| language.code()).collect(),
+    })
 }
 
 /// The voices the page can offer, read from the text-to-speech server this deployment

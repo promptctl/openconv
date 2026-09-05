@@ -1,22 +1,18 @@
 // Being the caller, in a browser: mint a token, join the room, publish the microphone,
-// and hand back everything the agent sends. Nothing here touches the page — this
-// decides what a call *is*, and `app.js` decides what one looks like.
+// and hand back everything the agent sends. Nothing here touches the page — this decides
+// what a call *is*, and `app.js` decides what one looks like.
 //
-// This is knowingly a second implementation of the handshake in
-// `scripts/lib/caller.mjs`, whose own header warns that exactly this is how two clients
-// drift apart. It is unavoidable rather than careless: that file drives
-// `@livekit/rtc-node` and this drives `livekit-client` — two SDKs with different types
-// for the same protocol, neither of which runs where the other does. What it costs is
-// real, so the mitigation is shape: this follows the Node caller step for step (mint,
-// recover the room from the token, connect, subscribe, publish one microphone) instead
-// of finding its own way, which keeps any drift between them legible as a difference
-// rather than buried in a different design — including the configuration message, which
-// every acceptance script sends once the agent is in the room and this page sends at the
-// same point for the same reason. This page then sends it again whenever the chosen voice
-// changes, which is the one thing the scripts have no use for: a script asserts what a
-// call was configured as, and only a person listening has any reason to change their mind
-// mid-call. The Node scripts remain the acceptance authority; this page is for hearing
-// what they can only assert.
+// The handshake itself is not here. Minting, joining and telling the agent what the
+// conversation is live in `conversation.js`, which the acceptance runs drive too; this
+// file is the browser half of the transport seam that module names, plus the things only
+// a browser has — a microphone to open, an autoplay policy to get past, and a person who
+// may change their mind about the voice while the call is running.
+//
+// That split is the whole point. This page used to hold its own copy of the handshake and
+// follow the Node caller "step for step" by the diligence of whoever edited both, which
+// worked until it didn't: the scripts learned to publish the session configuration and
+// the page did not, so every conversation a person actually held ran on the default
+// prompt while a green acceptance suite reported otherwise. [LAW:one-source-of-truth]
 
 // Vendored rather than fetched from a CDN at load time. An ES module import has no
 // Subresource Integrity mechanism, so a pinned URL constrains which release is asked
@@ -30,16 +26,7 @@ import {
   Track,
 } from "./vendor/livekit-client.js";
 
-/**
- * Whether a participant in the room is the agent rather than another caller.
- *
- * The identity openconv mints for it — `agent_<conversation>`, from
- * `crates/openconv-server/src/livekit.rs` — recognised by the same prefix
- * `scripts/lib/caller.mjs` recognises it by. Matched rather than re-decided: two clients
- * disagreeing about who counts as the agent would have them disagree about the same
- * room, and this is the fact that decides who gets told what the call should sound like.
- */
-const isAgent = (identity) => identity.startsWith("agent_");
+import { NotTold, conversationWith } from "./conversation.js";
 
 /**
  * Reports a failure nobody is waiting on, by letting the page's own reporter have it.
@@ -56,96 +43,51 @@ const reportDetached = (failure) =>
   });
 
 /**
- * Tells the agents among `present` what this call should sound like.
+ * Lets a configure that failed cost this call the voice that was chosen, not the call.
  *
- * The message the SDK opens every conversation with, carrying only the voice. An
- * initiation message with no prompt override settles the *same* default prompt the agent
- * is already running under — `SessionConfig::settle` reads an absent override as "use the
- * default" rather than as "clear the prompt" — so this adds a voice and changes nothing
- * else about the conversation.
+ * The room is up and the agent is in it by the time this can happen — only the message
+ * saying what the conversation is did not land, which leaves a working call running the
+ * deployment's defaults. Tearing that down answers a dropdown with a hang-up, and the
+ * agent the mint dispatched is in the room being paid for either way.
  *
- * Sent whenever an agent needs telling, which is on arrival and again whenever the choice
- * changes, and the agent takes the later one the same way it took the first: the server
- * re-settles its `SessionConfig` on every `ConversationInitiation`. Since only the voice
- * is ever named, a re-send leaves the prompt on the default and fires no first message —
- * a mid-call change swaps the voice and nothing else. That is the whole reason this is a
- * function of the agents and the voice rather than something the join does once.
+ * The conversation comes off the failure rather than being recovered from somewhere else,
+ * because a `NotTold` is precisely the failure that has one. [LAW:one-source-of-truth]
  *
- * `null` rather than an omitted field or an empty string, and the difference is real in
- * both directions. Serde reads an explicit null into the same `None` an omitted field
- * gives, which is the client saying it wants no particular voice and is exactly what the
- * blank option on the form means; an empty string would instead ask the text-to-speech
- * server to resolve `""` as a voice id. Naming the deployment's own default here would be
- * worse than either — that answer belongs to the server, and a copy of it on this page is
- * one that can go stale. [LAW:one-source-of-truth]
+ * Every other failure is a call that never opened and is re-raised untouched, for `join`'s
+ * own cleanup to release the room and the microphone. Reported either way, never swallowed.
+ * [LAW:no-silent-failure]
  *
- * Told one at a time so that a failure names the agent it could not reach. Telling nobody
- * is an empty list rather than a case: a room with no agent in it yet, and a room whose
- * agent has left, both take the same path as a room with one. [LAW:dataflow-not-control-flow]
+ * `report` is a parameter, and exported alongside it, because reporting is half of what
+ * this function promises — a failure that costs only the voice must still be seen — and a
+ * promise whose effect nothing can observe is not one a test can hold it to. The page
+ * passes nothing and gets `reportDetached`, which throws where no caller is listening and
+ * so cannot be handed a spy. [LAW:effects-at-boundaries]
  */
-const tellAgents = (room, present, voiceId) =>
-  Promise.all(
-    present.filter(isAgent).map((identity) =>
-      room.localParticipant
-        .publishData(
-          new TextEncoder().encode(
-            JSON.stringify({
-              type: "conversation_initiation_client_data",
-              conversation_config_override: { tts: { voice_id: voiceId || null } },
-            }),
-          ),
-          { reliable: true },
-        )
-        .catch((failure) => {
-          throw new Error(
-            `${identity} could not be told which voice to speak in: ${failure.message}`,
-            { cause: failure },
-          );
-        }),
-    ),
-  );
+export const keepTheCall = (failure, report = reportDetached) => {
+  if (!(failure instanceof NotTold)) throw failure;
+
+  report(failure);
+  return failure.conversationId;
+};
 
 /**
- * Mints a conversation token, which is also what dispatches the agent into the room.
+ * The three room operations `conversation.js` drives, in this SDK's terms.
  *
- * The same endpoint Happy's server calls, at the origin serving this page — a parallel
- * test-only mint would prove a path nobody in production takes.
+ * The whole of what the shared handshake knows about being in a browser. Everything else
+ * livekit-client offers — tracks, autoplay, the roster as objects rather than identities —
+ * stays on this side of the seam, because none of it is part of saying what a conversation
+ * is. [LAW:locality-or-seam]
  *
- * A parser rather than a check: it returns a token and the conversation that token
- * admits you to, or it throws carrying whatever the server said. There is no arm where
- * a caller receives an empty token and has to work out for itself whether the mint
- * happened.
+ * Exported because it is the browser half of that seam and the half that can be wrong on
+ * its own: a `publishData` sent unreliably, or a roster read as objects where identities
+ * were wanted, breaks every caller on this page while `conversation.js` stays provably
+ * correct. `caller.test.mjs` holds it to that without a browser.
  */
-async function mint({ apiKey, agentId, participantName }) {
-  const url = new URL("/v1/convai/conversation/token", location.origin);
-  url.searchParams.set("agent_id", agentId);
-  url.searchParams.set("participant_name", participantName);
-
-  const response = await fetch(url, { headers: { "xi-api-key": apiKey } });
-  const body = await response.text();
-  if (!response.ok) {
-    throw new Error(`mint failed: HTTP ${response.status} ${body}`);
-  }
-
-  const { token } = JSON.parse(body);
-
-  // The conversation ID *is* the room name, which is what makes it recoverable from the
-  // token the same way both of Happy's clients recover it.
-  return { token, conversationId: decodeClaims(token).video.room };
-}
-
-/**
- * Reads a JWT's payload.
- *
- * `atob` decodes base64, and a JWT carries base64*url* — a different alphabet in two
- * characters. Feeding one to the other does not fail; it yields bytes that are wrong
- * only sometimes, depending on the claims, which is the worst way for a bug to behave.
- */
-function decodeClaims(token) {
-  const payload = token.split(".")[1].replaceAll("-", "+").replaceAll("_", "/");
-  const bytes = Uint8Array.from(atob(payload), (character) => character.codePointAt(0));
-  return JSON.parse(new TextDecoder().decode(bytes));
-}
+export const transportOf = (room, livekitUrl) => ({
+  connect: (token) => room.connect(livekitUrl, token),
+  participants: () => [...room.remoteParticipants.keys()],
+  publishBytes: (payload) => room.localParticipant.publishData(payload, { reliable: true }),
+});
 
 /** A conversation this browser has joined. Holding one means the join worked. */
 export class Call {
@@ -160,7 +102,7 @@ export class Call {
    * against — so prompting for the microphone afterwards means a denied permission
    * leaves an agent sitting alone in a room that will be charged for.
    *
-   * `chosenVoice` is a reader rather than a voice, and that is what keeps the control on
+   * `settings` is a reader rather than settings, and that is what keeps the controls on
    * the page and the agent in the room from ever disagreeing: read afresh at each send,
    * there is no copy here to go stale, so a call started on one voice and changed to
    * another needs nothing kept in step. [LAW:one-source-of-truth]
@@ -170,7 +112,7 @@ export class Call {
     apiKey,
     agentId,
     participantName,
-    chosenVoice,
+    settings,
     onEvent,
     onTrack,
     onState,
@@ -178,44 +120,38 @@ export class Call {
   }) {
     const microphone = await createLocalAudioTrack();
     const room = new Room();
+    const conversation = conversationWith(transportOf(room, livekitUrl), settings);
 
     // Who is in the room has one source — the room's own roster — and the presence rows
     // are its diff. [LAW:one-source-of-truth] The events say *when* to look, never what
-    // is true: livekit mutates the roster before it emits, `set` then
-    // `emitWhenConnected` on arrival and `delete` then `emit` on departure, so the
-    // roster is already correct inside every handler.
+    // is true: livekit mutates the roster before it emits, `set` then `emitWhenConnected`
+    // on arrival and `delete` then `emit` on departure, so the roster is already correct
+    // inside every handler.
     //
     // Reporting from the event's own payload instead would announce twice: the sweep
-    // below and the handler both see anyone who arrives while `connect` is settling, and
-    // no ordering of the two removes that overlap — the sweep has to run late enough to
-    // find an agent already in the room and early enough to configure it before the
-    // microphone is live. [LAW:no-ambient-temporal-coupling] A diff is right whatever the
-    // arrival order, where a snapshot taken at a cleverer moment would only make the
-    // overlap rarer.
+    // inside `open` and the handler both see anyone who arrives while `connect` is
+    // settling, and no ordering of the two removes that overlap. [LAW:no-ambient-temporal-coupling]
+    // A diff is right whatever the arrival order, where a snapshot taken at a cleverer
+    // moment would only make the overlap rarer.
     let reported = new Set();
     const reportPresence = () => {
       const present = new Set(room.remoteParticipants.keys());
-      const arrived = [...present].filter((identity) => !reported.has(identity));
-      const left = [...reported].filter((identity) => !present.has(identity));
 
-      for (const identity of arrived) onPresence(identity, "joined");
-      for (const identity of left) onPresence(identity, "left");
+      for (const identity of [...present].filter((who) => !reported.has(who))) {
+        onPresence(identity, "joined");
+      }
+      for (const identity of [...reported].filter((who) => !present.has(who))) {
+        onPresence(identity, "left");
+      }
       reported = present;
 
-      // Every agent that just arrived is told what this call should sound like, driven
-      // off the same diff the rows above are. A control message reaches whoever is in the
-      // room at the instant it is published and nobody else — there is no queue for a
-      // participant yet to join — so a configuration sent on a fixed schedule would be
-      // right only in whichever arrival order it was written against.
-      // [LAW:no-ambient-temporal-coupling] Off the diff it is right in both: the agent
-      // dispatched by the mint is found by the sweep, and one that takes longer to arrive
-      // is found by the event, each exactly once.
-      //
-      // The promise is returned rather than dropped so `join` can order its sweep against
-      // the microphone. Dropped from an event handler a rejection reaches the page's
-      // failure banner unhandled; `join` hands its own to `reportDetached`.
-      // [LAW:no-silent-failure]
-      return tellAgents(room, arrived, chosenVoice());
+      // Every agent that just arrived is told what this conversation is, off the shared
+      // module's own diff rather than off this one — the rows above are about everybody
+      // in the room and that is about the agents, two questions the same roster answers.
+      // Returned rather than dropped so `join` can order its own failure reporting:
+      // dropped from an event handler a rejection reaches the page's failure banner
+      // unhandled. [LAW:no-silent-failure]
+      return conversation.arrived().catch(reportDetached);
     };
 
     // Listeners are attached before connecting: a track can be subscribed and a control
@@ -232,23 +168,29 @@ export class Call {
     });
 
     try {
-      const { token, conversationId } = await mint({ apiKey, agentId, participantName });
-      await room.connect(livekitUrl, token);
-
-      // The agent is dispatched by the mint, so it is usually in the room *before* this
-      // client is — and livekit suppresses `ParticipantConnected` until the connection
-      // is established, so the common case never announces itself through the event.
-      // Swept once here, which is the same diff the events take.
+      // Mints, connects, and configures whoever is already in the room — the shared
+      // sequence, which the acceptance runs execute line for line because it is the same
+      // lines. The configure inside it lands before the microphone goes live on the next
+      // statement, which is the ordering that matters: an agent told which voice to use
+      // after the caller could already be speaking is an agent that changes voice partway
+      // through a reply.
       //
-      // Immediately after connecting rather than at the end of the join, because this
-      // sweep is also what configures an agent that is already here, and the microphone
-      // goes live on the next line. An agent told which voice to use after the caller
-      // could already be speaking is an agent that changes voice partway through a reply.
-      //
-      // Awaited for that ordering and not for its success: a configure that fails costs
+      // Awaited for that ordering and not for its success. A configure that fails costs
       // this call the voice that was chosen, where failing the join would cost the call
-      // itself over a dropdown.
-      await reportPresence().catch(reportDetached);
+      // itself over a dropdown — so the one failure that leaves a usable call is caught
+      // here and every other one is not.
+      const conversationId = await conversation
+        .open({
+          openconv: location.origin,
+          apiKey,
+          agentId,
+          participantName,
+        })
+        .catch(keepTheCall);
+
+      // The rows for anyone already here, which `open`'s own sweep configured but did not
+      // announce. Its diff is over agents and this one is over everybody.
+      reportPresence();
 
       await room.localParticipant.publishTrack(microphone, {
         source: Track.Source.Microphone,
@@ -263,7 +205,7 @@ export class Call {
       // whose audio is muted is still a call, and the page says which it got.
       const audible = await room.startAudio().then(() => room.canPlaybackAudio, () => false);
 
-      return new Call(room, microphone, conversationId, audible, chosenVoice);
+      return new Call(room, microphone, conversationId, audible, conversation);
     } catch (error) {
       // The room and the microphone are both live by now on some paths and not others,
       // and a page left holding either one has an open capture light and a participant
@@ -283,7 +225,7 @@ export class Call {
     }
   }
 
-  constructor(room, microphone, conversationId, audible, chosenVoice) {
+  constructor(room, microphone, conversationId, audible, conversation) {
     this.room = room;
     this.microphone = microphone;
     /** What the server logs this call under, so a call on screen can be found in a log. */
@@ -297,37 +239,26 @@ export class Call {
      */
     this.audible = audible;
     /**
-     * How to find out which voice this call is supposed to be in.
+     * The conversation these agents are holding, which knows how to say what it is.
      *
-     * The reader handed to `join`, kept rather than the voice it returned. A call that
-     * remembered the answer would be a second copy of what the page already holds, and
-     * the two would part company the instant anyone touched the control — which is
-     * precisely the bug this reader exists to make unrepresentable.
-     * [LAW:one-source-of-truth]
+     * Kept rather than the settings it was opened with. A call that remembered the
+     * answers would be a second copy of what the page already holds, and the two would
+     * part company the instant anyone touched a control — which is precisely the bug the
+     * reader inside it exists to make unrepresentable. [LAW:one-source-of-truth]
      */
-    this.chosenVoice = chosenVoice;
+    this.conversation = conversation;
   }
 
   /**
-   * Makes the agents in this call speak in the voice that is chosen *now*.
-   *
-   * The other half of the arrival sweep, and deliberately the same send: an agent that
-   * arrives late and an agent whose voice was changed both need to be told the current
-   * answer, and there is only one way to tell them. What differs is which agents — the
-   * ones that just arrived, or everyone in the room — so that difference is a list of
-   * identities rather than two code paths. [LAW:dataflow-not-control-flow]
-   *
-   * The roster is read here rather than tracked, for the reason the presence diff reads
-   * it: livekit keeps `remoteParticipants` correct and the events only say when to look.
-   * [LAW:one-source-of-truth]
+   * Makes the agents in this call run on the settings the page is showing *now*.
    *
    * Failure is the caller's to report, and it is worth reporting loudly: what it means is
-   * that the agent is still speaking in the previous voice while the page shows the new
-   * one, and that gap is invisible from either end without someone saying so.
+   * that the agent is still on the previous settings while the page shows the new ones,
+   * and that gap is invisible from either end without someone saying so.
    * [LAW:no-silent-failure]
    */
-  useChosenVoice() {
-    return tellAgents(this.room, [...this.room.remoteParticipants.keys()], this.chosenVoice());
+  useChosenSettings() {
+    return this.conversation.everyone();
   }
 
   async leave() {

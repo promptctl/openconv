@@ -43,9 +43,14 @@ console.log(`speaking into ${caller.conversationId}\n`);
 
 checks.record("joined the conversation", true, caller.conversationId);
 
+// This run overrides nothing, so the handshake sends a message full of nulls rather than
+// skipping a step — and `SessionConfig::settle` reads that as "use the defaults", landing
+// exactly where a conversation starts before any client speaks. Pinned by
+// `a_message_that_overrides_nothing_settles_where_a_conversation_starts`, which is what
+// lets every caller take one path instead of this one taking a shorter one.
 checks.record(
   "the agent is present to listen",
-  await caller.waitFor(() => caller.agentPresent(), 30_000, "the agent"),
+  await caller.agentConfigured(30_000),
   caller.roster().join(", "),
 );
 

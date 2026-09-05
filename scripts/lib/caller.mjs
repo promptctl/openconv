@@ -25,6 +25,13 @@ import {
   TrackSource,
 } from "@livekit/rtc-node";
 
+// The handshake, shared with the browser page that `web/caller.js` drives. Imported off
+// the filesystem here and fetched from `/call/conversation.js` there; one file either
+// way, which is the point — these two used to hold the sequence separately and drifted,
+// and the page spent months configuring nothing while this side's runs stayed green.
+// [LAW:one-source-of-truth]
+import { conversationOf, conversationWith, isAgent } from "../../web/conversation.js";
+
 /// Frames arrive and are captured in ten-millisecond units, on both sides of the room.
 const FRAMES_PER_SECOND = 100;
 
@@ -326,6 +333,31 @@ export function recordSpeech(line, path, { sampleRate = 48_000 } = {}) {
   return readRecording(path);
 }
 
+/**
+ * The three room operations the shared handshake drives, in @livekit/rtc-node's terms.
+ *
+ * The node half of the seam whose browser half is `transportOf` in `web/caller.js`.
+ * `autoSubscribe` and `dynacast` are this side's business: they are how this SDK spells
+ * "hear everything published", which a browser does by default and which no part of saying
+ * what a conversation is depends on. [LAW:locality-or-seam]
+ *
+ * Exported for the reason the browser half is — it is the half that can be wrong on its
+ * own, and silently. An unreliable `publishData` drops a configuration under load with
+ * every script believing the agent was told; a roster handed over as participant objects
+ * makes every identity `undefined`, so `isAgent` matches nobody and no agent is told at
+ * all. Both end with a script asserting against a default-configured agent and blaming the
+ * agent. `caller.test.mjs` holds this side to them without a room.
+ */
+export const transportOf = (room, livekitUrl) => ({
+  connect: (token) =>
+    Promise.race([
+      room.connect(livekitUrl, token, { autoSubscribe: true, dynacast: false }),
+      rejectAfter(20_000, "the room connection"),
+    ]),
+  participants: () => Array.from(room.remoteParticipants.values()).map((p) => p.identity),
+  publishBytes: (payload) => room.localParticipant.publishData(payload, { reliable: true }),
+});
+
 /** A client that has joined a conversation. Reaching one means the join worked. */
 export class Caller {
   /**
@@ -340,17 +372,26 @@ export class Caller {
     xiApiKey,
     participantName = "u_acceptance",
     agentId = "agent_happy",
+    settings = {},
   }) {
-    const mint = new URL(`${openconv.replace(/\/$/, "")}/v1/convai/conversation/token`);
-    mint.searchParams.set("agent_id", agentId);
-    mint.searchParams.set("participant_name", participantName);
+    const caller = new Caller(null, livekitUrl, settings);
+    await caller.open({ openconv, apiKey: xiApiKey, agentId, participantName });
+    return caller;
+  }
 
-    const response = await fetch(mint, { headers: { "xi-api-key": xiApiKey } });
-    if (!response.ok) {
-      throw new Error(`mint failed: HTTP ${response.status} ${await response.text()}`);
-    }
-    const { token } = await response.json();
-    return Caller.at(livekitUrl, token);
+  /**
+   * Mints the conversation, joins its room, and tells whoever is already in it.
+   *
+   * Split from `join` because what a failure costs here is a policy rather than a step.
+   * `web/caller.js` catches `NotTold` and keeps the call, on the grounds that a caller who
+   * can hear the agent would rather not lose the room over a configure that missed. A
+   * script must do the opposite: a kept call is a run that goes on to assert against an
+   * agent still holding the deployment default, and reports green. The two sides differ
+   * deliberately, and a policy stated only by the absence of a `catch` is one a later
+   * refactor can copy away without anything noticing. [LAW:verifiable-goals]
+   */
+  async open(credentials) {
+    this.conversationId = await this.conversation.open(credentials);
   }
 
   /**
@@ -361,25 +402,49 @@ export class Caller {
    * in it, and building a second client to get one would mean measuring a different
    * program than the acceptance scripts run.
    *
-   * The room name is read from the token rather than passed beside it, because the two
-   * cannot then disagree. For a conversation that name *is* the conversation ID, which is
-   * how both of Happy's clients recover it.
+   * No configuration is published, because there is nobody to publish it to: this is the
+   * path for a room openconv never minted. `join` is the one that opens a *conversation*,
+   * and it is the one that runs the handshake.
    */
   static async at(livekitUrl, token) {
-    const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64").toString());
-    const caller = new Caller(claims.video.room, livekitUrl);
-
-    await Promise.race([
-      caller.room.connect(livekitUrl, token, { autoSubscribe: true, dynacast: false }),
-      rejectAfter(20_000, "the room connection"),
-    ]);
+    const caller = new Caller(conversationOf(token), livekitUrl);
+    await caller.transport.connect(token);
     return caller;
   }
 
-  constructor(conversationId, livekitUrl) {
+  constructor(conversationId, livekitUrl, settings = {}) {
     this.conversationId = conversationId;
     this.livekitUrl = livekitUrl;
     this.room = new Room();
+
+    this.transport = transportOf(this.room, livekitUrl);
+
+    /**
+     * This conversation, and what its agents have been told about it.
+     *
+     * The settings are fixed for a run — a script asserts what a call *was* configured
+     * as — so the reader the shared module wants always answers the same thing. That is
+     * the same code path the page takes with a reader that answers differently every
+     * time, not a simpler one. [LAW:dataflow-not-control-flow]
+     */
+    this.conversation = conversationWith(this.transport, () => settings);
+
+    /**
+     * Every attempt to tell an agent what this conversation is, so a script can wait for
+     * all of them.
+     *
+     * An agent dispatched by the mint is usually in the room before this client, and one
+     * that takes longer arrives on an event — two orders, and the message reaches only
+     * whoever is in the room when it is published. Holding the attempts is what lets
+     * `agentConfigured` mean the same thing in both. [LAW:no-ambient-temporal-coupling]
+     *
+     * A list, rather than one promise each arrival chains a `then` onto. A chain carries
+     * two facts in one value — the attempts made, and the outcome to wait on — and nothing
+     * runs after a rejection in a chain, so one failed publish would stop every later
+     * agent from being told at all while re-reporting the first agent's error for the rest
+     * of the run. Attempts that cannot reach each other cannot do that.
+     */
+    this.configuring = [];
 
     /** Every control event the agent published, in arrival order. */
     this.controlEvents = [];
@@ -406,7 +471,17 @@ export class Caller {
         this.controlEvents.push({ type: "<not json>", raw: text });
       }
     });
-    this.room.on(RoomEvent.ParticipantConnected, (p) => this.participants.push(p.identity));
+    this.room.on(RoomEvent.ParticipantConnected, (p) => {
+      this.participants.push(p.identity);
+
+      // A late agent is told the moment it arrives, off the shared module's own diff, so
+      // the two arrival orders are one path. Deliberately not caught: an acceptance run
+      // whose agent never learned what the conversation is would otherwise go on to
+      // assert against the default prompt and report a green pass on a conversation
+      // nobody configured. Unhandled here, node prints it and exits non-zero.
+      // [LAW:no-silent-failure]
+      this.configuring.push(this.conversation.arrived());
+    });
 
     /**
      * Who the SFU has said is talking.
@@ -484,15 +559,54 @@ export class Caller {
     return delivery(stats.toJson());
   }
 
-  /** The remote participants currently in the room. */
+  /**
+   * The remote participants currently in the room.
+   *
+   * Read through the transport rather than off the room, because turning this SDK's
+   * participants into identities is precisely what that seam is for, and a second reading
+   * here could disagree with the one the handshake matches on. [LAW:one-source-of-truth]
+   */
   roster() {
-    return Array.from(this.room.remoteParticipants.values()).map((p) => p.identity);
+    return this.transport.participants();
   }
 
   /** True once an agent is present, whether it joined before or after this caller. */
   agentPresent() {
-    const isAgent = (identity) => identity.startsWith("agent_");
     return this.participants.some(isAgent) || this.roster().some(isAgent);
+  }
+
+  /**
+   * Waits until an agent is in the room *and* holding this conversation's configuration.
+   *
+   * One call rather than the two lines every script used to write — wait for the agent,
+   * then publish the configuration — because those two lines were an ordering that had to
+   * be remembered, and two of the seven scripts did not: they published before waiting,
+   * and reached the agent only because publishing a microphone happened to wait for a
+   * subscriber first. That is the kind of correctness that holds until something else
+   * gets faster. [LAW:no-ambient-temporal-coupling]
+   *
+   * `ms` bounds this call, not each wait inside it. The two waits run in sequence, so
+   * giving each its own `ms` would let a caller that asked for 25 seconds wait 50 — an
+   * agent arriving at 24.9s would hand the configure a full fresh budget, and a script
+   * that meant to fail fast would sit twice as long before saying anything. Every call
+   * site passes one number and reads it as one budget, so there is one deadline here and
+   * both waits draw down what is left of it. [LAW:one-source-of-truth]
+   */
+  async agentConfigured(ms = 25_000) {
+    const until = Date.now() + ms;
+    const remaining = () => until - Date.now();
+
+    const present = await this.waitFor(() => this.agentPresent(), remaining(), "the agent");
+
+    // Bounded like every other room operation here. A publish that rejects ends the run
+    // with its own message, but one that never settles at all — a stalled data channel —
+    // would otherwise hang the script forever with nothing said, which is the one failure
+    // this module's timeouts exist to make impossible. [LAW:no-silent-failure]
+    await Promise.race([
+      Promise.all(this.configuring),
+      rejectAfter(remaining(), "the agent to be told what this conversation is"),
+    ]);
+    return present;
   }
 
   /** Publishes one client control event, as the SDK does over the data channel. */

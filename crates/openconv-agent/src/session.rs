@@ -78,6 +78,31 @@ impl SessionConfig {
             },
         }
     }
+
+    /// The opening line this configuration owes the caller, given the one it replaces.
+    ///
+    /// A first message *opens* a conversation, and a conversation opens once — so read off
+    /// the difference rather than off the message, the greeting follows the caller naming a
+    /// *new* opening line and nothing else. "The client sent a first message" and "the
+    /// client asked to be greeted" were the same fact only while one control could send
+    /// one: every control on the page now publishes the whole configuration on every
+    /// change, which is what lets one message shape serve every caller
+    /// (`web/conversation.js`), and it means a voice picked mid-call arrives carrying the
+    /// greeting the caller has already heard.
+    ///
+    /// What answering that off the message costs, rather than merely a greeting twice: the
+    /// loop starts a second turn, and `Answering::start` stops the one already speaking to
+    /// make room for it — so the caller is cut off mid-sentence to be told hello again.
+    ///
+    /// There is no "nothing came before" arm because there is no such state: a conversation
+    /// starts settled from an empty payload, whose `first_message` is already `None`, so the
+    /// first configuration to name a greeting differs from it and owes it.
+    /// [LAW:dataflow-not-control-flow]
+    pub fn opening_after(&self, previous: &Self) -> Option<&str> {
+        self.first_message
+            .as_deref()
+            .filter(|line| previous.first_message.as_deref() != Some(*line))
+    }
 }
 
 /// Replaces `{{name}}` placeholders with the client's dynamic variables.
@@ -155,6 +180,88 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), serde_json::Value::String((*v).to_owned())))
             .collect()
+    }
+
+    /// Every caller now sends the same message shape whether it overrides anything or
+    /// not, with `null` standing where nothing was asked for — see `web/conversation.js`,
+    /// which is the one place any of them builds it. That only holds together if a
+    /// message full of nulls means "use the defaults", so this is the claim that lets the
+    /// acceptance runs which used to send *nothing* take the same path as the ones which
+    /// always configured: settling this payload has to land exactly where
+    /// `crates/openconv-agent/src/lib.rs` starts a conversation before any client speaks.
+    #[test]
+    fn a_message_that_overrides_nothing_settles_where_a_conversation_starts() {
+        let sent: ConversationInitiationClientData = serde_json::from_str(
+            r#"{
+                "conversation_config_override": {
+                    "agent": {"prompt": {"prompt": null}, "first_message": null, "language": null},
+                    "tts": {"voice_id": null, "model_id": null}
+                },
+                "dynamic_variables": null
+            }"#,
+        )
+        .expect("the message every caller sends");
+
+        assert_eq!(
+            SessionConfig::settle("default prompt", sent),
+            SessionConfig::settle("default prompt", Default::default()),
+        );
+    }
+
+    /// The same message with every setting filled in, which is the other half of the
+    /// contract: that each one lands where the caller meant it to and not merely that the
+    /// message parses. A field renamed on this side goes on deserializing perfectly — it
+    /// simply stops being read, and the override silently reverts to the default, which is
+    /// this ticket's own bug wearing a different hat. Here that shows up as a failed
+    /// assertion instead of as a conversation running on a prompt nobody chose.
+    ///
+    /// Written out as the wire bytes rather than built from the types, because the types
+    /// are what is under test. `web/conversation.js` is the only thing that produces this
+    /// shape and `web/conversation.test.mjs` pins the identical bytes from that side, so
+    /// the two ends of one wire are each nailed down where they can be checked without the
+    /// other running. [LAW:one-source-of-truth]
+    #[test]
+    fn every_setting_a_caller_can_express_reaches_the_conversation() {
+        let sent: ConversationInitiationClientData = serde_json::from_str(
+            r#"{
+                "conversation_config_override": {
+                    "agent": {
+                        "prompt": {"prompt": "you are a voice interface"},
+                        "first_message": "ready when you are",
+                        "language": "es"
+                    },
+                    "tts": {"voice_id": "bm_george", "model_id": "piper"}
+                },
+                "dynamic_variables": {"sessionId": "sess_42"}
+            }"#,
+        )
+        .expect("the message every caller sends");
+
+        let config = SessionConfig::settle("unused default", sent);
+
+        assert_eq!(config.system_prompt, "you are a voice interface");
+        assert_eq!(config.first_message.as_deref(), Some("ready when you are"));
+        assert_eq!(config.voicing.language, Some(Language::Es));
+        assert_eq!(config.voicing.voice_id.as_deref(), Some("bm_george"));
+        assert_eq!(config.voicing.model_id.as_deref(), Some("piper"));
+    }
+
+    /// An explicit null and an omitted field are the same answer, which is what lets the
+    /// one builder emit a fixed shape rather than assembling itself out of whichever
+    /// settings happen to be set. Asserted on the axis where getting it wrong is silent:
+    /// `""` would reach the text-to-speech server as a voice id to resolve.
+    #[test]
+    fn a_null_and_a_blank_both_mean_no_particular_voice() {
+        let voiced = |json: &str| {
+            let sent: ConversationInitiationClientData =
+                serde_json::from_str(json).expect("a client message");
+            SessionConfig::settle("unused", sent).voicing
+        };
+
+        let nothing = voiced(r#"{"conversation_config_override": {"tts": {"voice_id": null}}}"#);
+        assert_eq!(nothing.voice_id, None);
+        assert_eq!(voiced(r#"{"conversation_config_override": {"tts": {"voice_id": ""}}}"#), nothing);
+        assert_eq!(voiced(r#"{"conversation_config_override": {"tts": {}}}"#), nothing);
     }
 
     #[test]
@@ -257,6 +364,94 @@ mod tests {
             }),
         );
         assert_eq!(blank.first_message, None, "whitespace is not a greeting");
+    }
+
+    /// One caller's configuration as the page actually publishes it: every field named
+    /// every time, which is the shape that made the greeting stop meaning "greet me".
+    fn published(
+        first_message: Option<&str>,
+        voice: Option<&str>,
+        language: Option<Language>,
+    ) -> SessionConfig {
+        SessionConfig::settle(
+            "default prompt",
+            ConversationInitiationClientData {
+                conversation_config_override: Some(ConversationConfigOverride {
+                    agent: Some(ConversationConfigOverrideAgent {
+                        first_message: first_message.map(str::to_owned),
+                        language,
+                        ..Default::default()
+                    }),
+                    tts: Some(ConversationConfigOverrideTts {
+                        voice_id: voice.map(str::to_owned),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The conversation the agent is holding before any client has spoken, which is what
+    /// the first configuration is compared against. Built the way `lib.rs` builds it, so a
+    /// starting config that gained a greeting would fail here rather than in a live call.
+    fn before_any_client_spoke() -> SessionConfig {
+        SessionConfig::settle("default prompt", Default::default())
+    }
+
+    #[test]
+    fn the_first_configuration_to_name_an_opening_line_owes_it() {
+        let opened = published(Some("Hola"), Some("es_ES-davefx-medium"), Some(Language::Es));
+        assert_eq!(opened.opening_after(&before_any_client_spoke()), Some("Hola"));
+    }
+
+    /// The bug this method exists for, in the shape it actually occurs.
+    ///
+    /// The page publishes the whole configuration whenever any control changes, so
+    /// switching the voice mid-call sends a message still carrying the greeting the caller
+    /// was opened with. Read off the message, that greeting is said again, and
+    /// `Answering::start` stops whatever the agent was mid-sentence about to say it.
+    ///
+    /// Both axes are asserted because a test naming only the voice would pass while the
+    /// language went on doing it: what is being fixed is not the voice control but the
+    /// question the agent was asking.
+    #[test]
+    fn changing_how_the_reply_is_spoken_owes_no_greeting() {
+        let opened = published(Some("Hola"), Some("es_ES-davefx-medium"), Some(Language::Es));
+
+        let revoiced = published(Some("Hola"), Some("bm_george"), Some(Language::Es));
+        assert_eq!(revoiced.opening_after(&opened), None, "a new voice is not a new opening");
+
+        let relanguaged = published(Some("Hola"), Some("es_ES-davefx-medium"), Some(Language::En));
+        assert_eq!(relanguaged.opening_after(&opened), None, "a new language is not one either");
+    }
+
+    /// The half deliberately kept: naming a new opening line *is* a request to hear it, and
+    /// it is why the control is live on the page rather than read once at the join.
+    #[test]
+    fn a_new_opening_line_is_owed_out_loud() {
+        let opened = published(Some("Hola"), None, None);
+        let changed = published(Some("Buenas"), None, None);
+        assert_eq!(changed.opening_after(&opened), Some("Buenas"));
+    }
+
+    /// Emptying the box asks for no greeting, so it owes none — as against owing the
+    /// caller silence *and* the line it just stopped asking for.
+    #[test]
+    fn an_opening_line_taken_away_owes_nothing() {
+        let opened = published(Some("Hola"), None, None);
+        assert_eq!(published(None, None, None).opening_after(&opened), None);
+        assert_eq!(published(Some("   "), None, None).opening_after(&opened), None);
+    }
+
+    /// A difference, not a once-ever latch: a caller who clears the box and types the same
+    /// line back has asked to hear it again, and the conversation in between was one that
+    /// opened with nothing.
+    #[test]
+    fn an_opening_line_that_comes_back_is_owed_again() {
+        let cleared = published(None, None, None);
+        assert_eq!(published(Some("Hola"), None, None).opening_after(&cleared), Some("Hola"));
     }
 
     fn tts_override(tts: ConversationConfigOverrideTts) -> ConversationInitiationClientData {
