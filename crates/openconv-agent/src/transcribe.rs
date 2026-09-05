@@ -167,8 +167,15 @@ const WARM_INFERENCE_BUDGET: Duration = Duration::from_millis(250);
 
 /// Refuses a process whose inference is too slow to serve calls.
 ///
-/// [LAW:no-silent-failure] The third and last way to lose the GPU, and the only one that
-/// was still quiet. A backend can compile in, find its driver, and still fail to
+/// [LAW:no-silent-failure] The subject is inference speed, not the GPU. Two unrelated
+/// deployments land here — a GPU backend that compiled in and then failed to initialise,
+/// and a healthy card running a model heavier than [`CALIBRATION_MODEL`] — and the check
+/// is deliberately blind to which, because the service does not need a GPU, it needs
+/// inference that keeps up with a conversation. The refusal names both, since only the
+/// first leaves a whisper.cpp line on stderr for the reader to go and find.
+///
+/// That first cause is why the check exists, being the last of the three ways to lose the
+/// GPU still left quiet. A backend can compile in, find its driver, and still fail to
 /// initialise — the card out of memory or held by another process, a compute capability
 /// the image was not built for, a device index that does not exist. whisper.cpp answers
 /// that by logging one line and appending a CPU backend anyway (`whisper_backend_init`
@@ -181,8 +188,8 @@ const WARM_INFERENCE_BUDGET: Duration = Duration::from_millis(250);
 /// Latency rather than configuration because whisper.cpp offers nothing else: `whisper.h`
 /// exposes `use_gpu` and `gpu_device` as *inputs* and no way at all to ask which backend
 /// a context ended up with. Timing is not a proxy for that question, though — it is the
-/// question. The service does not need a GPU, it needs inference that keeps up with a
-/// conversation, and [`WARM_INFERENCE_BUDGET`] is where that requirement is written down.
+/// question, and the one both causes answer the same way. [`WARM_INFERENCE_BUDGET`] is
+/// where the requirement it is read against is written down.
 fn require_fast_inference(warm_inference: Duration) -> Result<(), TranscribeError> {
     match warm_inference <= WARM_INFERENCE_BUDGET {
         true => Ok(()),
