@@ -13,6 +13,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 /// A loaded speech-to-text model, shared by every conversation in the process.
@@ -46,15 +47,26 @@ impl Transcriber {
 
         let transcriber = Self { context: Arc::new(context), threads };
 
-        // Run one inference now, on silence, and throw the result away.
+        // Run the model twice on silence now, and throw both transcripts away.
         //
-        // The first call through the GPU backend compiles and loads a shader library,
-        // which takes upwards of fifteen seconds on a cold machine. Paid here it is
-        // startup; paid lazily it lands on the first thing the first caller ever says,
-        // and that caller waits fifteen seconds for a reply to "hello".
-        let warmup = std::time::Instant::now();
-        transcribe_blocking(&transcriber.context, threads, &vec![0.0; 16_000])
-            .map_err(|error| TranscribeError::Warmup(Box::new(error)))?;
+        // The first call is not a measurement, it is the one-off cost of a backend
+        // waking up — Metal compiles and loads a shader library, upwards of fifteen
+        // seconds on a genuinely cold machine. Paid here it is startup; paid lazily it
+        // lands on the first thing the first caller ever says. The second call is what
+        // every utterance after it actually costs, and it is the only one a budget can
+        // be set against.
+        let silence = vec![0.0; crate::endpoint::SAMPLE_RATE as usize];
+        let warm_up = || {
+            transcribe_blocking(&transcriber.context, threads, &silence)
+                .map_err(|error| TranscribeError::Warmup(Box::new(error)))
+        };
+
+        warm_up()?;
+        let measuring = Instant::now();
+        warm_up()?;
+        let warm_inference = measuring.elapsed();
+
+        require_fast_inference(warm_inference)?;
 
         // `backends` records which backend was compiled in and, for CUDA, the device
         // architectures it was built for. That second part is the reason it earns a
@@ -64,23 +76,13 @@ impl Transcriber {
         //
         // It is deliberately NOT a claim about which backend served a given inference.
         // `whisper_print_system_info` reports compile-time flags, so it reads identically
-        // however the run went — and there is no gap here for it to have covered anyway.
-        // A Linux container holding the CUDA backend but no card cannot fall back to the
-        // CPU quietly, because it cannot start: `libcuda.so.1` comes from the nvidia
-        // container runtime, so without it the dynamic loader fails the exec outright,
-        // before `main`. Measured against this image, not assumed.
-        //
-        // Two of the three ways to lose the GPU are therefore loud: no backend compiled
-        // in, caught by the check above; an absent card, caught by the loader. The third
-        // — a backend that initialises and fails — stays silent, and `ready_in_ms` on
-        // this line is the only thing that would betray it, at 84ms against 41601ms for
-        // the CPU. Reading that is currently a human's job. openconv-openconv-bwy.34 is
-        // making it the process's.
+        // however the run went. `warm_inference_ms` is the field that answers that, and
+        // the check above is what stops anyone having to read it.
         tracing::info!(
             model = %model.display(),
             threads,
             backends = whisper_rs::print_system_info(),
-            ready_in_ms = warmup.elapsed().as_millis(),
+            warm_inference_ms = warm_inference.as_millis(),
             "speech-to-text model loaded"
         );
 
@@ -100,25 +102,18 @@ impl Transcriber {
 
 /// Refuses a build that compiled no GPU backend at all.
 ///
-/// [LAW:no-silent-failure] whisper.cpp does not refuse to run unaccelerated. It prints
-/// one WARN, transcribes on the CPU, and lets the process report itself healthy — and
-/// for this service that is not a slower conversation but a broken one. Inference falls
-/// behind realtime, the listener stalls inside it, and the audio sink it has stopped
-/// draining drops its oldest frames, so the caller's words are destroyed rather than
-/// delayed. Nothing errors and nothing is missing; the service simply stops working.
-/// Refusing to start is the only way that failure ever reaches anyone.
+/// The compile-time half of [`require_fast_inference`], which is where the reason this
+/// service refuses to run unaccelerated is written down. Two checks rather than one
+/// because they answer different questions: a binary that could never be fast is not the
+/// same fact as a process that is not fast, and the first is knowable without a machine,
+/// without a model file, and without the load-and-two-inferences it takes to measure the
+/// second. [FRAMING:representation] compile-time beats runtime — check each
+/// fact where it lives.
 ///
 /// Callers pass whisper-rs's own `cfg!(feature = "_gpu")`, which answers the one
 /// question that was answered wrongly for the whole life of the deployment: did this
 /// build compile in any GPU backend at all? See the per-target features in Cargo.toml —
 /// a target absent from that list builds fine and lands here.
-///
-/// Build-time only, and deliberately not claimed as more. A backend that compiles in and
-/// then fails to *initialise* — the card out of memory, a compute capability the image
-/// was not built for — is one whisper.cpp answers by falling back to the CPU and
-/// returning Ok, which this cannot see. That gap is real and is openconv-openconv-bwy.34;
-/// closing it needs a timing signal rather than a configuration one, since only latency
-/// distinguishes the two at runtime.
 ///
 /// A function rather than an `if` in `load`, because the flag it reads is fixed at
 /// compile time: inline, the one check this file exists to add would be the only line in
@@ -128,6 +123,77 @@ fn require_acceleration(use_gpu: bool) -> Result<(), TranscribeError> {
     match use_gpu {
         true => Ok(()),
         false => Err(TranscribeError::NoAcceleration),
+    }
+}
+
+/// The model [`WARM_INFERENCE_BUDGET`] was calibrated against.
+///
+/// Named here rather than read from the configured path, because it is a fact about how
+/// the budget was arrived at and not about what this process happens to be loading. A
+/// deployment that changes the model has not invalidated the string; it has invalidated
+/// the calibration, and this is what says so in the refusal.
+const CALIBRATION_MODEL: &str = "ggml-base.en";
+
+/// The longest a warm inference over one second of silence may take.
+///
+/// Calibrated on both supported targets rather than reasoned about. Every figure below is
+/// a *warm* measurement — the second inference, which is the one the check reads — over
+/// one second of silence with [`CALIBRATION_MODEL`]:
+///
+/// | target         | accelerated | fallen back to the CPU |
+/// |----------------|-------------|------------------------|
+/// | M2 Max, Metal  | 50-56ms     | 565ms-3.0s             |
+/// | RTX 2070, CUDA | 41ms        | 1675-1679ms            |
+///
+/// The binding pair is the narrowest across targets: the slowest *healthy* measurement
+/// against the fastest *unhealthy* one. Warm CUDA is the fastest figure in the table, not
+/// the slowest, so the healthy end is Metal's 56ms and the unhealthy end is macOS's
+/// 565ms — a 10x gap, and the only one the check has to split. Their geometric middle is
+/// 178ms, where the multiplicative margin on each side is equal; 250ms sits deliberately
+/// above it, 4.5x clear of the slowest healthy measurement and 2.3x clear of the fastest
+/// unhealthy one. That asymmetry is chosen, not sloppy: a false refusal takes the service
+/// down, where a missed one is only today's bug. Widening it further to catch a slower
+/// future CPU eats the headroom a contended GPU needs.
+///
+/// What it therefore encodes is how long [`CALIBRATION_MODEL`] takes on hardware that is
+/// working, so a heavier model does not shrink the margin — it invalidates the number.
+/// Deliberately not scaled to the configured model: a budget the deployment computes for
+/// itself is one that can never fail ([LAW:no-silent-failure]), and a per-model table
+/// would be a hand-maintained second map of how fast this hardware runs each model,
+/// drifting from the first card or model file that changes ([LAW:one-source-of-truth]).
+/// The startup measurement is the map that redraws itself; this is the requirement it is
+/// read against, and the refusal names the model when it fires.
+const WARM_INFERENCE_BUDGET: Duration = Duration::from_millis(250);
+
+/// Refuses a process whose inference is too slow to serve calls.
+///
+/// [LAW:no-silent-failure] The subject is inference speed, not the GPU. Two unrelated
+/// deployments land here — a GPU backend that compiled in and then failed to initialise,
+/// and a healthy card running a model heavier than [`CALIBRATION_MODEL`] — and the check
+/// is deliberately blind to which, because the service does not need a GPU, it needs
+/// inference that keeps up with a conversation. The refusal names both, since only the
+/// first leaves a whisper.cpp line on stderr for the reader to go and find.
+///
+/// That first cause is why the check exists, being the last of the three ways to lose the
+/// GPU still left quiet. A backend can compile in, find its driver, and still fail to
+/// initialise — the card out of memory or held by another process, a compute capability
+/// the image was not built for, a device index that does not exist. whisper.cpp answers
+/// that by logging one line and appending a CPU backend anyway (`whisper_backend_init`
+/// always does), so `create_state` and `full` both return Ok, the warmup succeeds, and
+/// the process reports itself healthy while every utterance afterwards runs on the CPU.
+/// That is the failure this service cannot survive: inference falls behind realtime, the
+/// listener stalls inside it, and the audio sink it has stopped draining discards its
+/// oldest frames — the caller's words are destroyed rather than delayed.
+///
+/// Latency rather than configuration because whisper.cpp offers nothing else: `whisper.h`
+/// exposes `use_gpu` and `gpu_device` as *inputs* and no way at all to ask which backend
+/// a context ended up with. Timing is not a proxy for that question, though — it is the
+/// question, and the one both causes answer the same way. [`WARM_INFERENCE_BUDGET`] is
+/// where the requirement it is read against is written down.
+fn require_fast_inference(warm_inference: Duration) -> Result<(), TranscribeError> {
+    match warm_inference <= WARM_INFERENCE_BUDGET {
+        true => Ok(()),
+        false => Err(TranscribeError::SlowInference { warm_inference }),
     }
 }
 
@@ -230,6 +296,16 @@ pub enum TranscribeError {
     /// The model loaded but could not run. A model file that parses and cannot infer
     /// is still a broken deployment, and better found at startup than mid-call.
     Warmup(Box<TranscribeError>),
+    /// The model ran, and ran at CPU speed.
+    ///
+    /// A property of this deployment rather than of the binary, which is the contrast
+    /// with [`Self::NoAcceleration`] — but not one that always clears on its own. A card
+    /// held by another process gives it back, and the same image on the same host then
+    /// starts healthy; a configured model heavier than the budget was calibrated against
+    /// never will. The refusal message separates the two, and this doc must not flatten
+    /// them back together: read as purely transient, it tells a supervisor to retry, and
+    /// retrying a too-heavy model is a crash loop that never ends.
+    SlowInference { warm_inference: Duration },
     /// The blocking thread went away — the process is shutting down.
     Cancelled,
 }
@@ -253,8 +329,25 @@ impl fmt::Display for TranscribeError {
                  this target is not on it",
                 std::env::consts::OS,
             ),
+            Self::SlowInference { warm_inference } => write!(
+                f,
+                "a warm speech-to-text inference took {}ms against a budget of {}ms. At \
+                 that speed inference runs behind realtime, the audio sink drops the \
+                 front of every utterance, and the service loses the caller's words \
+                 rather than answering slowly — refusing to start is the only way that \
+                 reaches anyone. Two things produce it. Either a GPU backend compiled in \
+                 and then failed to initialise, which whisper.cpp answers by falling back \
+                 to the CPU without erroring and reports on stderr just above this line \
+                 as `no GPU found` or `failed to initialize <backend> backend` — look for \
+                 a card out of memory or held by another process, or a container started \
+                 without the nvidia runtime's devices. Or OPENCONV_WHISPER_MODEL \
+                 points at a model heavier than {CALIBRATION_MODEL}, which is the one \
+                 this budget was calibrated against",
+                warm_inference.as_millis(),
+                WARM_INFERENCE_BUDGET.as_millis(),
+            ),
             Self::Inference(error) => write!(f, "speech-to-text failed: {error}"),
-            Self::Warmup(error) => write!(f, "speech-to-text model failed its first run: {error}"),
+            Self::Warmup(error) => write!(f, "speech-to-text model failed its warm-up: {error}"),
             Self::Cancelled => f.write_str("speech-to-text was cancelled"),
         }
     }
@@ -324,6 +417,46 @@ mod tests {
         // The message has to send a reader somewhere. Naming the target it was built
         // for is the part that turns it into an actionable report rather than a verdict.
         assert!(error.to_string().contains(std::env::consts::OS));
+    }
+
+    /// The calibration, kept where an edit to the budget has to face it.
+    ///
+    /// These are measurements, not invented boundaries: every figure was observed on a
+    /// supported target with `ggml-base.en` on one second of silence. A budget moved far
+    /// enough in either direction to stop separating them stops doing its job, and this
+    /// is what says so.
+    #[test]
+    fn accelerated_inference_passes_and_cpu_inference_does_not() {
+        for accelerated in [Duration::from_millis(41), Duration::from_millis(56)] {
+            assert!(
+                require_fast_inference(accelerated).is_ok(),
+                "{accelerated:?} was measured on a healthy GPU and was refused"
+            );
+        }
+
+        for fallen_back in [Duration::from_millis(565), Duration::from_millis(1675)] {
+            let Err(error) = require_fast_inference(fallen_back) else {
+                panic!("{fallen_back:?} is CPU speed and was allowed to serve calls");
+            };
+            assert!(matches!(error, TranscribeError::SlowInference { .. }));
+        }
+    }
+
+    /// A refusal has to send a reader somewhere, and it cannot send them somewhere wrong.
+    ///
+    /// Two causes produce this error and only one of them leaves a whisper.cpp line on
+    /// stderr, so a message that names just the backend sends an operator who changed the
+    /// model hunting for a log line that does not exist. Both numbers are formatted from
+    /// the constant, so the message cannot drift from the budget it reports either.
+    #[test]
+    fn the_refusal_reports_the_numbers_and_both_causes() {
+        let error = require_fast_inference(Duration::from_millis(1675)).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("1675ms"), "{message}");
+        assert!(message.contains(&format!("{}ms", WARM_INFERENCE_BUDGET.as_millis())), "{message}");
+        assert!(message.contains("failed to initialize"), "{message}");
+        assert!(message.contains(CALIBRATION_MODEL), "{message}");
     }
 
     #[test]
