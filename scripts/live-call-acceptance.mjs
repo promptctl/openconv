@@ -22,41 +22,16 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Caller, Checks, millis, readEnvironment, recordSpeech } from "./lib/caller.mjs";
-
-/// Everyday nouns rather than a random string, because the word has to survive being
-/// spoken by one synthesizer and heard by a speech model: "xk7q" is a test of nothing
-/// but whisper's spelling. Drawn per run so a pass cannot be a coincidence twice.
-///
-/// Every entry was checked through the real path — `say` into `transcribe_wav` — rather
-/// than chosen for sounding distinctive. Two obvious candidates did not survive it and
-/// are deliberately absent: base.en hears "penguin" as "pen win" and "walrus" as
-/// "waras", which fails this script for a reason that has nothing to do with the agent.
-/// Re-check any word before adding it here.
-const WORDS = [
-  "banana",
-  "umbrella",
-  "trumpet",
-  "cactus",
-  "harmonica",
-  "lantern",
-  "rooster",
-  "pumpkin",
-];
+import { asksFor, AUDIBLE_MS, Caller, Checks, millis, readEnvironment, recordSpeech } from "./lib/caller.mjs";
 
 const PROMPT =
   "You are a voice assistant under test. Do exactly what the caller asks, and reply " +
   "with nothing else. No greeting, no explanation, no markdown.";
 
-/// Matching is on words, so "Banana." counts and spacing or punctuation never decides
-/// whether the pipeline worked.
-const said = (text, word) => text.toLowerCase().includes(word);
-
 const { xiApiKey, openconv, livekitUrl } = readEnvironment(process.env, process.argv);
 const checks = new Checks();
 
-const word = WORDS[Math.floor(Math.random() * WORDS.length)];
-const line = `Please reply with only the word ${word}.`;
+const { line, said } = asksFor();
 const recording = recordSpeech(line, join(mkdtempSync(join(tmpdir(), "openconv-")), "caller.wav"));
 
 console.log(`the caller will say: "${line}"`);
@@ -98,7 +73,7 @@ console.log(`\nspoke ${spoken.toFixed(1)}s into the room, waiting to be answered
 checks.record(
   "the caller's words reached speech-to-text",
   await caller.waitFor(
-    () => caller.transcripts().some((text) => said(text, word)),
+    () => caller.transcripts().some((text) => said(text)),
     60_000,
     "a final transcript of the caller",
   ),
@@ -108,7 +83,7 @@ checks.record(
 checks.record(
   "the agent answered what the caller actually said",
   await caller.waitFor(
-    () => caller.replies().some((text) => said(text, word)),
+    () => caller.replies().some((text) => said(text)),
     60_000,
     "the reply",
   ),
@@ -118,11 +93,6 @@ checks.record(
 // The reply is published as text before its audio has been synthesized, so the sound
 // is a separate fact from the answer and gets a separate wait. This is the leg that
 // only exists once TTS is wired into the published track.
-//
-// Two hundred milliseconds of sound is the bar because it is what separates a spoken
-// word from a click, and the reply here is deliberately one word: a bar set to the
-// length of some particular answer fails on a short one that was perfectly audible.
-const AUDIBLE_MS = 200;
 checks.record(
   "the answer came back as sound in the room",
   await caller.waitFor(
