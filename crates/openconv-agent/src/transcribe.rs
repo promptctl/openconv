@@ -126,25 +126,44 @@ fn require_acceleration(use_gpu: bool) -> Result<(), TranscribeError> {
     }
 }
 
+/// The model [`WARM_INFERENCE_BUDGET`] was calibrated against.
+///
+/// Named here rather than read from the configured path, because it is a fact about how
+/// the budget was arrived at and not about what this process happens to be loading. A
+/// deployment that changes the model has not invalidated the string; it has invalidated
+/// the calibration, and this is what says so in the refusal.
+const CALIBRATION_MODEL: &str = "ggml-base.en";
+
 /// The longest a warm inference over one second of silence may take.
 ///
-/// Calibrated on both supported targets rather than reasoned about, because the two
-/// numbers this sits between are much closer on macOS than the deployment's 500x gap
-/// suggests. Measured with `ggml-base.en`, one second of silence, warm:
+/// Calibrated on both supported targets rather than reasoned about. Every figure below is
+/// a *warm* measurement — the second inference, which is the one the check reads — over
+/// one second of silence with [`CALIBRATION_MODEL`]:
 ///
-/// | target                  | accelerated | fallen back to the CPU |
-/// |-------------------------|-------------|------------------------|
-/// | M2 Max, Metal           | 50-56ms     | 565ms-3.0s             |
-/// | RTX 2070, CUDA          | 84ms        | 41601ms                |
+/// | target         | accelerated | fallen back to the CPU |
+/// |----------------|-------------|------------------------|
+/// | M2 Max, Metal  | 50-56ms     | 565ms-3.0s             |
+/// | RTX 2070, CUDA | 84ms        | 41601ms                |
 ///
-/// 250ms is placed at the geometric middle of the narrower gap — the macOS one, 85ms
-/// against 565ms — which is where the multiplicative margin on each side is largest:
-/// roughly 4.5x above the slowest healthy measurement, 2.3x below the fastest unhealthy
-/// one. Widening it to catch a slower future CPU would eat the headroom a contended GPU
-/// needs, and a false refusal is an outage where a missed one is only today's bug.
+/// The deployment's 500x gap is not the one that has to be separated. The binding pair is
+/// the narrowest across targets: the slowest *healthy* measurement, CUDA's 84ms, against
+/// the fastest *unhealthy* one, macOS's 565ms. Their geometric middle is 218ms, where the
+/// multiplicative margin on each side is largest, and 250ms sits just above it — 3.0x
+/// clear of the slowest healthy measurement and 2.3x clear of the fastest unhealthy one.
+/// Widening it to catch a slower future CPU eats the headroom a contended GPU needs, and
+/// a false refusal is an outage where a missed one is only today's bug.
+///
+/// What it therefore encodes is how long [`CALIBRATION_MODEL`] takes on hardware that is
+/// working, so a heavier model does not shrink the margin — it invalidates the number.
+/// Deliberately not scaled to the configured model: a budget the deployment computes for
+/// itself is one that can never fail ([LAW:no-silent-failure]), and a per-model table
+/// would be a hand-maintained second map of how fast this hardware runs each model,
+/// drifting from the first card or model file that changes ([LAW:one-source-of-truth]).
+/// The startup measurement is the map that redraws itself; this is the requirement it is
+/// read against, and the refusal names the model when it fires.
 const WARM_INFERENCE_BUDGET: Duration = Duration::from_millis(250);
 
-/// Refuses a process whose inference is running at CPU speed.
+/// Refuses a process whose inference is too slow to serve calls.
 ///
 /// [LAW:no-silent-failure] The third and last way to lose the GPU, and the only one that
 /// was still quiet. A backend can compile in, find its driver, and still fail to
@@ -161,8 +180,7 @@ const WARM_INFERENCE_BUDGET: Duration = Duration::from_millis(250);
 /// exposes `use_gpu` and `gpu_device` as *inputs* and no way at all to ask which backend
 /// a context ended up with. Timing is not a proxy for that question, though — it is the
 /// question. The service does not need a GPU, it needs inference that keeps up with a
-/// conversation, and a model too large for the hardware fails this check for the same
-/// reason and with the same consequence as a card that never initialised.
+/// conversation, and [`WARM_INFERENCE_BUDGET`] is where that requirement is written down.
 fn require_fast_inference(warm_inference: Duration) -> Result<(), TranscribeError> {
     match warm_inference <= WARM_INFERENCE_BUDGET {
         true => Ok(()),
@@ -299,22 +317,23 @@ impl fmt::Display for TranscribeError {
             ),
             Self::SlowInference { warm_inference } => write!(
                 f,
-                "a warm speech-to-text inference took {}ms, and the budget is {}ms — this \
-                 build compiled a GPU backend in, so that backend failed to initialise at \
-                 runtime and whisper fell back to the CPU without erroring. At CPU speed \
-                 inference runs behind realtime and the audio sink drops the front of \
-                 every utterance, so the service loses the caller's words rather than \
-                 answering slowly, and refusing to start is the only way that reaches \
-                 anyone. whisper.cpp printed the reason on stderr just above this, as \
-                 `no GPU found` or `failed to initialize <backend> backend`: look for a \
-                 card that is out of memory or held by another process, a container \
-                 started without the nvidia runtime's devices, or a model too large for \
-                 the hardware to serve in time",
+                "a warm speech-to-text inference took {}ms against a budget of {}ms. At \
+                 that speed inference runs behind realtime, the audio sink drops the \
+                 front of every utterance, and the service loses the caller's words \
+                 rather than answering slowly — refusing to start is the only way that \
+                 reaches anyone. Two things produce it. Either a GPU backend compiled in \
+                 and then failed to initialise, which whisper.cpp answers by falling back \
+                 to the CPU without erroring and reports on stderr just above this line \
+                 as `no GPU found` or `failed to initialize <backend> backend` — look for \
+                 a card out of memory or held by another process, or a container started \
+                 without the nvidia runtime's devices. Or OPENCONV_WHISPER_MODEL \
+                 points at a model heavier than {CALIBRATION_MODEL}, which is the one \
+                 this budget was calibrated against",
                 warm_inference.as_millis(),
                 WARM_INFERENCE_BUDGET.as_millis(),
             ),
             Self::Inference(error) => write!(f, "speech-to-text failed: {error}"),
-            Self::Warmup(error) => write!(f, "speech-to-text model failed its first run: {error}"),
+            Self::Warmup(error) => write!(f, "speech-to-text model failed its warm-up: {error}"),
             Self::Cancelled => f.write_str("speech-to-text was cancelled"),
         }
     }
@@ -409,16 +428,21 @@ mod tests {
         }
     }
 
-    /// A refusal has to send a reader somewhere, and the two numbers that decide it are
-    /// the first thing they need. Formatted from the constant, so the message cannot
-    /// drift from the budget it reports.
+    /// A refusal has to send a reader somewhere, and it cannot send them somewhere wrong.
+    ///
+    /// Two causes produce this error and only one of them leaves a whisper.cpp line on
+    /// stderr, so a message that names just the backend sends an operator who changed the
+    /// model hunting for a log line that does not exist. Both numbers are formatted from
+    /// the constant, so the message cannot drift from the budget it reports either.
     #[test]
-    fn the_refusal_reports_both_the_measurement_and_the_budget() {
+    fn the_refusal_reports_the_numbers_and_both_causes() {
         let error = require_fast_inference(Duration::from_millis(41601)).unwrap_err();
         let message = error.to_string();
 
         assert!(message.contains("41601ms"), "{message}");
         assert!(message.contains(&format!("{}ms", WARM_INFERENCE_BUDGET.as_millis())), "{message}");
+        assert!(message.contains("failed to initialize"), "{message}");
+        assert!(message.contains(CALIBRATION_MODEL), "{message}");
     }
 
     #[test]
