@@ -42,6 +42,18 @@ const FRAMES_PER_SECOND = 100;
 const AUDIBLE = 1000;
 
 /**
+ * How much sound an answer has to be for the answer to count as spoken.
+ *
+ * Two hundred milliseconds is what separates a spoken word from a click, and the replies
+ * these runs ask for are deliberately one word: a bar set to the length of some particular
+ * answer fails on a short one that was perfectly audible.
+ *
+ * [LAW:one-source-of-truth] Every script measuring the same frames reads the same bar, so
+ * one of them cannot quietly hold the agent to a different standard than another.
+ */
+export const AUDIBLE_MS = 200;
+
+/**
  * The line the acceptance runs speak into a room.
  *
  * [LAW:one-source-of-truth] One sentence, because two scripts assert on it *being the

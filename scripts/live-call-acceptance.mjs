@@ -22,7 +22,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { asksFor, Caller, Checks, millis, readEnvironment, recordSpeech } from "./lib/caller.mjs";
+import { asksFor, AUDIBLE_MS, Caller, Checks, millis, readEnvironment, recordSpeech } from "./lib/caller.mjs";
 
 const PROMPT =
   "You are a voice assistant under test. Do exactly what the caller asks, and reply " +
@@ -93,11 +93,6 @@ checks.record(
 // The reply is published as text before its audio has been synthesized, so the sound
 // is a separate fact from the answer and gets a separate wait. This is the leg that
 // only exists once TTS is wired into the published track.
-//
-// Two hundred milliseconds of sound is the bar because it is what separates a spoken
-// word from a click, and the reply here is deliberately one word: a bar set to the
-// length of some particular answer fails on a short one that was perfectly audible.
-const AUDIBLE_MS = 200;
 checks.record(
   "the answer came back as sound in the room",
   await caller.waitFor(

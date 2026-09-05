@@ -27,7 +27,7 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { asksFor, Caller, Checks, millis, recordSpeech } from "./lib/caller.mjs";
+import { asksFor, AUDIBLE_MS, Caller, Checks, millis, recordSpeech } from "./lib/caller.mjs";
 
 /**
  * The one boundary: everything downstream runs on values known to exist.
@@ -35,20 +35,43 @@ import { asksFor, Caller, Checks, millis, recordSpeech } from "./lib/caller.mjs"
  * under test is that a *real Happy account* reaches openconv — a token forged here would
  * prove only that the route parses. `~/.happy/access.key` holds the CLI's own credential,
  * whose `token` field is a valid happy-server bearer.
+ *
+ * The expected issuer is a value like the rest, not a literal in the check below, because
+ * it is openconv's `LIVEKIT_API_KEY` — a deployment credential rather than a service name.
+ * A rotation would otherwise turn this run permanently red for a reason that has nothing
+ * to do with what it asserts. Reading the key itself is the one thing not done here: a
+ * credential supplied by this script would prove only that openconv still mints.
  */
 function readHappyEnvironment(env, argv) {
   const keyPath = env.HAPPY_ACCESS_KEY ?? join(homedir(), ".happy", "access.key");
-  const { token } = JSON.parse(readFileSync(keyPath, "utf8"));
+  const raw = readFileSync(keyPath, "utf8");
+  let token;
+  try {
+    ({ token } = JSON.parse(raw));
+  } catch (cause) {
+    throw new Error(`${keyPath} is not JSON`, { cause });
+  }
   if (!token) throw new Error(`no bearer token in ${keyPath}`);
   return {
     token,
     happyServer: (argv[2] ?? "https://happy-server.sanctuary.gdn").replace(/\/$/, ""),
     livekitUrl: argv[3] ?? "wss://livekit.sanctuary.gdn",
     agentId: argv[4] ?? "agent_6701k211syvvegba4kt7m68nxjmw",
+    issuer: env.OPENCONV_LIVEKIT_ISSUER ?? "openconv",
   };
 }
 
-const { token, happyServer, livekitUrl, agentId } = readHappyEnvironment(process.env, process.argv);
+/** A mint, or `null` for a body that is not one — never a mint-shaped object standing in
+ *  for an answer that was not given. The raw body is what gets reported in that case. */
+function mintOrNothing(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+const { token, happyServer, livekitUrl, agentId, issuer } = readHappyEnvironment(process.env, process.argv);
 const checks = new Checks();
 
 const res = await fetch(`${happyServer}/v1/voice/conversations`, {
@@ -56,24 +79,33 @@ const res = await fetch(`${happyServer}/v1/voice/conversations`, {
   headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
   body: JSON.stringify({ agentId }),
 });
-const minted = await res.json();
+// A proxy's HTML 502, a plain-text 401, or — the one an argument typo actually produces —
+// the webapp host's SPA catch-all answering 200 with index.html are all ordinary answers
+// from a live deployment. Letting `res.json()` throw on one loses the body and the status,
+// the two actionable facts, to a SyntaxError raised before the check meant to report them.
+// The status is not the discriminator; whether the body is a mint is. [LAW:parse-dont-validate]
+const body = await res.text();
+const minted = mintOrNothing(body);
 
+// One condition, read by both the check and the stop below, so the two cannot come to
+// disagree about what a usable mint is. [LAW:one-source-of-truth]
+const usable = res.status === 200 && minted?.allowed === true && typeof minted?.conversationToken === "string";
 checks.record(
   "happy-server minted a conversation for a real account",
-  res.status === 200 && minted.allowed === true,
-  `HTTP ${res.status} ${JSON.stringify({ ...minted, conversationToken: minted.conversationToken ? "<jwt>" : undefined })}`,
+  usable,
+  `HTTP ${res.status} ${minted ? JSON.stringify({ ...minted, conversationToken: minted.conversationToken ? "<jwt>" : undefined }) : JSON.stringify(body.slice(0, 300))}`,
 );
 // Nothing below can run without a token, and a caller that joined nothing would report
 // its own failures as timeouts pointing at the agent. Stop where the truth is still local.
-if (!minted.allowed) checks.finish();
+if (!usable) checks.finish();
 
 // The room name openconv signs is the whole reason happy can name a conversation at all:
 // happy pulls `conv_...` out of the JWT rather than being told it in a field. An
 // ElevenLabs-signed token would clear an `allowed: true` check and fail this one.
-const claims = JSON.parse(Buffer.from(minted.conversationToken.split(".")[1], "base64").toString());
+const claims = JSON.parse(Buffer.from(minted.conversationToken.split(".")[1], "base64url").toString());
 checks.record(
-  "the token happy handed back was signed by openconv, for the room happy named",
-  claims.iss === "openconv" && claims.video?.room === minted.conversationId,
+  `the token happy handed back was signed by ${issuer}, for the room happy named`,
+  claims.iss === issuer && claims.video?.room === minted.conversationId,
   `iss=${claims.iss} room=${claims.video?.room} conversationId=${minted.conversationId}`,
 );
 
@@ -84,7 +116,7 @@ console.log(`joined ${minted.conversationId} at ${livekitUrl}\n`);
 // minted by one provider and offered to the other's SFU joins an empty room, quietly.
 checks.record(
   "openconv's agent is in the room happy's token admits to",
-  await caller.waitFor(() => caller.roster().some((name) => name.startsWith("agent_")), 25_000, "the agent"),
+  await caller.waitFor(() => caller.agentPresent(), 25_000, "the agent"),
   caller.roster().join(", "),
 );
 
@@ -108,10 +140,6 @@ checks.record(
   JSON.stringify(caller.replies()),
 );
 
-// Two hundred milliseconds is what separates a spoken word from a click, and the same bar
-// `live-call-acceptance` sets, for the same reason: the reply here is deliberately one
-// word, so a bar set to the length of some particular answer fails on a short audible one.
-const AUDIBLE_MS = 200;
 checks.record(
   "the answer came back as sound in the room",
   await caller.waitFor(
@@ -120,6 +148,14 @@ checks.record(
     "the agent's speech",
   ),
   `${caller.heard.audibleFrames - before.audibleFrames} audible frames, peak ${caller.heard.peak}`,
+);
+
+// Zero frames from a reader that crashed and zero frames from a track nobody spoke into
+// are the same number, and only this separates them.
+checks.record(
+  "the audio reader ran to the end of the call",
+  caller.heard.error === null,
+  caller.heard.error ? String(caller.heard.error) : `${caller.heard.frames} frames read`,
 );
 
 await caller.leave();

@@ -251,9 +251,10 @@ the agent is not in, and the caller hears silence. Presence is what turns that s
 into a failed check.
 
 All three scripts, and any future one, are clients built on `scripts/lib/caller.mjs` —
-minting, joining, the control channel, metering the agent's audio, speaking into the
-room, and the random word the caller asks for live there once, so two scripts cannot
-drift into two different ideas of what a caller is.
+joining, the control channel, metering the agent's audio, speaking into the room, and
+the random word the caller asks for live there once, so two scripts cannot drift into
+two different ideas of what a caller is. Minting is the one part the happy script does
+itself, because happy's mint is the thing it is there to test.
 
 ```
 OPENCONV_API_KEY=... node scripts/stt-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
