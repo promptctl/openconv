@@ -291,8 +291,13 @@ pub enum TranscribeError {
     Warmup(Box<TranscribeError>),
     /// The model ran, and ran at CPU speed.
     ///
-    /// A property of this machine at this moment rather than of the binary: the same
-    /// image on the same host starts healthy once whatever took the card gives it back.
+    /// A property of this deployment rather than of the binary, which is the contrast
+    /// with [`Self::NoAcceleration`] — but not one that always clears on its own. A card
+    /// held by another process gives it back, and the same image on the same host then
+    /// starts healthy; a configured model heavier than the budget was calibrated against
+    /// never will. The refusal message separates the two, and this doc must not flatten
+    /// them back together: read as purely transient, it tells a supervisor to retry, and
+    /// retrying a too-heavy model is a crash loop that never ends.
     SlowInference { warm_inference: Duration },
     /// The blocking thread went away — the process is shutting down.
     Cancelled,
