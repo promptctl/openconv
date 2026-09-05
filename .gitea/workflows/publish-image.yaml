@@ -18,12 +18,13 @@ name: Publish the openconv image
 # outbound, so no inbound connection exists at any point (home-infra/CLAUDE.md: "No
 # inbound internet exposure, ever").
 
-# Pushing to the Gitea remote IS the trigger. openconv is developed on GitHub, which
-# cannot reach this network and must not drive anything inside it; a build happens when
-# someone deliberately pushes the commit they want built to gitea.sanctuary.gdn, the only
-# side that can reach the registry. No branch filter — pushing a ref here is the request
-# to check that ref, and which refs additionally get *published* is the `publish` job's
-# own condition below.
+# Pushing to the Gitea remote IS the trigger. openconv is developed on GitHub, but a
+# GitHub-hosted runner is refused rather than impossible: joining one to the tailnet
+# would hand a tailnet identity and registry access to a rented VM, on every build. So a
+# build happens when someone deliberately pushes the commit they want built to
+# gitea.sanctuary.gdn, and the act_runner there is the only builder. No branch filter —
+# pushing a ref here is the request to check that ref, and which refs additionally get
+# *published* is the `publish` job's own condition below.
 #
 # workflow_dispatch takes no inputs, and that is the design rather than an omission. The
 # one thing this workflow must never accept is an instruction about where its source
