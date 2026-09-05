@@ -7,6 +7,7 @@ const els = {
   join: document.getElementById("join"),
   audio: document.getElementById("agent-audio"),
   voice: document.getElementById("voice"),
+  language: document.getElementById("language"),
 };
 
 /**
@@ -18,6 +19,37 @@ const CONTROLS = {
   agentId: document.getElementById("agent-id"),
   participantName: document.getElementById("participant-name"),
   voiceId: els.voice,
+  language: els.language,
+  firstMessage: document.getElementById("first-message"),
+  prompt: document.getElementById("prompt"),
+};
+
+/**
+ * The controls that say what the *conversation* is, as opposed to who is joining it.
+ *
+ * Named one by one rather than taken as "everything on the form", and that is a security
+ * boundary rather than tidiness: these values are JSON-encoded onto the room's data
+ * channel, and `CONTROLS` also holds the api key. A spread here would publish it to every
+ * participant. [LAW:decomposition]
+ */
+const OVERRIDES = ["voiceId", "language", "firstMessage", "prompt"];
+
+/** What every control is showing right now, trimmed. The one reader of the form. */
+const showing = () =>
+  Object.fromEntries(
+    Object.entries(CONTROLS).map(([name, control]) => [name, control.value.trim()]),
+  );
+
+/**
+ * What this call should be, read at the moment it is asked for.
+ *
+ * Handed to `Call.join` as a reader rather than as values, which is what keeps the form
+ * and the agent from ever disagreeing: there is no copy anywhere to go stale, so changing
+ * a control mid-call needs nothing kept in step. [LAW:one-source-of-truth]
+ */
+const chosenSettings = () => {
+  const values = showing();
+  return Object.fromEntries(OVERRIDES.map((name) => [name, values[name]]));
 };
 
 /**
@@ -55,9 +87,7 @@ const REQUIRED = {
  * particular voice" happens once, where the message that says it is built.
  */
 function readForm() {
-  const chosen = Object.fromEntries(
-    Object.entries(CONTROLS).map(([name, control]) => [name, control.value.trim()]),
-  );
+  const chosen = showing();
 
   const missing = Object.keys(REQUIRED).filter((name) => chosen[name] === "");
   if (missing.length > 0) {
@@ -223,6 +253,41 @@ async function offerVoices(wanted) {
 }
 
 /**
+ * Fills the language list from the deployment, then puts back the language this visit
+ * asked for.
+ *
+ * The same shape as `offerVoices` and for the same reason: a `<select>` silently ignores a
+ * value it has no option for, so the list has to exist before the seed is written and the
+ * write has to be read back. What differs is only where the list comes from, so that
+ * difference is one fetch rather than a second way of filling a control.
+ * [LAW:dataflow-not-control-flow]
+ *
+ * A failure leaves the page on `auto`, which is a real answer — the agent detecting the
+ * language rather than being told one — and it is said out loud rather than arrived at
+ * silently. [LAW:no-silent-failure]
+ */
+async function offerLanguages(wanted) {
+  try {
+    for (const code of (await deployment()).languages) {
+      els.language.append(new Option(code, code));
+    }
+
+    els.language.value = wanted;
+    if (els.language.value !== wanted) {
+      render(log("error", `${wanted} is not a language openconv accepts — using auto`));
+    }
+
+    // Assigning `.value` fires no `change`, so a call joined before this list arrived
+    // would keep running in the language it opened with while the box showed another.
+    // Dispatched rather than told directly, so a language this page sets and one the
+    // caller picks reach the agent by the one path. [LAW:single-enforcer]
+    els.language.dispatchEvent(new Event("change"));
+  } catch (error) {
+    render(log("error", `could not read the languages this deployment accepts: ${error.message}`));
+  }
+}
+
+/**
  * Keeps the current settings for next time.
  *
  * Called only after a join that worked, so what is remembered is a set of values known
@@ -252,56 +317,70 @@ function showButton(label, enabled) {
 }
 
 /**
- * The SFU these tokens are valid for, read from the server that mints them.
+ * What this deployment says about itself: the SFU to dial, and the languages it accepts.
  *
- * Not a field on this page, and deliberately so: a token minted by one deployment and
- * offered to a different deployment's SFU does not error. The client joins a room the
- * agent is not in, and the caller hears silence with nothing anywhere reporting a
- * problem. The server that mints already knows the answer, so it is asked rather than
- * re-typed here where the two can drift.
+ * Neither is a field on this page, and deliberately so. A token minted by one deployment
+ * and offered to a different deployment's SFU does not error — the client joins a room the
+ * agent is not in and the caller hears silence, with nothing anywhere reporting a problem.
+ * And a language openconv does not name fails the whole control message to deserialize,
+ * taking the prompt and the voice down with it. The server knows both answers, so both are
+ * asked for rather than re-typed here where they can drift. [LAW:one-source-of-truth]
+ *
+ * One reader with two callers rather than two fetches: they want the answer at different
+ * moments — the languages as the page loads, the SFU on the click that joins — and they
+ * survive a failure differently, which is the whole reason each asks when it does.
  */
-async function livekitUrl() {
+async function deployment() {
   const response = await fetch("./config");
   if (!response.ok) {
-    throw new Error(`could not read the SFU to dial: HTTP ${response.status}`);
+    throw new Error(`could not read the deployment's settings: HTTP ${response.status}`);
   }
-  return (await response.json()).livekit_url;
+  return response.json();
 }
 
 /**
- * Tells the call which voice the form is showing, and says so out loud when it cannot.
+ * Tells the call what the form is showing, and says so out loud when it cannot.
  *
- * The one place a voice reaches an agent from this page, used by the join and by the
- * control's own change event, so a voice this page put in the box and a voice the caller
- * put there cannot travel by two paths that fail differently. [LAW:single-enforcer]
+ * The one place any override reaches an agent from this page — used by the join and by
+ * every control's own change event — so a value this page put in a box and a value the
+ * caller put there cannot travel by two paths that fail differently. [LAW:single-enforcer]
+ * One sender for four controls rather than four, because which control changed is not a
+ * thing the agent is told: the message says what the conversation is now, whole.
+ * [LAW:dataflow-not-control-flow]
  *
- * A failure leaves the control showing what was asked for. Putting it back would make the
- * page agree with an agent nobody can hear yet, which is the silent substitution this
- * whole control exists to prevent, one level up. [LAW:no-silent-failure]
+ * A failure leaves the controls showing what was asked for. Putting them back would make
+ * the page agree with an agent nobody can hear yet, which is the silent substitution these
+ * controls exist to prevent, one level up. [LAW:no-silent-failure]
  *
  * Nothing happens when no call is up, and that arm is complete rather than skipped: with
  * no agent anywhere there is nothing that could disagree with the form, and every join
- * ends by sending this same control.
+ * ends by sending these same controls.
  */
-async function sendChosenVoice() {
+async function sendChosenSettings() {
   try {
-    await call?.useChosenVoice();
+    await call?.useChosenSettings();
   } catch (error) {
-    render(log("error", `${error} — the voice box is showing a voice this call is not using`));
+    render(log("error", `${error} — the form is showing settings this call is not using`));
   }
 }
 
 async function join() {
-  const fields = readForm();
+  // Only the three the mint needs. The overrides on the form reach the call through
+  // `settings` below and by no other route — spreading the whole form here would hand
+  // `Call.join` the api key twice and the conversation's settings as a stale snapshot,
+  // and one of those two mistakes ends up on the data channel.
+  const { apiKey, agentId, participantName } = readForm();
   showButton("joining…", false);
 
   call = await Call.join({
-    ...fields,
-    livekitUrl: await livekitUrl(),
-    // A reader of the control rather than the voice `fields` happens to be carrying. The
-    // form stays the one place that says which voice this call is in, so changing it
-    // mid-call reaches the agent with nothing to keep in step. [LAW:one-source-of-truth]
-    chosenVoice: () => els.voice.value,
+    apiKey,
+    agentId,
+    participantName,
+    livekitUrl: (await deployment()).livekit_url,
+    // A reader of the controls rather than the values they held a moment ago. The form
+    // stays the one place that says what this call is, so changing any of it mid-call
+    // reaches the agent with nothing to keep in step. [LAW:one-source-of-truth]
+    settings: chosenSettings,
     onEvent: show,
     onTrack: (track) => track.attach(els.audio),
     onState: (state) => render(cell("room", state)),
@@ -311,17 +390,17 @@ async function join() {
     onPresence: (identity, presence) => render(log("system", `${identity} ${presence}`)),
   });
 
-  // A voice list that arrived while this join was in flight has already written the
-  // control and dispatched its change at a `call` that was still null. Sent once here,
-  // with nothing awaited between the assignment above and this line, so no dispatch can
-  // land in the gap and every join ends with the agent holding what the form shows —
+  // A voice or language list that arrived while this join was in flight has already
+  // written its control and dispatched a change at a `call` that was still null. Sent once
+  // here, with nothing awaited between the assignment above and this line, so no dispatch
+  // can land in the gap and every join ends with the agent holding what the form shows —
   // whichever of the two settled last. [LAW:no-ambient-temporal-coupling]
-  await sendChosenVoice();
+  await sendChosenSettings();
 
-  // The voice is read here rather than taken from `fields`: that snapshot predates the
-  // microphone prompt, and a voice chosen during the join is the one this call is in, so
-  // it is the one the next visit should open on. [LAW:one-source-of-truth]
-  remember({ ...fields, voiceId: els.voice.value });
+  // Read now rather than at the top of this function: that snapshot predates the
+  // microphone prompt and both listings, and what this call is actually running on is the
+  // one thing worth opening on next visit. [LAW:one-source-of-truth]
+  remember(showing());
   render(cell("call", call.conversationId));
   render(cell("audio", call.audible ? "playing" : "BLOCKED — click the page"));
   showButton("leave", true);
@@ -354,9 +433,16 @@ els.join.addEventListener("click", async () => {
   }
 });
 
-// Choosing a voice during a call changes the call. Without this the control is only read
-// at the join, and the way to hear a different voice is to hang up and dial again — which
-// makes comparing two voices a thing you do from memory across two conversations.
-els.voice.addEventListener("change", sendChosenVoice);
+// Changing any of these during a call changes the call. Without it a control is only read
+// at the join, and the way to hear a different voice — or language, or opening line — is to
+// hang up and dial again, which makes comparing two of anything a thing you do from memory
+// across two conversations. Bound by iterating the same list that decides what is sent, so
+// a control that reaches the agent and a control that is watched cannot come apart.
+// [LAW:one-source-of-truth]
+for (const name of OVERRIDES) {
+  CONTROLS[name].addEventListener("change", sendChosenSettings);
+}
 
-offerVoices(seedFields().voiceId);
+const seeded = seedFields();
+offerVoices(seeded.voiceId);
+offerLanguages(seeded.language);

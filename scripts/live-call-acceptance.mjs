@@ -61,21 +61,23 @@ const recording = recordSpeech(line, join(mkdtempSync(join(tmpdir(), "openconv-"
 
 console.log(`the caller will say: "${line}"`);
 
-const caller = await Caller.join({ openconv, livekitUrl, xiApiKey, participantName: "u_livecall" });
+// The prompt override is what makes the agent's reply worth asserting on, and it travels
+// with the handshake so that this run configures a conversation the same way the browser
+// page does — one implementation, in `web/conversation.js`.
+const caller = await Caller.join({
+  openconv,
+  livekitUrl,
+  xiApiKey,
+  participantName: "u_livecall",
+  settings: { prompt: PROMPT },
+});
 console.log(`joined ${caller.conversationId} at ${livekitUrl}\n`);
 
 checks.record(
-  "the agent is in the conversation",
-  await caller.waitFor(() => caller.agentPresent(), 25_000, "the agent to join"),
+  "the agent is in the conversation and holds its configuration",
+  await caller.agentConfigured(25_000),
   caller.roster().join(", "),
 );
-
-// The SDK configures the conversation before anyone speaks. Sent here for the same
-// reason: the prompt override is what makes the agent's reply worth asserting on.
-await caller.send({
-  type: "conversation_initiation_client_data",
-  conversation_config_override: { agent: { prompt: { prompt: PROMPT } } },
-});
 
 checks.record(
   "the conversation was announced",
