@@ -178,10 +178,11 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
         from_turn,
     };
 
-    // Whether the agent is currently answering, and how to stop it. `None` is an agent
-    // with nothing to interrupt; holding the token rather than a bare flag is what makes
-    // barge-in one call rather than a hunt for whatever happens to be speaking.
-    let mut answering: Option<CancellationToken> = None;
+    // Whether the agent is currently answering, and how to stop it. Holding the token
+    // rather than a bare flag is what makes barge-in one call rather than a hunt for
+    // whatever happens to be speaking; holding it behind `Answering` is what keeps every
+    // turn that replaces another from orphaning it. See that type.
+    let mut answering = Answering::default();
 
     // The conversation as the model will see it. Held here rather than in the LLM
     // client because the client answers one question at a time and holds no session —
@@ -242,7 +243,7 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                     }
 
                     Noticed::Started => {
-                        if stop_answering(&mut answering, &stage.voice, control.as_deref()).await? {
+                        if answering.stop(&stage.voice, control.as_deref()).await? {
                             tracing::info!(
                                 conversation = %assignment.conversation_id,
                                 "the caller spoke over the agent; stopping"
@@ -262,12 +263,26 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
 
                         if settled {
                             history.push(Turn::Caller(text));
-                            answering = Some(start_turn(
-                                &stage,
-                                control.clone(),
-                                &config,
-                                Says::Answer(history.clone()),
-                            ));
+
+                            // Stopping here is not the ordinary path — `Noticed::Started`
+                            // took the turn when this utterance began. Something started
+                            // speaking *during* it, which is a mid-call configuration
+                            // change owing a new greeting, and the caller finishing their
+                            // sentence is what supersedes it.
+                            if answering
+                                .start(
+                                    &stage,
+                                    control.clone(),
+                                    &config,
+                                    Says::Answer(history.clone()),
+                                )
+                                .await?
+                            {
+                                tracing::info!(
+                                    conversation = %assignment.conversation_id,
+                                    "a turn began while the caller was still speaking; stopping"
+                                );
+                            }
                         }
                     }
                 }
@@ -285,7 +300,7 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                     FromTurn::Used { calls, results } => {
                         history.push(Turn::Used { calls, results });
                     }
-                    FromTurn::Ended => answering = None,
+                    FromTurn::Ended(id) => answering.ended(id),
                 }
                 continue;
             }
@@ -316,8 +331,19 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
 
                 // The channel exists now, so a greeting that was waiting on it can go.
                 if let Some(greeting) = greeting_to_say.take() {
-                    answering =
-                        Some(start_turn(&stage, control.clone(), &config, Says::Line(greeting)));
+                    // A caller who spoke before their agent had announced is already
+                    // being answered, and the greeting that opens the conversation is not
+                    // worth talking over that answer to deliver — but it is the newer
+                    // fact, so it takes the turn and says so.
+                    if answering
+                        .start(&stage, control.clone(), &config, Says::Line(greeting))
+                        .await?
+                    {
+                        tracing::info!(
+                            conversation = %assignment.conversation_id,
+                            "the caller was answered before the conversation was announced; stopping"
+                        );
+                    }
                 }
             }
 
@@ -443,12 +469,25 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                                 "the app sent a user_message carrying no text"
                             ),
                             Some(text) => {
+                                tracing::info!(
+                                    conversation = %assignment.conversation_id,
+                                    chars = text.len(),
+                                    "the app sent a message to answer"
+                                );
+                                history.push(Turn::Caller(text));
+
                                 // Superseding whatever the agent was mid-sentence about,
                                 // for the same reason speaking over it does: two turns
                                 // talking at once is the one thing a caller cannot listen
                                 // through. The app queues prompts until the room is quiet,
                                 // so this is the race it loses rather than the normal path.
-                                if stop_answering(&mut answering, &stage.voice, control.as_deref())
+                                if answering
+                                    .start(
+                                        &stage,
+                                        control.clone(),
+                                        &config,
+                                        Says::Answer(history.clone()),
+                                    )
                                     .await?
                                 {
                                     tracing::info!(
@@ -456,19 +495,6 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                                         "a typed message arrived mid-answer; stopping"
                                     );
                                 }
-
-                                tracing::info!(
-                                    conversation = %assignment.conversation_id,
-                                    chars = text.len(),
-                                    "the app sent a message to answer"
-                                );
-                                history.push(Turn::Caller(text));
-                                answering = Some(start_turn(
-                                    &stage,
-                                    control.clone(),
-                                    &config,
-                                    Says::Answer(history.clone()),
-                                ));
                             }
                         }
                         continue;
@@ -535,15 +561,11 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                 if let Some(greeting) = opening {
                     match control.is_some() {
                         true => {
-                            // Superseding whatever the agent was mid-sentence about, for the
-                            // same reason a typed message does: reopening a conversation over
-                            // a half-finished answer without stopping it leaves two turns
-                            // audible, and the one nothing holds the token for any more can no
-                            // longer be interrupted at all. Assigning over `answering` does not
-                            // stop it — a bare `CancellationToken` cancels nothing when it is
-                            // dropped, and `stop_answering` is the only thing that calls
-                            // `cancel`. [LAW:single-enforcer]
-                            if stop_answering(&mut answering, &stage.voice, control.as_deref())
+                            // Superseding whatever the agent was mid-sentence about, for
+                            // the same reason a typed message does: two turns talking at
+                            // once is the one thing a caller cannot listen through.
+                            if answering
+                                .start(&stage, control.clone(), &config, Says::Line(greeting))
                                 .await?
                             {
                                 tracing::info!(
@@ -551,13 +573,6 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
                                     "a new opening line arrived mid-answer; stopping"
                                 );
                             }
-
-                            answering = Some(start_turn(
-                                &stage,
-                                control.clone(),
-                                &config,
-                                Says::Line(greeting),
-                            ));
                         }
                         false => greeting_to_say = Some(greeting),
                     }
@@ -584,13 +599,9 @@ pub async fn run(assignment: Assignment, services: Arc<Services>) -> Result<(), 
         }
     }
 
-    // A caller who left mid-answer is still owed nothing, and the answer costs money to
-    // finish: the model keeps writing and every clause of it keeps being synthesized for
-    // a room with nobody in it. Ending the turn is the same act as barge-in, because it
-    // is the same fact — nobody is listening to the rest of this.
-    if let Some(turn) = answering.take() {
-        turn.cancel();
-    }
+    // The same act as barge-in, because it is the same fact — nobody is listening to the
+    // rest of this.
+    answering.cancel();
 
     // An agent that never announced is one nobody ever joined — a token minted and not
     // used, or a caller who could not reach the SFU. It bills as a conversation either
@@ -669,7 +680,10 @@ enum FromTurn {
     /// otherwise break every turn after it.
     Used { calls: Vec<ToolCall>, results: Vec<ToolResult> },
     /// The turn is over: every clause queued, or the caller cut it off.
-    Ended,
+    ///
+    /// Names itself, because a turn the caller interrupted still reports this — and by
+    /// then the slot it used to occupy may hold the turn that replaced it.
+    Ended(TurnId),
 }
 
 /// What every turn in one conversation is spoken through.
@@ -698,6 +712,7 @@ struct Stage {
 /// response, when the next thing they say may well work.
 fn start_turn(
     stage: &Stage,
+    id: TurnId,
     control: Option<Arc<ControlChannel>>,
     config: &SessionConfig,
     says: Says,
@@ -824,7 +839,7 @@ fn start_turn(
                 "turn over"
             );
 
-            let _ = from_turn.send(FromTurn::Ended).await;
+            let _ = from_turn.send(FromTurn::Ended(id)).await;
         }
     });
 
@@ -1031,50 +1046,119 @@ async fn next_event(
     }
 }
 
-/// Stops whatever the agent is saying, because the caller has taken the turn.
-///
-/// Cancelling and telling the client are one act rather than two: the token stops the
-/// agent sending, and only the interruption event makes the client drop the audio it has
-/// already buffered. A caller who does one without the other keeps hearing a reply the
-/// agent abandoned seconds ago.
-///
-/// Reports whether there was anything to stop, so the two ways a turn gets taken — spoken
-/// over, or typed over — can say which one happened without each keeping its own idea of
-/// what stopping involves.
-async fn stop_answering(
-    answering: &mut Option<CancellationToken>,
-    voice: &Voice,
-    control: Option<&ControlChannel>,
-) -> Result<bool, AgentError> {
-    // [LAW:one-source-of-truth] Two facts, because a running turn and an audible reply
-    // are not the same thing and the gap between them is where barge-in used to fail. A
-    // turn ends when its last clause is enqueued; the caller keeps hearing it until the
-    // queue drains. Asking only the turn made every interruption in that window a no-op:
-    // the token was already gone, so nothing was cancelled, nothing was silenced, and the
-    // agent talked over the caller to the end of its buffer while the detector scored
-    // their speech at 0.99 and the loop did nothing with it.
-    match (answering.take(), voice.is_speaking()) {
-        // Silence, and no turn behind it. The caller is opening a turn, not cutting one
-        // off, and there is nothing to interrupt.
-        (None, false) => Ok(false),
+/// Names one turn, so a report *from* a turn can be told from a report about the turn
+/// that replaced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TurnId(u64);
 
-        // A turn is still running, so cancelling it is the whole job: its drain task
-        // holds the queue and throws it away on cancellation. Silencing from here as well
-        // would put a second writer on a queue whose single-writer discipline is what
-        // lets it be discarded safely at all — see `speak`.
-        (Some(turn), _) => {
+/// The turn the agent is taking, and the only way to change it.
+///
+/// The token that stops a turn is also the only handle that names it, so a slot holding
+/// it bare loses the power to interrupt whatever is still speaking the moment anything
+/// assigns over it — silently, because a dropped `CancellationToken` cancels nothing.
+/// Four places start a turn and one clears the slot, and every one of them owed that
+/// rule as a rule. Owning the slot is what makes stopping what you replace the only
+/// thing expressible rather than the thing each caller has to remember.
+/// [LAW:single-enforcer]
+#[derive(Default)]
+struct Answering {
+    /// The running turn, under the id its own `FromTurn::Ended` will carry.
+    current: Option<(TurnId, CancellationToken)>,
+    /// Ids handed out so far. Monotonic because a turn is told apart from the one that
+    /// replaced it, and nothing ever reaches for a turn by id after it is gone.
+    minted: u64,
+}
+
+impl Answering {
+    /// Starts `says`, stopping whatever it replaces.
+    ///
+    /// Reports whether something was cut off, which every caller has its own sentence
+    /// for: the caller spoke over the agent, or typed over it, or reconfigured the
+    /// conversation mid-answer. That is the fact worth logging; that the stopping
+    /// happened at all is no longer news, because it cannot not have.
+    async fn start(
+        &mut self,
+        stage: &Stage,
+        control: Option<Arc<ControlChannel>>,
+        config: &SessionConfig,
+        says: Says,
+    ) -> Result<bool, AgentError> {
+        let stopped = self.stop(&stage.voice, control.as_deref()).await?;
+
+        self.minted += 1;
+        let id = TurnId(self.minted);
+        self.current = Some((id, start_turn(stage, id, control, config, says)));
+
+        Ok(stopped)
+    }
+
+    /// Forgets the turn that just ended, and only that turn.
+    ///
+    /// Every turn reports `Ended`, interrupted ones included — and a cancelled turn
+    /// waiting on a tool call, which `start_turn` deliberately does not cancel, reports
+    /// it long after its replacement started speaking. Clearing the slot for whichever
+    /// turn happened to finish would drop the live turn's token and leave the caller
+    /// unable to interrupt it: the same orphaned turn `start` exists to prevent, coming
+    /// in through a later door.
+    fn ended(&mut self, id: TurnId) {
+        self.current.take_if(|(running, _)| *running == id);
+    }
+
+    /// Ends the conversation's turn for good, with nobody left to tell.
+    ///
+    /// A caller who left mid-answer is owed nothing, and the answer costs money to
+    /// finish: the model keeps writing and every clause of it keeps being synthesized
+    /// for a room with nobody in it.
+    fn cancel(&mut self) {
+        if let Some((_, turn)) = self.current.take() {
             turn.cancel();
-            publish_interruption(control).await?;
-            Ok(true)
         }
+    }
 
-        // The turn is over and the caller is still listening to it. Nothing owns the
-        // queue now, which is precisely why this can — and must — empty it directly:
-        // there is no drain task left to receive a cancellation.
-        (None, true) => {
-            voice.silence();
-            publish_interruption(control).await?;
-            Ok(true)
+    /// Stops whatever the agent is saying, because the caller has taken the turn.
+    ///
+    /// Cancelling and telling the client are one act rather than two: the token stops the
+    /// agent sending, and only the interruption event makes the client drop the audio it
+    /// has already buffered. A caller who does one without the other keeps hearing a
+    /// reply the agent abandoned seconds ago.
+    ///
+    /// Reports whether there was anything to stop, so the ways a turn gets taken can each
+    /// say which one happened without keeping its own idea of what stopping involves.
+    async fn stop(
+        &mut self,
+        voice: &Voice,
+        control: Option<&ControlChannel>,
+    ) -> Result<bool, AgentError> {
+        // [LAW:one-source-of-truth] Two facts, because a running turn and an audible
+        // reply are not the same thing and the gap between them is where barge-in used to
+        // fail. A turn ends when its last clause is enqueued; the caller keeps hearing it
+        // until the queue drains. Asking only the turn made every interruption in that
+        // window a no-op: the token was already gone, so nothing was cancelled, nothing
+        // was silenced, and the agent talked over the caller to the end of its buffer
+        // while the detector scored their speech at 0.99 and the loop did nothing with it.
+        match (self.current.take(), voice.is_speaking()) {
+            // Silence, and no turn behind it. The caller is opening a turn, not cutting
+            // one off, and there is nothing to interrupt.
+            (None, false) => Ok(false),
+
+            // A turn is still running, so cancelling it is the whole job: its drain task
+            // holds the queue and throws it away on cancellation. Silencing from here as
+            // well would put a second writer on a queue whose single-writer discipline is
+            // what lets it be discarded safely at all — see `speak`.
+            (Some((_, turn)), _) => {
+                turn.cancel();
+                publish_interruption(control).await?;
+                Ok(true)
+            }
+
+            // The turn is over and the caller is still listening to it. Nothing owns the
+            // queue now, which is precisely why this can — and must — empty it directly:
+            // there is no drain task left to receive a cancellation.
+            (None, true) => {
+                voice.silence();
+                publish_interruption(control).await?;
+                Ok(true)
+            }
         }
     }
 }
@@ -1291,5 +1375,41 @@ mod tests {
         drop(sending);
 
         assert!(next_event(&mut missed, &mut events).await.is_none());
+    }
+
+    /// A turn that is running, held the way the conversation loop holds one.
+    ///
+    /// Built rather than started, because `start_turn` needs a room, a mouth and two
+    /// model clients — and none of them bear on which report clears the slot.
+    /// [LAW:behavior-not-structure]
+    fn running(id: TurnId) -> (Answering, CancellationToken) {
+        let turn = CancellationToken::new();
+        (Answering { current: Some((id, turn.clone())), minted: id.0 }, turn)
+    }
+
+    /// The orphaned turn, which is what `TurnId` exists to prevent: a turn the caller
+    /// interrupted still reports that it ended, and a cancelled turn waiting on a tool
+    /// call can report it long after its replacement started speaking. Clearing the slot
+    /// for it drops the live turn's token, and nothing can interrupt that turn again.
+    #[test]
+    fn a_turn_ending_after_it_was_replaced_leaves_the_live_turn_alone() {
+        let (mut answering, live) = running(TurnId(2));
+
+        answering.ended(TurnId(1));
+        answering.cancel();
+
+        assert!(live.is_cancelled(), "an older turn's report took the live turn's token");
+    }
+
+    /// The ordinary end of a turn: the slot empties, so the next barge-in silences the
+    /// audio still draining instead of cancelling a turn that is already over.
+    #[test]
+    fn a_turn_reporting_its_own_end_empties_the_slot() {
+        let (mut answering, turn) = running(TurnId(2));
+
+        answering.ended(TurnId(2));
+        answering.cancel();
+
+        assert!(!turn.is_cancelled(), "the turn was still held after reporting it had ended");
     }
 }
