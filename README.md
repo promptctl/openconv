@@ -230,10 +230,30 @@ small and empirically chosen: `base.en` hears "penguin" as "pen win", which fail
 script for a reason that has nothing to do with the agent, so candidates get checked
 through `transcribe_wav` before they go in.
 
-Both scripts, and any future one, are clients built on `scripts/lib/caller.mjs` —
-minting, joining, the control channel, metering the agent's audio, and speaking into
-the room live there once, so two scripts cannot drift into two different ideas of what
-a caller is.
+```
+node scripts/happy-metered-path-acceptance.mjs https://happy-server.sanctuary.gdn wss://livekit.sanctuary.gdn
+```
+
+That one takes no API key, and the absence is the point: it mints through the deployed
+happy-server with a real Happy account's bearer token out of `~/.happy/access.key`, so
+the credential under test is the shared secret happy-server itself holds and presents as
+`xi-api-key`. `live-call-acceptance` proves openconv works and proves nothing about who
+is allowed to reach it; this covers the legs that exist only once Happy is pointed
+here — happy's `VOICE_CONVAI_ORIGIN`, its usage gate, that secret, and the `conv_` id
+happy recovers out of the JWT rather than being handed in a field. Only the browser
+SDK itself is left uncovered.
+
+It then asserts the token happy handed back was signed by openconv for the room happy
+named, joins that room, and asserts openconv's agent is actually in it. That last one
+matters because a provider/SFU mismatch does not error: the conversation token is a JWT
+signed by one provider's LiveKit keys, and offered to the other's SFU it joins a room
+the agent is not in, and the caller hears silence. Presence is what turns that silence
+into a failed check.
+
+All three scripts, and any future one, are clients built on `scripts/lib/caller.mjs` —
+minting, joining, the control channel, metering the agent's audio, speaking into the
+room, and the random word the caller asks for live there once, so two scripts cannot
+drift into two different ideas of what a caller is.
 
 ```
 OPENCONV_API_KEY=... node scripts/stt-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn

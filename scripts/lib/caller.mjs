@@ -55,6 +55,34 @@ const AUDIBLE = 1000;
  */
 export const SPOKEN = "Hello, can you hear me? This is a test of the voice agent.";
 
+/**
+ * The causal probe: a word the caller asks for aloud, the sentence that asks for it, and
+ * the match that recognises it coming back. One unit because the three cannot be chosen
+ * independently — a word only earns its place by surviving `say` into whisper, and it is
+ * only useful with a line plain enough for the model to obey and a match loose enough
+ * that "Banana." still counts.
+ *
+ * Everyday nouns rather than a random string, because the word has to survive being
+ * spoken by one synthesizer and heard by a speech model: "xk7q" is a test of nothing but
+ * whisper's spelling. Drawn per run so a pass cannot be a coincidence twice.
+ *
+ * Every entry was checked through the real path — `say` into `transcribe_wav` — rather
+ * than chosen for sounding distinctive. Two obvious candidates did not survive it and are
+ * deliberately absent: base.en hears "penguin" as "pen win" and "walrus" as "waras",
+ * which fails a caller script for a reason that has nothing to do with the agent.
+ * Re-check any word through that path before adding it here.
+ *
+ * [LAW:one-source-of-truth] One list, for the same reason `SPOKEN` is one sentence: every
+ * script that asks a caller's question draws from here, so a word can never be vetted for
+ * one script and unvetted in another.
+ */
+export function asksFor() {
+  const word = WORDS[Math.floor(Math.random() * WORDS.length)];
+  return { word, line: `Please reply with only the word ${word}.`, said: (text) => text.toLowerCase().includes(word) };
+}
+
+const WORDS = ["banana", "umbrella", "trumpet", "cactus", "harmonica", "lantern", "rooster", "pumpkin"];
+
 /** What a count of frames is worth in milliseconds, at the one rate a room works at. */
 export const millis = (frames) => (frames * 1000) / FRAMES_PER_SECOND;
 
