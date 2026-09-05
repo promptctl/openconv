@@ -106,8 +106,8 @@ impl Transcriber {
 /// service refuses to run unaccelerated is written down. Two checks rather than one
 /// because they answer different questions: a binary that could never be fast is not the
 /// same fact as a process that is not fast, and the first is knowable without a machine,
-/// without a model file, and without the eighty-odd seconds of CPU inference it takes to
-/// measure the second. [FRAMING:representation] compile-time beats runtime — check each
+/// without a model file, and without the load-and-two-inferences it takes to measure the
+/// second. [FRAMING:representation] compile-time beats runtime — check each
 /// fact where it lives.
 ///
 /// Callers pass whisper-rs's own `cfg!(feature = "_gpu")`, which answers the one
@@ -143,15 +143,17 @@ const CALIBRATION_MODEL: &str = "ggml-base.en";
 /// | target         | accelerated | fallen back to the CPU |
 /// |----------------|-------------|------------------------|
 /// | M2 Max, Metal  | 50-56ms     | 565ms-3.0s             |
-/// | RTX 2070, CUDA | 84ms        | 41601ms                |
+/// | RTX 2070, CUDA | 41ms        | 1675-1679ms            |
 ///
-/// The deployment's 500x gap is not the one that has to be separated. The binding pair is
-/// the narrowest across targets: the slowest *healthy* measurement, CUDA's 84ms, against
-/// the fastest *unhealthy* one, macOS's 565ms. Their geometric middle is 218ms, where the
-/// multiplicative margin on each side is largest, and 250ms sits just above it — 3.0x
-/// clear of the slowest healthy measurement and 2.3x clear of the fastest unhealthy one.
-/// Widening it to catch a slower future CPU eats the headroom a contended GPU needs, and
-/// a false refusal is an outage where a missed one is only today's bug.
+/// The binding pair is the narrowest across targets: the slowest *healthy* measurement
+/// against the fastest *unhealthy* one. Warm CUDA is the fastest figure in the table, not
+/// the slowest, so the healthy end is Metal's 56ms and the unhealthy end is macOS's
+/// 565ms — a 10x gap, and the only one the check has to split. Their geometric middle is
+/// 178ms, where the multiplicative margin on each side is equal; 250ms sits deliberately
+/// above it, 4.5x clear of the slowest healthy measurement and 2.3x clear of the fastest
+/// unhealthy one. That asymmetry is chosen, not sloppy: a false refusal takes the service
+/// down, where a missed one is only today's bug. Widening it further to catch a slower
+/// future CPU eats the headroom a contended GPU needs.
 ///
 /// What it therefore encodes is how long [`CALIBRATION_MODEL`] takes on hardware that is
 /// working, so a heavier model does not shrink the margin — it invalidates the number.
@@ -413,14 +415,14 @@ mod tests {
     /// is what says so.
     #[test]
     fn accelerated_inference_passes_and_cpu_inference_does_not() {
-        for accelerated in [Duration::from_millis(50), Duration::from_millis(84)] {
+        for accelerated in [Duration::from_millis(41), Duration::from_millis(56)] {
             assert!(
                 require_fast_inference(accelerated).is_ok(),
                 "{accelerated:?} was measured on a healthy GPU and was refused"
             );
         }
 
-        for fallen_back in [Duration::from_millis(565), Duration::from_millis(41601)] {
+        for fallen_back in [Duration::from_millis(565), Duration::from_millis(1675)] {
             let Err(error) = require_fast_inference(fallen_back) else {
                 panic!("{fallen_back:?} is CPU speed and was allowed to serve calls");
             };
@@ -436,10 +438,10 @@ mod tests {
     /// the constant, so the message cannot drift from the budget it reports either.
     #[test]
     fn the_refusal_reports_the_numbers_and_both_causes() {
-        let error = require_fast_inference(Duration::from_millis(41601)).unwrap_err();
+        let error = require_fast_inference(Duration::from_millis(1675)).unwrap_err();
         let message = error.to_string();
 
-        assert!(message.contains("41601ms"), "{message}");
+        assert!(message.contains("1675ms"), "{message}");
         assert!(message.contains(&format!("{}ms", WARM_INFERENCE_BUDGET.as_millis())), "{message}");
         assert!(message.contains("failed to initialize"), "{message}");
         assert!(message.contains(CALIBRATION_MODEL), "{message}");
