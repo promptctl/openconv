@@ -375,13 +375,23 @@ export class Caller {
     settings = {},
   }) {
     const caller = new Caller(null, livekitUrl, settings);
-    caller.conversationId = await caller.conversation.open({
-      openconv,
-      apiKey: xiApiKey,
-      agentId,
-      participantName,
-    });
+    await caller.open({ openconv, apiKey: xiApiKey, agentId, participantName });
     return caller;
+  }
+
+  /**
+   * Mints the conversation, joins its room, and tells whoever is already in it.
+   *
+   * Split from `join` because what a failure costs here is a policy rather than a step.
+   * `web/caller.js` catches `NotTold` and keeps the call, on the grounds that a caller who
+   * can hear the agent would rather not lose the room over a configure that missed. A
+   * script must do the opposite: a kept call is a run that goes on to assert against an
+   * agent still holding the deployment default, and reports green. The two sides differ
+   * deliberately, and a policy stated only by the absence of a `catch` is one a later
+   * refactor can copy away without anything noticing. [LAW:verifiable-goals]
+   */
+  async open(credentials) {
+    this.conversationId = await this.conversation.open(credentials);
   }
 
   /**

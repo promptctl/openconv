@@ -91,9 +91,8 @@ impl SessionConfig {
     /// greeting the caller has already heard.
     ///
     /// What answering that off the message costs, rather than merely a greeting twice: the
-    /// loop starts a second turn over the one it is already speaking, and since a turn is
-    /// only ever cancelled through `stop_answering`, the first is not stopped but orphaned
-    /// — still speaking, with nothing holding its token left to interrupt it.
+    /// loop starts a second turn, and `Answering::start` stops the one already speaking to
+    /// make room for it — so the caller is cut off mid-sentence to be told hello again.
     ///
     /// There is no "nothing came before" arm because there is no such state: a conversation
     /// starts settled from an empty payload, whose `first_message` is already `None`, so the
@@ -411,9 +410,8 @@ mod tests {
     ///
     /// The page publishes the whole configuration whenever any control changes, so
     /// switching the voice mid-call sends a message still carrying the greeting the caller
-    /// was opened with. Read off the message, that greeting is said again — over whatever
-    /// the agent is mid-sentence about, and without stopping it, since nothing on this path
-    /// goes through `stop_answering`.
+    /// was opened with. Read off the message, that greeting is said again, and
+    /// `Answering::start` stops whatever the agent was mid-sentence about to say it.
     ///
     /// Both axes are asserted because a test naming only the voice would pass while the
     /// language went on doing it: what is being fixed is not the voice control but the
