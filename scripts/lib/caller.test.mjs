@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Caller, delivery, millis, readRecording, sounding, transportOf } from "./caller.mjs";
+import { NotTold } from "../../web/conversation.js";
 
 /// A caller that has "received" these events, with no room behind it. The accessors read
 /// `controlEvents` and nothing else, so this is the whole of their input.
@@ -579,23 +580,61 @@ test("a control message goes out reliably, because a dropped one is never notice
   assert.equal(room.published[0].options.reliable, true);
 });
 
-/// A caller whose agent appears only after `agentAfterMs`, and whose configure never
-/// settles.
+/// A caller whose agent appears only after `agentAfterMs`, holding `configuring` as the
+/// record of the publishes it is waiting on.
 ///
 /// `agentConfigured` reads exactly two things — the roster, through the transport, and the
-/// publish attempts recorded on `configuring` — so a roster that answers on a timer is the
-/// whole of its input. No room is constructed and nothing here reaches an SFU.
-const callerAwaiting = (agentAfterMs) => {
+/// publish attempts recorded on `configuring` — so a roster that answers on a timer and a
+/// list of attempts are the whole of its input. A configure that never settles is the
+/// default because it is the case with no other way to reach it; passing settled ones is
+/// what the ordinary path looks like. No room is constructed and nothing reaches an SFU.
+const callerAwaiting = (agentAfterMs, configuring = [new Promise(() => {})]) => {
   const start = Date.now();
 
   return Object.assign(Object.create(Caller.prototype), {
     participants: [],
-    configuring: [new Promise(() => {})],
+    configuring,
     transport: {
       participants: () => (Date.now() - start >= agentAfterMs ? ["agent_late"] : []),
     },
   });
 };
+
+test("an agent present and told inside the budget is what being configured means", async () => {
+  // The other `agentConfigured` test seeds a configure that never settles, so it can only
+  // ever reach the rejection branch. The path all seven acceptance scripts wait on — agent
+  // in the room, every publish settled, inside the budget — had nothing asserting it at
+  // all, and a regression that made it hang, reject, or answer `false` would have left
+  // this suite green. [LAW:behavior-not-structure]
+  const caller = callerAwaiting(0, [Promise.resolve()]);
+
+  assert.equal(await caller.agentConfigured(500), true);
+});
+
+test("a configure that never reached the agent ends the run rather than keeping the call", async () => {
+  // `web/caller.js` catches this exact type to keep a working call. A script must not: the
+  // conversation it would keep is one the agent was never told about, so every assertion
+  // after it measures an agent still on the deployment default — and reports green. The
+  // open-time sweep is not recorded in `configuring` (only arrivals are), so `agentConfigured`
+  // would not catch it either. This is the only thing holding this side to its half.
+  const caller = Object.assign(Object.create(Caller.prototype), {
+    conversation: {
+      open: async () => {
+        throw new NotTold("conv_kept", new Error("agent_one could not be told what this conversation is"));
+      },
+    },
+  });
+
+  await assert.rejects(
+    () => caller.open({}),
+    (failure) => {
+      assert.ok(failure instanceof NotTold, `kept the call and threw ${failure.name} instead`);
+      assert.equal(failure.conversationId, "conv_kept");
+      return true;
+    },
+  );
+  assert.equal(caller.conversationId, undefined, "a call that was never told recorded no conversation");
+});
 
 test("the budget bounds the whole wait, not each wait inside it", async () => {
   // Two waits run in sequence in `agentConfigured`, and each used to be given the caller's

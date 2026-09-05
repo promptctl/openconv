@@ -192,6 +192,23 @@ test("a send that fails names the agent it could not be delivered to", async () 
   });
 });
 
+test("a sweep that could not reach two agents names both of them", async () => {
+  // `Promise.all` reports the first rejection and discards the rest, so the second agent's
+  // failure reached nobody: not the caller, not a log, nothing — while its own `send` still
+  // un-recorded it for a retry, leaving a room where one agent is known to be unreachable
+  // and another is unreachable in silence. [LAW:no-silent-failure]
+  const transport = transportOf(["agent_one", "agent_two"], async (payload) => {
+    throw new Error(`no route (${new TextDecoder().decode(payload).length} bytes)`);
+  });
+
+  await assert.rejects(conversationWith(transport, () => voiced("bm_george")).arrived(), (failure) => {
+    assert.match(failure.message, /agent_one could not be told what this conversation is/);
+    assert.match(failure.message, /agent_two could not be told what this conversation is/);
+    assert.equal(failure.errors.length, 2, "both failures are carried, not just their sentences");
+    return true;
+  });
+});
+
 test("an agent a send failed to reach is told again on the next sweep", async () => {
   // The room does not put itself right, so the next sweep is the only thing that can — and
   // it cannot, if a publish that never landed was recorded as though it had. An agent left

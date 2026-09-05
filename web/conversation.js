@@ -243,7 +243,7 @@ export function conversationWith(transport, readSettings) {
   };
 
   /** Publishes the configuration to each of `identities`, joining any send already flying. */
-  const tell = (identities) => {
+  const tell = async (identities) => {
     // Read once for the whole sweep rather than per agent, so that two agents told together
     // are told the same thing: a control moving while the sweep runs would otherwise leave
     // one agent on the old answer and the other on the new, with the record claiming both
@@ -254,9 +254,26 @@ export function conversationWith(transport, readSettings) {
     // a partial failure records exactly the ones that were. Telling nobody is an empty list
     // rather than a case of its own: a room with no agent in it yet, and a room whose agent
     // has left, take the same path as a room with one. [LAW:dataflow-not-control-flow]
-    return Promise.all(
-      identities.map((identity) => telling.get(identity) ?? send(identity, message)),
+    const attempts = identities.map(
+      (identity) => telling.get(identity) ?? send(identity, message),
     );
+
+    // Settled rather than raced, because `Promise.all` reports the first rejection and
+    // drops every other one on the floor. Two agents unreachable in the same sweep is the
+    // case the sentence above claims this shape handles, and under `all` the second one is
+    // named nowhere at all — not thrown, not logged — while its `send` still quietly
+    // un-records it for the next sweep to retry. [LAW:no-silent-failure]
+    const failed = (await Promise.allSettled(attempts))
+      .filter((attempt) => attempt.status === "rejected")
+      .map((attempt) => attempt.reason);
+
+    // One failure reads exactly as it did before this aggregated — `send` already put the
+    // agent's identity in every sentence, so joining one of them changes nothing, and
+    // `NotTold` still surfaces that sentence unaltered. `AggregateError` carries the rest
+    // where a single `cause` could hold only the first. [LAW:one-source-of-truth]
+    if (failed.length > 0) {
+      throw new AggregateError(failed, failed.map((failure) => failure.message).join("; "));
+    }
   };
 
   return {
