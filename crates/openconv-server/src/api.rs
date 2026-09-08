@@ -2,7 +2,7 @@
 //! closely enough that pointing Happy at this host is a base-URL change and nothing
 //! else.
 
-use crate::config::XiApiKey;
+use crate::config::{CallerAuth, XiApiKey};
 use crate::conversation::ConversationId;
 use crate::livekit::{ConversationToken, LiveKitError};
 use crate::record::{now_unix_secs, AgentId, ConversationEvent, ConversationRecord, HappyUserId};
@@ -48,13 +48,23 @@ impl FromRequestParts<AppState> for Authenticated {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        // The one remaining branch is the domain's own enum, handled exhaustively: a
+        // deployment either holds a shared secret or has stated it wants none. Nothing
+        // downstream of here can tell the two apart, which is the point — the proof this
+        // extractor hands out means the same thing either way.
+        // [LAW:dataflow-not-control-flow]
+        let expected = match &state.caller_auth {
+            CallerAuth::Open => return Ok(Self),
+            CallerAuth::SharedSecret(expected) => expected,
+        };
+
         let presented = parts
             .headers
             .get(API_KEY_HEADER)
             .and_then(|value| value.to_str().ok())
             .ok_or(ApiError::Unauthenticated)?;
 
-        (XiApiKey::new(presented) == state.xi_api_key)
+        (&XiApiKey::new(presented) == expected)
             .then_some(Self)
             .ok_or(ApiError::Unauthenticated)
     }

@@ -18,6 +18,7 @@
 //! serving that to a browser produced a `ws://` URL on an `https://` page that browsers
 //! refuse as mixed content, reported only as a transport error naming nothing.
 
+use crate::config::CallerAuth;
 use crate::state::AppState;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
@@ -118,6 +119,13 @@ pub fn router() -> Router<AppState> {
 #[derive(Debug, Serialize)]
 struct CallConfig {
     livekit_url: String,
+    /// Whether this deployment asks callers for an `xi-api-key`.
+    ///
+    /// The page cannot know it and must not guess: a form that demands a key nothing
+    /// checks asks for a secret that does not exist, and one that omits a key the mint
+    /// requires sends a request that comes back 401 with the field to fix it hidden.
+    /// [LAW:one-source-of-truth]
+    requires_api_key: bool,
     /// The languages a conversation may be switched to.
     ///
     /// Here rather than in the page's own markup because the union is closed: a code this
@@ -137,6 +145,7 @@ struct CallConfig {
 async fn config(State(state): State<AppState>) -> impl IntoResponse {
     Json(CallConfig {
         livekit_url: state.livekit.public_signaling_url(),
+        requires_api_key: matches!(state.caller_auth, CallerAuth::SharedSecret(_)),
         languages: Language::ALL.iter().map(|language| language.code()).collect(),
     })
 }

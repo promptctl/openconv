@@ -125,14 +125,44 @@ LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... OPENCONV_API_KEY=... ANTHROPIC_API_KE
 ```
 
 `LIVEKIT_URL`, `OPENCONV_BIND`, `OPENCONV_CONVERSATION_LOG`, `OPENCONV_WHISPER_MODEL`,
-and `OPENCONV_LLM_MODEL` have defaults; the four above do not, and the process refuses
+and `OPENCONV_LLM_MODEL` have defaults; the ones above do not, and the process refuses
 to start without them — with every missing name listed at once.
+
+**`OPENCONV_API_KEY` has a second answer.** A deployment that is its own only caller —
+Happy and openconv on the same private network — gains nothing from a shared secret it
+must provision, sync and rotate on both sides, and the network is already the boundary.
+Such a deployment sets `OPENCONV_ALLOW_UNAUTHENTICATED=true` instead, and every caller is
+let in with no `xi-api-key` at all.
+
+What it may not do is leave both unset. Reading silence as "open" is how a deployment that
+meant to authenticate, and whose secret rendered empty, comes up minting LiveKit tokens
+and spending an Anthropic budget for anyone who can reach it — with nothing anywhere
+reporting a problem. So the absence of a secret has to be *stated*, and stating both is
+refused at startup rather than settled by precedence. Happy's side matches: with
+`VOICE_CONVAI_ORIGIN` pointed here, its `ELEVENLABS_API_KEY` becomes optional, and unset
+means it sends no key. The `/call` page asks `GET /call/config` which of the two this
+deployment is and hides its api key field accordingly, so what it shows and what it
+insists on cannot disagree.
 
 It also serves `POST /livekit/webhook`, which is how conversations get their durations.
 The end of a call is observed rather than reported — the SFU sees the room close even
 when the agent crashed, and a conversation with no end reads to Happy as free usage.
 That makes the conversation log an event log: `started` and `finished` are two appended
 lines, and a conversation is the fold of them, so nothing is ever rewritten in place.
+
+There is a third line, and it exists because the second one can go missing. A delivery
+that never arrives leaves its conversation reading as in progress forever — accruing
+against its caller up to the six-hour cap and never past it — and nothing in the webhook
+path can notice, because what it would have to notice is a message it did not receive. So
+`crates/openconv-server/src/reconcile.rs` re-reads the log against the thing the log is a
+record of: LiveKit's room list is the authority on whether a call is still happening, and
+a started conversation with no ending and no room is written off as `abandoned`. It runs
+once at startup — which is where a delivery lost while this process was down gets caught —
+and hourly after that, and it is idempotent, so a second pass over the first pass's output
+has nothing to do. `abandoned` is a separate line from `finished` on purpose: it says the
+call is over and deliberately does not say when it ended, because by then nothing knows.
+Its duration stays capped for the reason it always was — between the start and the moment
+somebody noticed, this crate knows only that the call was somewhere inside.
 
 Two acceptance scripts check a running instance against what its callers actually do,
 rather than against what this README claims:
@@ -165,11 +195,11 @@ Note for anyone building this on macOS: `.cargo/config.toml` passes `-ObjC`, and
 load-bearing. libwebrtc implements part of itself as Objective-C categories that the
 linker otherwise drops, and the process aborts the first time an agent joins a room.
 
-Two further caveats before trusting any of this in production: openconv accepts
-`room_finished` deliveries, but the LiveKit deployment is not yet configured to send
-them. That is `webhook.urls` in `jobs/livekit.nomad.hcl` over in `home-infra`, and it
-needs a reachable openconv to point at. Until it is set, every conversation reads as
-in-progress and is billed for elapsed time capped at six hours.
+One caveat before trusting any of this in production: openconv accepts `room_finished`
+deliveries and the homelab's SFU is configured to send them (`webhook.urls` in
+`jobs/livekit.nomad.hcl` over in `home-infra`), but a deployment that has not set that up
+gets no durations at all — every conversation reads as in-progress and is billed for
+elapsed time capped at six hours until the startup sweep writes it off.
 
 The agent holds a conversation. It joins, announces, transcribes what the caller says,
 answers with an LLM, publishes the reply as `agent_response`, and speaks it into the

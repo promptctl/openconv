@@ -92,6 +92,13 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let state = AppState::new(&config, LiveKit::new(&config), log, agents, tts);
+
+    // Started before the listener, so a delivery lost while this process was down is
+    // caught on the way up rather than after the first call of the day. It holds the same
+    // log and the same client the routes do, so what it closes and what they report
+    // cannot come from two different pictures. [LAW:one-source-of-truth]
+    openconv_server::reconcile::run_periodically(state.log.clone(), state.livekit.clone());
+
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
 
     tracing::info!(

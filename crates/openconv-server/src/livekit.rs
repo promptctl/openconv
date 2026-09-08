@@ -11,6 +11,7 @@ use crate::record::ConversationRecord;
 use livekit_api::access_token::{AccessToken, AccessTokenError, VideoGrants};
 use livekit_api::services::room::{CreateRoomOptions, RoomClient};
 use livekit_api::services::ServiceError;
+use std::collections::HashSet;
 use std::fmt;
 use std::time::Duration;
 
@@ -80,6 +81,25 @@ impl LiveKit {
             .map_err(LiveKitError::CreateRoom)?;
 
         Ok(())
+    }
+
+    /// The names of every room the SFU currently holds.
+    ///
+    /// The authority on whether a call is still happening. This crate's log is a record
+    /// of what it was told; this is the thing itself, and asking it is the only way a
+    /// delivery that never arrived can ever be noticed. [LAW:one-source-of-truth]
+    ///
+    /// Every room rather than a named few: asking about specific rooms would need the
+    /// caller to already believe they exist, which is exactly the belief being checked.
+    pub async fn live_rooms(&self) -> Result<HashSet<String>, LiveKitError> {
+        Ok(self
+            .rooms
+            .list_rooms(Vec::new())
+            .await
+            .map_err(LiveKitError::ListRooms)?
+            .into_iter()
+            .map(|room| room.name)
+            .collect())
     }
 
     /// Signs the JWT the caller hands to the ElevenLabs SDK.
@@ -212,6 +232,7 @@ impl fmt::Debug for ConversationToken {
 #[derive(Debug)]
 pub enum LiveKitError {
     CreateRoom(ServiceError),
+    ListRooms(ServiceError),
     MintToken(AccessTokenError),
     Metadata(serde_json::Error),
 }
@@ -244,6 +265,9 @@ impl fmt::Display for LiveKitError {
             Self::CreateRoom(error) => {
                 write!(f, "LiveKit refused to create the room: {}", with_causes(error))
             }
+            Self::ListRooms(error) => {
+                write!(f, "LiveKit would not say which rooms are open: {}", with_causes(error))
+            }
             Self::MintToken(error) => write!(f, "could not sign the participant token: {error}"),
             Self::Metadata(error) => write!(f, "could not serialize the room metadata: {error}"),
         }
@@ -255,7 +279,7 @@ impl std::error::Error for LiveKitError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::XiApiKey;
+    use crate::config::{CallerAuth, XiApiKey};
     use crate::record::{AgentId, HappyUserId};
     use livekit_api::access_token::TokenVerifier;
 
@@ -267,7 +291,7 @@ mod tests {
             public_livekit_url: "https://livekit.example".to_owned(),
             livekit_api_key: "openconv".to_owned(),
             livekit_api_secret: "secret-secret-secret-secret-secret".to_owned(),
-            xi_api_key: XiApiKey::new("sk-test"),
+            caller_auth: CallerAuth::SharedSecret(XiApiKey::new("sk-test")),
             bind: "127.0.0.1:0".parse().unwrap(),
             conversation_log: "conversations.jsonl".into(),
             whisper_model: "ggml-base.en.bin".into(),

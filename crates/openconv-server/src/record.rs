@@ -87,6 +87,22 @@ pub enum ConversationEvent {
         conversation_id: ConversationId,
         ended_at_unix_secs: i64,
     },
+    /// Written when a sweep finds the room gone with no end ever reported for it.
+    ///
+    /// A distinct fact from [`Self::Finished`], and distinct in the one way that matters:
+    /// it says the call is over and does *not* say when it ended. Writing it as a
+    /// `Finished` at the moment of the sweep would put a duration in the log that nobody
+    /// measured — a number with the exact shape of an observation, standing in for the
+    /// absence of one. [LAW:no-silent-failure]
+    ///
+    /// Its existence is what makes a lost `room_finished` recoverable rather than
+    /// permanent: without it the conversation reads as in progress forever, accruing
+    /// against its caller until the cap and never past it.
+    Abandoned {
+        conversation_id: ConversationId,
+        /// When the sweep noticed. Not when the call ended, which is unknowable by then.
+        observed_at_unix_secs: i64,
+    },
 }
 
 impl ConversationEvent {
@@ -95,6 +111,7 @@ impl ConversationEvent {
         match self {
             Self::Started(record) => &record.conversation_id,
             Self::Finished { conversation_id, .. } => conversation_id,
+            Self::Abandoned { conversation_id, .. } => conversation_id,
         }
     }
 }

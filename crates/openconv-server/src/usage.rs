@@ -83,11 +83,14 @@ pub fn conversations(
     // finish" without scanning, and so an end that arrives before its start — which a
     // truncated or reordered log can produce — simply finds no start to attach to
     // rather than inventing a conversation with no user.
-    let ends: HashMap<&ConversationId, i64> = events
+    let ends: HashMap<&ConversationId, Ending> = events
         .iter()
         .filter_map(|event| match event {
             ConversationEvent::Finished { conversation_id, ended_at_unix_secs } => {
-                Some((conversation_id, *ended_at_unix_secs))
+                Some((conversation_id, Ending::Reported(*ended_at_unix_secs)))
+            }
+            ConversationEvent::Abandoned { conversation_id, observed_at_unix_secs } => {
+                Some((conversation_id, Ending::Abandoned(*observed_at_unix_secs)))
             }
             ConversationEvent::Started(_) => None,
         })
@@ -97,21 +100,21 @@ pub fn conversations(
         .iter()
         .filter_map(|event| match event {
             ConversationEvent::Started(record) => Some(record),
-            ConversationEvent::Finished { .. } => None,
+            ConversationEvent::Finished { .. } | ConversationEvent::Abandoned { .. } => None,
         })
         .filter(|record| query.matches(record.happy_user.as_ref(), record.started_at_unix_secs))
         .map(|record| {
-            let (ended_at, status) = ends.get(&record.conversation_id).map_or(
-                (now_unix_secs, ConversationStatus::InProgress),
-                |ended| (*ended, ConversationStatus::Done),
-            );
+            let ending = ends
+                .get(&record.conversation_id)
+                .copied()
+                .unwrap_or(Ending::StillOpen(now_unix_secs));
 
             Conversation {
                 conversation_id: record.conversation_id.clone(),
                 agent_id: record.agent_id.clone(),
                 start_time_unix_secs: record.started_at_unix_secs,
-                call_duration_secs: duration_secs(record.started_at_unix_secs, ended_at, status),
-                status,
+                call_duration_secs: duration_secs(record.started_at_unix_secs, ending),
+                status: ending.status(),
             }
         })
         .collect();
@@ -127,17 +130,53 @@ pub fn conversations(
     ConversationPage { conversations: matched, has_more }
 }
 
+/// How a conversation stopped, as the log knows it.
+///
+/// Three states inside, two on the wire: whether an end was reported or inferred changes
+/// what this crate may credit, and does not change what a caller is told — the call is
+/// over either way, and [`ConversationStatus`] keeps the shape ElevenLabs' own list has.
+/// [LAW:types-are-the-program]
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    /// The SFU reported the room closed at this time. The only exact answer there is.
+    Reported(i64),
+    /// A sweep found the room gone at this time, having never been told when it went.
+    Abandoned(i64),
+    /// No end of any kind yet, measured against this "now".
+    StillOpen(i64),
+}
+
+impl Ending {
+    fn status(self) -> ConversationStatus {
+        match self {
+            // An abandoned call is over, and a caller asking what happened to it is owed
+            // that rather than the reason this crate had to work it out.
+            Self::Reported(_) | Self::Abandoned(_) => ConversationStatus::Done,
+            Self::StillOpen(_) => ConversationStatus::InProgress,
+        }
+    }
+}
+
 /// How long a call is credited with.
 ///
 /// Clamped at both ends. Clocks moving backwards would otherwise produce a negative
-/// duration that *subtracts* from a user's usage, and an unfinished conversation is
-/// capped so a lost webhook cannot accrue against a user forever.
-fn duration_secs(started_at: i64, ended_at: i64, status: ConversationStatus) -> i64 {
+/// duration that *subtracts* from a user's usage, and any call whose end was not reported
+/// is capped so a lost webhook cannot accrue against a user forever.
+///
+/// The cap applies to an abandoned call as much as to an open one, and for the reason it
+/// always did: between its start and the moment somebody noticed, this crate knows only
+/// that the call was somewhere inside. Crediting the whole span would let a webhook lost
+/// two weeks ago bill a fortnight; crediting nothing would make losing one the cheap way
+/// to talk for free. The cap is the same conservative answer to both, now frozen at the
+/// observation instead of growing with every query.
+fn duration_secs(started_at: i64, ending: Ending) -> i64 {
+    let (ended_at, exact) = match ending {
+        Ending::Reported(at) => (at, true),
+        Ending::Abandoned(at) | Ending::StillOpen(at) => (at, false),
+    };
+
     let elapsed = (ended_at - started_at).max(0);
-    match status {
-        ConversationStatus::Done => elapsed,
-        ConversationStatus::InProgress => elapsed.min(MAX_UNREPORTED_DURATION_SECS),
-    }
+    if exact { elapsed } else { elapsed.min(MAX_UNREPORTED_DURATION_SECS) }
 }
 
 impl UsageQuery {
