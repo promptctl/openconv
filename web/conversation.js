@@ -175,12 +175,12 @@ export const conversationOf = (token) => claims(token).video.room;
  * receives an empty token and has to work out for itself whether the mint happened.
  * [LAW:parse-dont-validate]
  */
-export async function mintConversation({ openconv, apiKey, agentId, participantName }) {
+export async function mintConversation({ openconv, agentId, participantName }) {
   const url = new URL(`${openconv.replace(/\/$/, "")}/v1/convai/conversation/token`);
   url.searchParams.set("agent_id", agentId);
   url.searchParams.set("participant_name", participantName);
 
-  const response = await fetch(url, { headers: { "xi-api-key": apiKey } });
+  const response = await fetch(url);
   const body = await response.text();
   if (!response.ok) {
     throw new Error(`mint failed: HTTP ${response.status} ${body}`);
@@ -293,8 +293,8 @@ export function conversationWith(transport, readSettings) {
      * takes another second are each found exactly once and neither depends on which order
      * they happened in. [LAW:no-ambient-temporal-coupling]
      */
-    async open(credentials) {
-      const { token, conversationId } = await mintConversation(credentials);
+    async open(request) {
+      const { token, conversationId } = await mintConversation(request);
       await transport.connect(token);
       await this.arrived().catch((failure) => {
         throw new NotTold(conversationId, failure);

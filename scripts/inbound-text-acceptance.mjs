@@ -1,6 +1,6 @@
 // Verifies that the agent tells background context from a typed turn.
 //
-//   OPENCONV_API_KEY=... node scripts/inbound-text-acceptance.mjs [openconv-url] [livekit-ws-url]
+//   node scripts/inbound-text-acceptance.mjs [openconv-url] [livekit-ws-url]
 //
 // Needs @livekit/rtc-node:
 //
@@ -67,7 +67,7 @@ const ANSWER_WITHIN_MS = 45_000;
 /// How long to keep listening for the answer to arrive as sound after it arrives as text.
 const AUDIO_WITHIN_MS = 20_000;
 
-const { xiApiKey, openconv, livekitUrl } = readEnvironment(process.env, process.argv);
+const { openconv, livekitUrl } = readEnvironment(process.env, process.argv);
 const checks = new Checks();
 
 /** Everything the agent has said, in arrival order. */
@@ -87,7 +87,6 @@ const transcripts = (caller) =>
 const caller = await Caller.join({
   openconv,
   livekitUrl,
-  xiApiKey,
   settings: { prompt: PROMPT },
 });
 

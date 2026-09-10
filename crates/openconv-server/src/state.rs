@@ -4,7 +4,7 @@
 //! mint and meter, [`crate::web`] to tell the browser client which SFU to dial — and a
 //! state type living inside either one would make the other depend upwards on it.
 
-use crate::config::{CallerAuth, Config};
+use crate::config::Config;
 use crate::livekit::LiveKit;
 use crate::store::ConversationLog;
 use crate::webhook::Webhooks;
@@ -31,7 +31,6 @@ pub struct AppState {
     ///
     /// [`Synthesizer`]: openconv_agent::speak::Synthesizer
     pub tts: Arc<Tts>,
-    pub caller_auth: CallerAuth,
 }
 
 impl AppState {
@@ -51,7 +50,6 @@ impl AppState {
                 &config.livekit_api_key,
                 &config.livekit_api_secret,
             )),
-            caller_auth: config.caller_auth.clone(),
         }
     }
 }

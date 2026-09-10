@@ -1,6 +1,6 @@
 // Verifies one whole conversational turn, by being the human on the other end.
 //
-//   OPENCONV_API_KEY=... node scripts/live-call-acceptance.mjs [openconv-url] [livekit-ws-url]
+//   node scripts/live-call-acceptance.mjs [openconv-url] [livekit-ws-url]
 //
 // Needs @livekit/rtc-node and macOS `say`:
 //
@@ -28,7 +28,7 @@ const PROMPT =
   "You are a voice assistant under test. Do exactly what the caller asks, and reply " +
   "with nothing else. No greeting, no explanation, no markdown.";
 
-const { xiApiKey, openconv, livekitUrl } = readEnvironment(process.env, process.argv);
+const { openconv, livekitUrl } = readEnvironment(process.env, process.argv);
 const checks = new Checks();
 
 const { line, said } = asksFor();
@@ -42,7 +42,6 @@ console.log(`the caller will say: "${line}"`);
 const caller = await Caller.join({
   openconv,
   livekitUrl,
-  xiApiKey,
   participantName: "u_livecall",
   settings: { prompt: PROMPT },
 });

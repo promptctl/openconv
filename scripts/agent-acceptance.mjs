@@ -1,7 +1,7 @@
 // Verifies the agent by being the client: joins a real conversation room and asserts
 // what the ElevenLabs SDK would need in order to work.
 //
-//   OPENCONV_API_KEY=... node scripts/agent-acceptance.mjs [openconv-url] [livekit-ws-url]
+//   node scripts/agent-acceptance.mjs [openconv-url] [livekit-ws-url]
 //
 // Needs @livekit/rtc-node, which is not a dependency of anything else here:
 //
@@ -18,10 +18,10 @@
 
 import { Caller, Checks, readEnvironment } from "./lib/caller.mjs";
 
-const { xiApiKey, openconv, livekitUrl } = readEnvironment(process.env, process.argv);
+const { openconv, livekitUrl } = readEnvironment(process.env, process.argv);
 const checks = new Checks();
 
-const caller = await Caller.join({ openconv, livekitUrl, xiApiKey, participantName: "u_agentcheck" });
+const caller = await Caller.join({ openconv, livekitUrl, participantName: "u_agentcheck" });
 console.log(`joined ${caller.conversationId} at ${livekitUrl}\n`);
 
 checks.record("the client joined the conversation room", true, caller.conversationId);

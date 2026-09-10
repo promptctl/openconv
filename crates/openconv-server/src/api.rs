@@ -2,7 +2,6 @@
 //! closely enough that pointing Happy at this host is a base-URL change and nothing
 //! else.
 
-use crate::config::{CallerAuth, XiApiKey};
 use crate::conversation::ConversationId;
 use crate::livekit::{ConversationToken, LiveKitError};
 use crate::record::{now_unix_secs, AgentId, ConversationEvent, ConversationRecord, HappyUserId};
@@ -10,64 +9,27 @@ use crate::state::AppState;
 use crate::store::LogError;
 use crate::usage::{self, ConversationPage, UsageQuery};
 use crate::webhook::WebhookRejected;
-use axum::extract::{FromRequestParts, Query, State};
-use axum::http::{request::Parts, HeaderMap, StatusCode};
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-/// The header ElevenLabs authenticates with, and therefore the one Happy sends.
-const API_KEY_HEADER: &str = "xi-api-key";
-
 /// Everything Happy's server and the SFU call. Joined with the browser client's routes
 /// by [`crate::app::router`], which is the only place that knows both exist.
+///
+/// [LAW:single-enforcer] No route here asks who is calling. The deployment is reachable
+/// only over the tailnet, and that network is the one boundary a caller crosses; Happy
+/// still sends the `xi-api-key` it holds, and nothing reads it.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/convai/conversation/token", get(conversation_token))
         .route("/v1/convai/conversations", get(conversations))
-        // Authenticated by LiveKit's own signature over the body rather than by
-        // `xi-api-key`, because LiveKit is the caller here and knows nothing about ours.
+        // Checked against LiveKit's signature over the body: what ends a conversation has
+        // to be LiveKit, not merely something on the network.
         .route("/livekit/webhook", post(livekit_webhook))
-        // Unauthenticated on purpose: a liveness probe that needs a credential tells
-        // you the credential is good, not that the service is up.
         .route("/health", get(|| async { "ok" }))
-}
-
-/// Proof that the request carried the right `xi-api-key`.
-///
-/// The value cannot be constructed except by presenting the key, so a handler that
-/// takes one has already been authenticated and no handler can forget to check. That
-/// makes this extractor the single place the credential is verified.
-pub struct Authenticated;
-
-impl FromRequestParts<AppState> for Authenticated {
-    type Rejection = ApiError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        // The one remaining branch is the domain's own enum, handled exhaustively: a
-        // deployment either holds a shared secret or has stated it wants none. Nothing
-        // downstream of here can tell the two apart, which is the point — the proof this
-        // extractor hands out means the same thing either way.
-        // [LAW:dataflow-not-control-flow]
-        let expected = match &state.caller_auth {
-            CallerAuth::Open => return Ok(Self),
-            CallerAuth::SharedSecret(expected) => expected,
-        };
-
-        let presented = parts
-            .headers
-            .get(API_KEY_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .ok_or(ApiError::Unauthenticated)?;
-
-        (&XiApiKey::new(presented) == expected)
-            .then_some(Self)
-            .ok_or(ApiError::Unauthenticated)
-    }
 }
 
 /// `GET /v1/convai/conversation/token?agent_id=...&participant_name=...`
@@ -99,7 +61,6 @@ pub struct TokenResponse {
 /// the process. Any other order can hand out a token for a room that does not exist or
 /// for a call that will never be billed.
 async fn conversation_token(
-    _: Authenticated,
     State(state): State<AppState>,
     Query(request): Query<TokenRequest>,
 ) -> Result<Json<TokenResponse>, ApiError> {
@@ -170,7 +131,6 @@ fn parse_created_after(raw: &str) -> Result<i64, ApiError> {
 
 /// Serves the usage history Happy sums to decide whether a user may start a call.
 async fn conversations(
-    _: Authenticated,
     State(state): State<AppState>,
     Query(request): Query<ConversationsRequest>,
 ) -> Result<Json<ConversationPage>, ApiError> {
@@ -220,7 +180,6 @@ async fn livekit_webhook(
 
 #[derive(Debug)]
 pub enum ApiError {
-    Unauthenticated,
     BadCreatedAfter(String),
     UnsignedWebhook,
     Webhook(WebhookRejected),
@@ -262,11 +221,6 @@ struct ErrorDetail {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (code, status, message) = match self {
-            Self::Unauthenticated => (
-                StatusCode::UNAUTHORIZED,
-                "invalid_api_key",
-                format!("missing or incorrect {API_KEY_HEADER} header"),
-            ),
             Self::BadCreatedAfter(value) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "invalid_created_after",

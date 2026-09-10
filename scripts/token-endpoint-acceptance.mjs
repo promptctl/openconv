@@ -1,6 +1,6 @@
 // Checks a running openconv against the contract Happy's server actually depends on.
 //
-//   OPENCONV_API_KEY=... LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
+//   LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
 //     node scripts/token-endpoint-acceptance.mjs [openconv-url] [livekit-url]
 //
 // This exercises the endpoint end to end against a real LiveKit deployment, which is
@@ -12,20 +12,12 @@
 // from the endpoint's own documentation, so this fails when openconv stops satisfying
 // its caller — not when it stops matching what we believed its caller wanted.
 
-import { Rooms } from "./lib/livekit.mjs";
+import { Rooms, livekitCredentials } from "./lib/livekit.mjs";
 
 // The one boundary: everything below runs on values known to exist.
 function readConfig(env, argv) {
-  const missing = ["OPENCONV_API_KEY", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"].filter(
-    (name) => !env[name],
-  );
-  if (missing.length > 0) {
-    throw new Error(`missing ${missing.join(", ")} — the LiveKit pair lives in Vault at secret/livekit`);
-  }
   return {
-    xiApiKey: env.OPENCONV_API_KEY,
-    apiKey: env.LIVEKIT_API_KEY,
-    apiSecret: env.LIVEKIT_API_SECRET,
+    ...livekitCredentials(env),
     openconv: (argv[2] ?? "http://127.0.0.1:8080").replace(/\/$/, ""),
     livekit: (argv[3] ?? "https://livekit.sanctuary.gdn").replace(/\/$/, ""),
   };
@@ -39,10 +31,8 @@ const check = (name, ok, detail = "") => {
   console.log(`${ok ? "  ok  " : " FAIL "} ${name}${detail ? ` — ${detail}` : ""}`);
 };
 
-async function mint(query, apiKey = config.xiApiKey) {
-  const response = await fetch(`${config.openconv}/v1/convai/conversation/token?${query}`, {
-    headers: { "xi-api-key": apiKey },
-  });
+async function mint(query, headers = {}) {
+  const response = await fetch(`${config.openconv}/v1/convai/conversation/token?${query}`, { headers });
   return { status: response.status, body: await response.text() };
 }
 
@@ -116,12 +106,11 @@ if (byo.status === 200) {
   check("BYO conversation is distinct from the metered one", byoId !== conversationId);
 }
 
-// ---- the credential is actually enforced ----
-const wrongKey = await mint("agent_id=agent_happy", "sk-not-the-key");
-check("a wrong xi-api-key is refused", wrongKey.status === 401, `HTTP ${wrongKey.status}`);
-
-const noKey = await fetch(`${config.openconv}/v1/convai/conversation/token?agent_id=agent_happy`);
-check("a missing xi-api-key is refused", noKey.status === 401, `HTTP ${noKey.status}`);
+// ---- no caller is asked for a credential ----
+// Every mint above sends none. Happy still sends the `xi-api-key` it holds, so a request
+// carrying one has to be served too, rather than read as a credential that failed.
+const happysKey = await mint("agent_id=agent_happy", { "xi-api-key": "sk-held-by-happy" });
+check("a request carrying an xi-api-key is served", happysKey.status === 200, `HTTP ${happysKey.status}`);
 
 const noAgent = await mint("");
 check("a request with no agent_id is rejected", noAgent.status >= 400, `HTTP ${noAgent.status}`);

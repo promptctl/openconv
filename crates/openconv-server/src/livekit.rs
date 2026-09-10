@@ -279,7 +279,6 @@ impl std::error::Error for LiveKitError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CallerAuth, XiApiKey};
     use crate::record::{AgentId, HappyUserId};
     use livekit_api::access_token::TokenVerifier;
 
@@ -291,7 +290,6 @@ mod tests {
             public_livekit_url: "https://livekit.example".to_owned(),
             livekit_api_key: "openconv".to_owned(),
             livekit_api_secret: "secret-secret-secret-secret-secret".to_owned(),
-            caller_auth: CallerAuth::SharedSecret(XiApiKey::new("sk-test")),
             bind: "127.0.0.1:0".parse().unwrap(),
             conversation_log: "conversations.jsonl".into(),
             whisper_model: "ggml-base.en.bin".into(),

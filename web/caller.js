@@ -109,7 +109,6 @@ export class Call {
    */
   static async join({
     livekitUrl,
-    apiKey,
     agentId,
     participantName,
     settings,
@@ -182,7 +181,6 @@ export class Call {
       const conversationId = await conversation
         .open({
           openconv: location.origin,
-          apiKey,
           agentId,
           participantName,
         })
@@ -213,7 +211,7 @@ export class Call {
       microphone.stop();
 
       // A disconnect that fails while cleaning up must not become the story — "mint
-      // failed: HTTP 401" is the useful sentence, not something about a socket, and a
+      // failed: HTTP 502" is the useful sentence, not something about a socket, and a
       // room that never connected rejects here rather than being inert. So its outcome
       // is a value, empty when it worked, appended to the cause that actually brought
       // us here. Neither failure is dropped and neither hides the other.

@@ -9,12 +9,12 @@
 // `live-call-acceptance.mjs` mints against openconv directly, so it proves openconv and
 // nothing about who is allowed to reach it. This mints through the *deployed happy-server*
 // with a real Happy account token, so the legs it adds are the ones that only exist once
-// happy is pointed here: happy's `VOICE_CONVAI_ORIGIN`, its usage gate, the shared secret
-// it presents as `xi-api-key`, and the `conv_` id it recovers from the JWT rather than
-// being handed in a field. Only the browser SDK itself is left uncovered.
+// happy is pointed here: happy's `VOICE_CONVAI_ORIGIN`, its usage gate, and the `conv_` id
+// it recovers from the JWT rather than being handed in a field. Only the browser SDK itself
+// is left uncovered.
 //
-// It takes no API key. That is the point of the run: the credential under test is the one
-// happy-server holds, and a key supplied here would prove only that openconv still mints.
+// It takes no API key, because it mints the way Happy's own clients do: with a Happy
+// account's bearer token, through happy-server.
 //
 // The three spellings of "which provider" — happy-server's origin, the native bundle's
 // SFU, and the SFU baked into the webapp image — are checked nowhere by construction

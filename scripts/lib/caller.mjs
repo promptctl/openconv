@@ -409,13 +409,12 @@ export class Caller {
   static async join({
     openconv,
     livekitUrl,
-    xiApiKey,
     participantName = "u_acceptance",
     agentId = "agent_happy",
     settings = {},
   }) {
     const caller = new Caller(null, livekitUrl, settings);
-    await caller.open({ openconv, apiKey: xiApiKey, agentId, participantName });
+    await caller.open({ openconv, agentId, participantName });
     return caller;
   }
 
@@ -430,8 +429,8 @@ export class Caller {
    * deliberately, and a policy stated only by the absence of a `catch` is one a later
    * refactor can copy away without anything noticing. [LAW:verifiable-goals]
    */
-  async open(credentials) {
-    this.conversationId = await this.conversation.open(credentials);
+  async open(request) {
+    this.conversationId = await this.conversation.open(request);
   }
 
   /**
@@ -906,10 +905,7 @@ export class Checks {
 
 /** The one boundary: everything downstream runs on values known to exist. */
 export function readEnvironment(env, argv) {
-  const xiApiKey = env.OPENCONV_API_KEY;
-  if (!xiApiKey) throw new Error("missing OPENCONV_API_KEY");
   return {
-    xiApiKey,
     openconv: (argv[2] ?? "http://127.0.0.1:8080").replace(/\/$/, ""),
     livekitUrl: argv[3] ?? "wss://livekit.sanctuary.gdn",
   };
