@@ -1,6 +1,6 @@
 // Speaks a sentence into a live conversation and checks the agent heard it.
 //
-//   node scripts/stt-acceptance.mjs [openconv-url] [livekit-ws-url]
+//   [OPENCONV_API_KEY=...] node scripts/stt-acceptance.mjs [openconv-url] [livekit-ws-url]
 //
 // Needs @livekit/rtc-node and macOS `say`, which supplies the voice:
 //
@@ -33,12 +33,12 @@ const words = (text) =>
       .filter(Boolean),
   );
 
-const { openconv, livekitUrl } = readEnvironment(process.env, process.argv);
+const { xiApiKey, openconv, livekitUrl } = readEnvironment(process.env, process.argv);
 const checks = new Checks();
 
 const recording = recordSpeech(SPOKEN, join(mkdtempSync(join(tmpdir(), "openconv-stt-")), "speech.wav"));
 
-const caller = await Caller.join({ openconv, livekitUrl, participantName: "u_stt" });
+const caller = await Caller.join({ openconv, livekitUrl, xiApiKey, participantName: "u_stt" });
 console.log(`speaking into ${caller.conversationId}\n`);
 
 checks.record("joined the conversation", true, caller.conversationId);

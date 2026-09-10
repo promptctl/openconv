@@ -409,12 +409,13 @@ export class Caller {
   static async join({
     openconv,
     livekitUrl,
+    xiApiKey,
     participantName = "u_acceptance",
     agentId = "agent_happy",
     settings = {},
   }) {
     const caller = new Caller(null, livekitUrl, settings);
-    await caller.open({ openconv, agentId, participantName });
+    await caller.open({ openconv, apiKey: xiApiKey, agentId, participantName });
     return caller;
   }
 
@@ -429,8 +430,8 @@ export class Caller {
    * deliberately, and a policy stated only by the absence of a `catch` is one a later
    * refactor can copy away without anything noticing. [LAW:verifiable-goals]
    */
-  async open(request) {
-    this.conversationId = await this.conversation.open(request);
+  async open(credentials) {
+    this.conversationId = await this.conversation.open(credentials);
   }
 
   /**
@@ -903,9 +904,14 @@ export class Checks {
   }
 }
 
-/** The one boundary: everything downstream runs on values known to exist. */
+/** The one boundary: everything downstream runs on values this run is going to use. */
 export function readEnvironment(env, argv) {
   return {
+    // Absent unless the deployment under test asks for a credential, which by default it
+    // does not. Not refused when missing, because "no key" is how most runs are correct;
+    // a run against a deployment that does hold one is refused by that deployment, in a
+    // 401 that names the header.
+    xiApiKey: env.OPENCONV_API_KEY ?? null,
     openconv: (argv[2] ?? "http://127.0.0.1:8080").replace(/\/$/, ""),
     livekitUrl: argv[3] ?? "wss://livekit.sanctuary.gdn",
   };

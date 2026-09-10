@@ -371,6 +371,7 @@ test("opening connects before it configures, and configures before it returns", 
     const conversation = conversationWith(transport, () => voiced("bm_george"));
     const conversationId = await conversation.open({
       openconv: "http://127.0.0.1:8080",
+      apiKey: "secret",
       agentId: "agent_happy",
       participantName: "u_test",
     });
@@ -404,6 +405,7 @@ test("a conversation that opened but could not be told says so, and says which o
     await assert.rejects(
       conversation.open({
         openconv: "http://127.0.0.1:8080",
+        apiKey: "secret",
         agentId: "agent_happy",
         participantName: "u_test",
       }),
@@ -422,16 +424,17 @@ test("a conversation that opened but could not be told says so, and says which o
 
 test("a mint that is refused throws carrying what the server said", async () => {
   const realFetch = globalThis.fetch;
-  globalThis.fetch = async () => ({ ok: false, status: 502, text: async () => "livekit_unavailable" });
+  globalThis.fetch = async () => ({ ok: false, status: 401, text: async () => "bad api key" });
 
   try {
     await assert.rejects(
       conversationWith(transportOf([]), () => ({})).open({
         openconv: "http://127.0.0.1:8080",
+        apiKey: "wrong",
         agentId: "agent_happy",
         participantName: "u_test",
       }),
-      /mint failed: HTTP 502 livekit_unavailable/,
+      /mint failed: HTTP 401 bad api key/,
     );
   } finally {
     globalThis.fetch = realFetch;

@@ -53,12 +53,19 @@ const REQUEST_TIMEOUT_MS = 30_000;
  * The LiveKit credentials, or a refusal naming what is missing and where to get it.
  *
  * One fact — these two variables must exist, and they live in Vault at secret/livekit —
- * held once. Every script that reads the pair reads it here: `livekit-smoke`,
- * `loopback-acceptance`, `token-endpoint-acceptance`, `conversations-acceptance` and
- * `webhook-delivery-acceptance`.
+ * held once. Every script that needs the pair reads it here: `livekit-smoke`,
+ * `loopback-acceptance`, `webhook-delivery-acceptance`, `token-endpoint-acceptance` and
+ * `conversations-acceptance`.
+ *
+ * The last two abstained until the caller credential became optional, and the reason they
+ * did is worth keeping in view: they checked `OPENCONV_API_KEY` alongside the pair so that
+ * an operator missing both was told about both in one message, which routing through here
+ * would have split into two throws. That reason expired rather than being overruled — a
+ * key that a run does not need cannot be missing from it. Any future variable that a run
+ * genuinely requires alongside the pair brings the same argument back.
  *
  * That is the whole census: five callers, no abstainers, no other copy. It is written out
- * because earlier versions of this docblock miscounted twice, which is the same miscount
+ * because two earlier versions of this docblock miscounted, which is the same miscount
  * this module's own header was corrected for.
  */
 export function livekitCredentials(env) {

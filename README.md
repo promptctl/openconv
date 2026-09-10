@@ -128,9 +128,26 @@ LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... ANTHROPIC_API_KEY=... \
 and `OPENCONV_LLM_MODEL` have defaults; the ones above do not, and the process refuses
 to start without them — with every missing name listed at once.
 
-**No caller is asked for a credential.** openconv is reachable only over the tailnet, and
-that network is its boundary. Happy still sends the `xi-api-key` it holds, and nothing
-reads it — so `OPENCONV_API_KEY` can stay in Vault and rendered into the job, unread.
+**No caller is asked for a credential unless you set `OPENCONV_API_KEY`.** Unset, which is
+the default, every route serves whatever can reach it: a deployment that is its own only
+caller — Happy and openconv on the same private network — gains nothing from a shared
+secret it must provision, sync and rotate on both sides, because the network is already
+the boundary. Set it, and every route asks for that value in `xi-api-key`. One variable,
+and turning the check on or off is the presence of a value rather than a second flag to
+keep consistent with the first.
+
+Setting it to *nothing* is the one reading refused, at startup, by name. An empty
+`OPENCONV_API_KEY` is what a Nomad template renders when its Vault lookup found nothing,
+and it is not a deployment asking for no credential — it is one that meant to ask and was
+handed none. Coming up open on it is how a service ends up minting LiveKit tokens and
+spending an Anthropic budget for anyone who can reach it, with nothing anywhere reporting
+a problem.
+
+Happy's side needs no coordination either way: with `VOICE_CONVAI_ORIGIN` pointed here, its
+`ELEVENLABS_API_KEY` is optional, and it sends whatever it holds — a key an open deployment
+ignores, and the key an authenticated one expects. The `/call` page asks `GET /call/config`
+whether this deployment wants one and shows its api key field accordingly, so what it shows
+and what it insists on cannot disagree.
 
 It also serves `POST /livekit/webhook`, which is how conversations get their durations.
 The end of a call is observed rather than reported — the SFU sees the room close even
@@ -252,12 +269,14 @@ through `transcribe_wav` before they go in.
 node scripts/happy-metered-path-acceptance.mjs https://happy-server.sanctuary.gdn wss://livekit.sanctuary.gdn
 ```
 
-That one takes no API key: it mints through the deployed happy-server with a real Happy
-account's bearer token out of `~/.happy/access.key`, the way Happy's own clients do.
-`live-call-acceptance` proves openconv works; this covers the legs that exist only once
-Happy is pointed here — happy's `VOICE_CONVAI_ORIGIN`, its usage gate, and the `conv_` id
-happy recovers out of the JWT rather than being handed in a field. Only the browser SDK
-itself is left uncovered.
+That one takes no API key, and the absence is the point: it mints through the deployed
+happy-server with a real Happy account's bearer token out of `~/.happy/access.key`, so
+the credential under test is the shared secret happy-server itself holds and presents as
+`xi-api-key`. `live-call-acceptance` proves openconv works and proves nothing about who
+is allowed to reach it; this covers the legs that exist only once Happy is pointed
+here — happy's `VOICE_CONVAI_ORIGIN`, its usage gate, that secret, and the `conv_` id
+happy recovers out of the JWT rather than being handed in a field. Only the browser
+SDK itself is left uncovered.
 
 It then asserts the token happy handed back was signed by openconv for the room happy
 named, joins that room, and asserts openconv's agent is actually in it. That last one

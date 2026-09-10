@@ -15,6 +15,7 @@ const els = {
  * the URL that can seed it, and into what the next visit remembers.
  */
 const CONTROLS = {
+  apiKey: document.getElementById("api-key"),
   agentId: document.getElementById("agent-id"),
   participantName: document.getElementById("participant-name"),
   voiceId: els.voice,
@@ -26,9 +27,10 @@ const CONTROLS = {
 /**
  * The controls that say what the *conversation* is, as opposed to who is joining it.
  *
- * Named one by one rather than taken as "everything on the form": these values are
- * JSON-encoded onto the room's data channel, where every participant reads them, and who
- * is joining is the mint's business rather than the room's. [LAW:decomposition]
+ * Named one by one rather than taken as "everything on the form", and that is a security
+ * boundary rather than tidiness: these values are JSON-encoded onto the room's data
+ * channel, and `CONTROLS` also holds the api key. A spread here would publish it to every
+ * participant. [LAW:decomposition]
  */
 const OVERRIDES = ["voiceId", "language", "firstMessage", "prompt"];
 
@@ -54,15 +56,28 @@ const chosenSettings = () => {
  * What the mint refuses to be without, and what to call each one when it is empty.
  *
  * A second table rather than a flag on the first, because being required is not a
- * property every control has and never was — it is a property of the two values that
+ * property every control has and never was — it is a property of the three values that
  * get minted with. The voice's empty value is a real answer, "no particular voice, let
  * the deployment choose", and refusing it would take away the only state available
  * before the roster has loaded or when it cannot.
  */
-const REQUIRED = {
+const ALWAYS_REQUIRED = {
   agentId: "an agent",
   participantName: "a participant",
 };
+
+/**
+ * The same table for the deployment this page is served by.
+ *
+ * Whether a key is required is a fact about the deployment and not about the form, so it
+ * is asked for rather than assumed. Assuming it either way costs something: a page that
+ * always demands one asks for a secret an open deployment does not have, and a page that
+ * never does sends a request that comes back 401 with no field to fix it in.
+ * [LAW:one-source-of-truth]
+ */
+function requiredFields({ requires_api_key }) {
+  return requires_api_key ? { apiKey: "the api key", ...ALWAYS_REQUIRED } : ALWAYS_REQUIRED;
+}
 
 /**
  * Reads the form, refusing a blank where blank is not an answer.
@@ -155,7 +170,7 @@ function remembered() {
 /**
  * Fills the form from the URL or from the last visit, so that joining costs one click.
  *
- * These values change rarely, so retyping them every visit
+ * These values change rarely and the shared secret never, so retyping them every visit
  * is friction carrying no information. The voice is seeded the same way as the rest,
  * which is what makes `?voiceId=af_heart` a bookmark and a chosen voice something that
  * survives a reload — there is no separate notion of a default voice for this page
@@ -163,7 +178,7 @@ function remembered() {
  *
  * Seeds are written *into the controls* rather than read at mint time, which keeps the
  * form the only thing deciding what the call is made with — a page whose box shows one
- * value while the request sends another is a bad hour. It also means `readForm` stays the
+ * key while the request sends another is a bad hour. It also means `readForm` stays the
  * single boundary: nothing routes around the parser.
  *
  * Precedence is URL, then remembered, then whatever the markup shipped, so a link can
@@ -189,8 +204,8 @@ function seedFields() {
     control.value = seeded[name];
   }
 
-  // The seeds do not stay in the address bar once they are in the boxes: a reload would
-  // otherwise apply the link again over whatever was chosen since.
+  // The key does not stay in the address bar once it is in the box. A URL is the one
+  // place a secret gets bookmarked, screenshotted and pasted into chat.
   history.replaceState(null, "", location.pathname);
 
   return seeded;
@@ -288,14 +303,13 @@ async function offerLanguages(wanted) {
  * Keeps the current settings for next time.
  *
  * Called only after a join that worked, so what is remembered is a set of values known
- * to mint. Written over what was already stored rather than in place of it, so a value
- * this page no longer has a control for — the api key an earlier version saved — is kept
- * rather than erased by the next join.
+ * to mint. Note this does put the shared secret in `localStorage`: acceptable for a
+ * client whose whole purpose is a fast development loop, and worth knowing before
+ * pointing this page at anything you would not paste into a browser console.
  */
 function remember(fields) {
   try {
-    const previous = JSON.parse(localStorage.getItem(REMEMBERED) ?? "{}");
-    localStorage.setItem(REMEMBERED, JSON.stringify({ ...previous, ...fields }));
+    localStorage.setItem(REMEMBERED, JSON.stringify(fields));
   } catch (error) {
     render(log("error", `could not remember these settings: ${error.message}`));
   }
@@ -363,15 +377,18 @@ async function sendChosenSettings() {
 }
 
 async function join() {
-  // Only the two the mint needs. The overrides on the form reach the call through
+  // Only the three the mint needs. The overrides on the form reach the call through
   // `settings` below and by no other route — spreading the whole form here would hand
-  // `Call.join` the conversation's settings as a stale snapshot, which is what would end
-  // up on the data channel.
-  const { agentId, participantName } = readForm(REQUIRED);
+  // `Call.join` the api key twice and the conversation's settings as a stale snapshot,
+  // and one of those two mistakes ends up on the data channel.
+  // Both answers off one read. Asked before the form is parsed because one of them
+  // decides what the form is allowed to be missing.
   const deployed = await deployment();
+  const { apiKey, agentId, participantName } = readForm(requiredFields(deployed));
   showButton("joining…", false);
 
   call = await Call.join({
+    apiKey,
     agentId,
     participantName,
     livekitUrl: deployed.livekit_url,
@@ -441,6 +458,28 @@ for (const name of OVERRIDES) {
   CONTROLS[name].addEventListener("change", sendChosenSettings);
 }
 
+/**
+ * Takes the api key field away on a deployment that asks for no key.
+ *
+ * Shown by default and hidden on the answer, rather than hidden and revealed: the page
+ * is served before the answer arrives, and of the two ways to be wrong for those few
+ * milliseconds, showing a field that turns out to be unnecessary is the one that loses
+ * nothing. A failure leaves it showing and says so — an unexplained missing field is how
+ * someone concludes the page is broken.
+ *
+ * The refusal to join without one is decided from the same fetch at the same moment
+ * (`requiredFields`), so the field the page shows and the field it insists on cannot
+ * disagree. [LAW:one-source-of-truth]
+ */
+async function offerAuth() {
+  try {
+    els.apiKey.closest("label").hidden = !(await deployment()).requires_api_key;
+  } catch (error) {
+    render(log("error", `could not read whether this deployment wants an api key: ${error.message}`));
+  }
+}
+
 const seeded = seedFields();
+offerAuth();
 offerVoices(seeded.voiceId);
 offerLanguages(seeded.language);

@@ -1,6 +1,6 @@
 // Verifies that the agent can drive the app, by being the app on the other end.
 //
-//   node scripts/tools-acceptance.mjs [openconv-url] [livekit-ws-url]
+//   [OPENCONV_API_KEY=...] node scripts/tools-acceptance.mjs [openconv-url] [livekit-ws-url]
 //
 // Needs @livekit/rtc-node and macOS `say`:
 //
@@ -73,7 +73,7 @@ const ACKNOWLEDGE_WITHIN_MS = 45_000;
 /// the check passed.
 const SILENCE_WINDOW_MS = 25_000;
 
-const { openconv, livekitUrl } = readEnvironment(process.env, process.argv);
+const { xiApiKey, openconv, livekitUrl } = readEnvironment(process.env, process.argv);
 const checks = new Checks();
 
 const scratch = mkdtempSync(join(tmpdir(), "openconv-tools-"));
@@ -94,7 +94,7 @@ const responses = (caller) =>
 
 /** Opens a conversation configured with one prompt, and waits for the announcement. */
 async function converse(prompt, name) {
-  const caller = await Caller.join({ openconv, livekitUrl, settings: { prompt } });
+  const caller = await Caller.join({ openconv, livekitUrl, xiApiKey, settings: { prompt } });
 
   // Before the microphone, and waited for. This used to publish the configuration after
   // opening one, and reached the agent only because opening one waits for a subscriber —

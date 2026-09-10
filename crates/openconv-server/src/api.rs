@@ -2,6 +2,7 @@
 //! closely enough that pointing Happy at this host is a base-URL change and nothing
 //! else.
 
+use crate::config::XiApiKey;
 use crate::conversation::ConversationId;
 use crate::livekit::{ConversationToken, LiveKitError};
 use crate::record::{now_unix_secs, AgentId, ConversationEvent, ConversationRecord, HappyUserId};
@@ -9,27 +10,72 @@ use crate::state::AppState;
 use crate::store::LogError;
 use crate::usage::{self, ConversationPage, UsageQuery};
 use crate::webhook::WebhookRejected;
-use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{FromRequestParts, Query, State};
+use axum::http::{request::Parts, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+/// The header ElevenLabs authenticates with, and therefore the one Happy sends.
+const API_KEY_HEADER: &str = "xi-api-key";
+
 /// Everything Happy's server and the SFU call. Joined with the browser client's routes
 /// by [`crate::app::router`], which is the only place that knows both exist.
-///
-/// [LAW:single-enforcer] No route here asks who is calling. The deployment is reachable
-/// only over the tailnet, and that network is the one boundary a caller crosses; Happy
-/// still sends the `xi-api-key` it holds, and nothing reads it.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/convai/conversation/token", get(conversation_token))
         .route("/v1/convai/conversations", get(conversations))
-        // Checked against LiveKit's signature over the body: what ends a conversation has
-        // to be LiveKit, not merely something on the network.
+        // Authenticated by LiveKit's own signature over the body rather than by
+        // `xi-api-key`, because LiveKit is the caller here and knows nothing about ours.
         .route("/livekit/webhook", post(livekit_webhook))
+        // Unauthenticated on purpose: a liveness probe that needs a credential tells
+        // you the credential is good, not that the service is up.
         .route("/health", get(|| async { "ok" }))
+}
+
+/// Whether a caller presenting `presented` clears the bar a deployment holding
+/// `configured` sets.
+///
+/// A deployment that configured no key asks for none, so every request clears it — the
+/// header is not consulted, and a caller that sends one anyway (Happy sends the key it
+/// holds whatever this deployment does with it) is neither helped nor refused by it.
+///
+/// A pure function of the two, rather than a method on either, because that is the whole
+/// rule and the extractor below is its residue — this is what the tests hold, and they
+/// need no `AppState`, no whisper model and no SFU to do it.
+fn admits(configured: Option<&XiApiKey>, presented: Option<&XiApiKey>) -> bool {
+    configured.is_none_or(|required| presented == Some(required))
+}
+
+/// Proof that the request cleared whatever bar this deployment sets.
+///
+/// The value cannot be constructed except by going through [`admits`], so a handler that
+/// takes one has already been admitted and no handler can forget to ask. That makes this
+/// extractor the single place a caller is let in. [LAW:parse-dont-validate]
+///
+/// Not named `Authenticated`, because on a deployment that configures no key nobody was:
+/// the name says what this proves — the caller is through the door — rather than how,
+/// which is the deployment's business and not any handler's.
+pub struct Admitted;
+
+impl FromRequestParts<AppState> for Admitted {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let presented = parts
+            .headers
+            .get(API_KEY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(XiApiKey::new);
+
+        admits(state.api_key.as_ref(), presented.as_ref())
+            .then_some(Self)
+            .ok_or(ApiError::Unauthenticated)
+    }
 }
 
 /// `GET /v1/convai/conversation/token?agent_id=...&participant_name=...`
@@ -61,6 +107,7 @@ pub struct TokenResponse {
 /// the process. Any other order can hand out a token for a room that does not exist or
 /// for a call that will never be billed.
 async fn conversation_token(
+    _: Admitted,
     State(state): State<AppState>,
     Query(request): Query<TokenRequest>,
 ) -> Result<Json<TokenResponse>, ApiError> {
@@ -131,6 +178,7 @@ fn parse_created_after(raw: &str) -> Result<i64, ApiError> {
 
 /// Serves the usage history Happy sums to decide whether a user may start a call.
 async fn conversations(
+    _: Admitted,
     State(state): State<AppState>,
     Query(request): Query<ConversationsRequest>,
 ) -> Result<Json<ConversationPage>, ApiError> {
@@ -180,6 +228,7 @@ async fn livekit_webhook(
 
 #[derive(Debug)]
 pub enum ApiError {
+    Unauthenticated,
     BadCreatedAfter(String),
     UnsignedWebhook,
     Webhook(WebhookRejected),
@@ -221,6 +270,11 @@ struct ErrorDetail {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (code, status, message) = match self {
+            Self::Unauthenticated => (
+                StatusCode::UNAUTHORIZED,
+                "invalid_api_key",
+                format!("missing or incorrect {API_KEY_HEADER} header"),
+            ),
             Self::BadCreatedAfter(value) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "invalid_created_after",
@@ -266,5 +320,36 @@ impl IntoResponse for ApiError {
         };
 
         (code, Json(ErrorBody { detail: ErrorDetail { status, message } })).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deployment that configures no key is open to whatever can reach it, which is the
+    /// default and the whole point of the option: the network is the boundary, and no
+    /// caller has to be issued anything to use it.
+    #[test]
+    fn a_deployment_with_no_key_admits_every_caller() {
+        assert!(admits(None, None));
+        assert!(admits(None, Some(&XiApiKey::new("sk-anything"))));
+    }
+
+    #[test]
+    fn a_configured_key_admits_the_caller_that_presents_it() {
+        let configured = XiApiKey::new("sk-abc");
+        assert!(admits(Some(&configured), Some(&XiApiKey::new("sk-abc"))));
+    }
+
+    /// Both arms of being refused, because they are one fact — the caller did not present
+    /// the key — and a deployment that asks for a credential must not be talked past by
+    /// sending the wrong one or by sending none.
+    #[test]
+    fn a_configured_key_refuses_a_wrong_or_absent_one() {
+        let configured = XiApiKey::new("sk-abc");
+        assert!(!admits(Some(&configured), Some(&XiApiKey::new("sk-abd"))));
+        assert!(!admits(Some(&configured), Some(&XiApiKey::new(""))));
+        assert!(!admits(Some(&configured), None));
     }
 }

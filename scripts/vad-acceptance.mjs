@@ -1,6 +1,6 @@
 // Verifies what voice activity detection is for, by being the human on the other end.
 //
-//   node scripts/vad-acceptance.mjs [openconv-url] [livekit-ws-url]
+//   [OPENCONV_API_KEY=...] node scripts/vad-acceptance.mjs [openconv-url] [livekit-ws-url]
 //
 // Needs @livekit/rtc-node and macOS `say`:
 //
@@ -53,7 +53,7 @@ const SPEECH = 0.5;
 /// would fail on a slow network for a reason that is not a regression.
 const STOP_WITHIN_MS = 1_500;
 
-const { openconv, livekitUrl } = readEnvironment(process.env, process.argv);
+const { xiApiKey, openconv, livekitUrl } = readEnvironment(process.env, process.argv);
 const checks = new Checks();
 
 const scratch = mkdtempSync(join(tmpdir(), "openconv-"));
@@ -63,6 +63,7 @@ const interjection = recordSpeech(INTERJECTION, join(scratch, "interjection.wav"
 const caller = await Caller.join({
   openconv,
   livekitUrl,
+  xiApiKey,
   participantName: "u_vad",
   settings: { prompt: PROMPT },
 });

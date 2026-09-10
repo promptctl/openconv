@@ -1,6 +1,6 @@
 // Checks that the agent honours the session configuration the client sends.
 //
-//   node scripts/llm-acceptance.mjs [openconv-url] [livekit-ws-url]
+//   [OPENCONV_API_KEY=...] node scripts/llm-acceptance.mjs [openconv-url] [livekit-ws-url]
 //
 // Needs @livekit/rtc-node and macOS `say`:
 //
@@ -28,7 +28,7 @@ const PROMPT =
   "session {{sessionId}}. When asked which session you are driving, reply with " +
   "the session id exactly as written and nothing else.";
 
-const { openconv, livekitUrl } = readEnvironment(process.env, process.argv);
+const { xiApiKey, openconv, livekitUrl } = readEnvironment(process.env, process.argv);
 const checks = new Checks();
 
 const recording = recordSpeech(QUESTION, join(mkdtempSync(join(tmpdir(), "openconv-llm-")), "q.wav"));
@@ -36,6 +36,7 @@ const recording = recordSpeech(QUESTION, join(mkdtempSync(join(tmpdir(), "openco
 const caller = await Caller.join({
   openconv,
   livekitUrl,
+  xiApiKey,
   participantName: "u_llm",
   // Carried by the handshake rather than published by hand afterwards, so this run and
   // the browser page configure a conversation by the same code. `web/conversation.js`

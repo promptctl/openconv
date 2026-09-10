@@ -7,7 +7,7 @@
 //! Served from here rather than from a static file server, for two reasons that are
 //! both about the page being *this* deployment's client rather than a client in
 //! general. Same-origin means the token mint is an ordinary `fetch` — no CORS layer
-//! widened across the API for a page's sake. And the SFU to dial comes from
+//! widened across a credentialed API for a page's sake. And the SFU to dial comes from
 //! the deployment's own configuration rather than from a text box, because a token
 //! minted here and offered to a different deployment's SFU does not error: the client
 //! joins a room the agent is not in and the caller hears silence.
@@ -118,6 +118,13 @@ pub fn router() -> Router<AppState> {
 #[derive(Debug, Serialize)]
 struct CallConfig {
     livekit_url: String,
+    /// Whether this deployment asks callers for an `xi-api-key`.
+    ///
+    /// The page cannot know it and must not guess: a form that demands a key nothing
+    /// checks asks for a secret that does not exist, and one that omits a key the mint
+    /// requires sends a request that comes back 401 with the field to fix it hidden.
+    /// [LAW:one-source-of-truth]
+    requires_api_key: bool,
     /// The languages a conversation may be switched to.
     ///
     /// Here rather than in the page's own markup because the union is closed: a code this
@@ -132,9 +139,12 @@ struct CallConfig {
     languages: Vec<String>,
 }
 
+/// Unauthenticated, like `/health`: the SFU hostname is what every client dials and is
+/// not a credential. The token is the credential, and that mint is authenticated.
 async fn config(State(state): State<AppState>) -> impl IntoResponse {
     Json(CallConfig {
         livekit_url: state.livekit.public_signaling_url(),
+        requires_api_key: state.api_key.is_some(),
         languages: Language::ALL.iter().map(|language| language.code()).collect(),
     })
 }
