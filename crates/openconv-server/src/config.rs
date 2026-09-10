@@ -42,7 +42,10 @@ pub struct Config {
     /// The credential callers present as `xi-api-key`, when this deployment asks for one.
     ///
     /// Absent by default, which is a deployment saying its network is its boundary. Set it
-    /// and every route asks for it; nothing else changes, and nothing else has to.
+    /// and the two routes that mint a token or read the log ask for it — the ones that
+    /// spend money or disclose who called. `/health` and `/livekit/webhook` do not, the
+    /// latter because it authenticates the SFU by signature instead; nothing else changes,
+    /// and nothing else has to.
     pub api_key: Option<XiApiKey>,
     pub bind: SocketAddr,
     /// Append-only record of conversations, read back by `GET /v1/convai/conversations`.

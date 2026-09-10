@@ -124,17 +124,22 @@ LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... ANTHROPIC_API_KEY=... \
   cargo run --release -p openconv-server
 ```
 
-`LIVEKIT_URL`, `OPENCONV_BIND`, `OPENCONV_CONVERSATION_LOG`, `OPENCONV_WHISPER_MODEL`,
-and `OPENCONV_LLM_MODEL` have defaults; the ones above do not, and the process refuses
-to start without them — with every missing name listed at once.
+`LIVEKIT_URL`, `OPENCONV_PUBLIC_LIVEKIT_URL`, `OPENCONV_BIND`,
+`OPENCONV_CONVERSATION_LOG`, `OPENCONV_WHISPER_MODEL`, `OPENCONV_LLM_MODEL`,
+`OPENCONV_TTS_URL` and `OPENCONV_TTS_VOICE` have defaults; the ones above do not, and the
+process refuses to start without them — with every missing name listed at once.
 
 **No caller is asked for a credential unless you set `OPENCONV_API_KEY`.** Unset, which is
-the default, every route serves whatever can reach it: a deployment that is its own only
-caller — Happy and openconv on the same private network — gains nothing from a shared
-secret it must provision, sync and rotate on both sides, because the network is already
-the boundary. Set it, and every route asks for that value in `xi-api-key`. One variable,
-and turning the check on or off is the presence of a value rather than a second flag to
-keep consistent with the first.
+the default, the two metered routes serve whatever can reach them: a deployment that is its
+own only caller — Happy and openconv on the same private network — gains nothing from a
+shared secret it must provision, sync and rotate on both sides, because the network is
+already the boundary. Set it, and `GET /v1/convai/conversation/token` and
+`GET /v1/convai/conversations` ask for that value in `xi-api-key`. Those two are the whole
+of it, and the rest are unasked for reasons of their own: `/health` exists to answer a
+prober that holds no secret, `/livekit/webhook` authenticates the SFU by its own signature
+over the body, and the `/call` pages are what a browser loads *before* it has a key to
+send. One variable, and turning the check on or off is the presence of a value rather than
+a second flag to keep consistent with the first.
 
 Setting it to *nothing* is the one reading refused, at startup, by name. An empty
 `OPENCONV_API_KEY` is what a Nomad template renders when its Vault lookup found nothing,
@@ -203,8 +208,10 @@ linker otherwise drops, and the process aborts the first time an agent joins a r
 One caveat before trusting any of this in production: openconv accepts `room_finished`
 deliveries and the homelab's SFU is configured to send them (`webhook.urls` in
 `jobs/livekit.nomad.hcl` over in `home-infra`), but a deployment that has not set that up
-gets no durations at all — every conversation reads as in-progress and is billed for
-elapsed time capped at six hours until the startup sweep writes it off.
+gets its durations from the sweep instead of from the call that ended — which runs at
+startup and every hour after, so a conversation reads as in-progress and is billed for
+elapsed time, capped at six hours, until the next sweep finds its room gone and writes it
+off.
 
 The agent holds a conversation. It joins, announces, transcribes what the caller says,
 answers with an LLM, publishes the reply as `agent_response`, and speaks it into the
@@ -370,8 +377,10 @@ entry in `crates/openconv-agent/Cargo.toml` turns on `load-dynamic` for Linux al
 which takes it out of the static link entirely — at the price of a shared library the
 image has to carry, which is why that feature is not on for the checkout build.
 
-The SFU is configured to post `room_finished` back to the deployment, which is the only
-way a conversation ever gets a duration. `conversations-acceptance.mjs` signs its own
+The SFU is configured to post `room_finished` back to the deployment, which is the only way
+a conversation gets a duration *at the moment it ends* — the hourly sweep writes one off
+eventually, but a billed number that arrives up to an hour late is not the same number.
+`conversations-acceptance.mjs` signs its own
 deliveries and so passes whether or not anything is sending them; this one closes a real
 room through the room service and waits for the number to come back:
 
