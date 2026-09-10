@@ -15,6 +15,7 @@
 // five minutes of sleeping is not a better test than the same event arriving now.
 
 import { createHmac } from "node:crypto";
+import { callerHeaders } from "../web/conversation.js";
 import { Checks, readEnvironment } from "./lib/caller.mjs";
 import { livekitCredentials } from "./lib/livekit.mjs";
 
@@ -33,7 +34,7 @@ function mintToken(apiKey, apiSecret, grants) {
   return `${header}.${payload}.${signature}`;
 }
 
-/** The one boundary: everything below runs on values known to exist. */
+/** The one boundary: everything below runs on values this run is going to use. */
 function readConfig(env, argv) {
   const { xiApiKey, openconv } = readEnvironment(env, argv);
   // Shared, unlike the sibling scripts that fold the LiveKit pair into one combined
@@ -59,7 +60,7 @@ const userId = `u_webhook_${Math.random().toString(36).slice(2, 12)}`;
 
 const minted = await fetch(
   `${openconv}/v1/convai/conversation/token?agent_id=agent_probe&participant_name=${userId}`,
-  { headers: { "xi-api-key": xiApiKey } },
+  { headers: callerHeaders(xiApiKey) },
 );
 if (!minted.ok) {
   console.error(`minting failed: HTTP ${minted.status} ${await minted.text()}`);
@@ -91,7 +92,7 @@ checks.record("the SFU closed the room", deleted.ok, `HTTP ${deleted.status}`);
 /** The conversation as openconv now reports it, or undefined if it is not listed. */
 async function readBack() {
   const listed = await fetch(`${openconv}/v1/convai/conversations?user_id=${userId}`, {
-    headers: { "xi-api-key": xiApiKey },
+    headers: callerHeaders(xiApiKey),
   });
   if (!listed.ok) throw new Error(`listing failed: HTTP ${listed.status} ${await listed.text()}`);
   const { conversations } = await listed.json();

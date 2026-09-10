@@ -64,6 +64,17 @@ console.log(`openconv ${config.openconv} against LiveKit ${roomService.url}\n`);
 const minted = await mint("agent_id=agent_happy&participant_name=u_acceptance");
 check("metered mint returns 200", minted.status === 200, `HTTP ${minted.status}`);
 
+// Stop here rather than read a token out of a refusal. A 401 body is valid JSON with no
+// `token` in it, so every line below would run on `undefined` and the script would die on
+// `token.split` with a TypeError, before printing a single result — turning "you did not
+// give me the key this deployment wants" into a stack trace. [LAW:no-silent-failure]
+if (minted.status !== 200) {
+  const posture = config.xiApiKey ? "the key in OPENCONV_API_KEY was refused" : "no OPENCONV_API_KEY was set";
+  console.error(`\ncannot go on: the mint answered HTTP ${minted.status} and ${posture}.`);
+  console.error(`  ${minted.body}`);
+  process.exit(1);
+}
+
 const { token } = JSON.parse(minted.body);
 check("response carries a token field", typeof token === "string" && token.length > 0);
 

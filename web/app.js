@@ -338,9 +338,9 @@ function showButton(label, enabled) {
  * taking the prompt and the voice down with it. The server knows both answers, so both are
  * asked for rather than re-typed here where they can drift. [LAW:one-source-of-truth]
  *
- * One reader with two callers rather than two fetches: they want the answer at different
- * moments — the languages as the page loads, the SFU on the click that joins — and they
- * survive a failure differently, which is the whole reason each asks when it does.
+ * One reader, asked by each caller at the moment that caller needs the answer rather than
+ * once for all of them: they want it at different times and survive a failure differently,
+ * which is the whole reason each asks when it does.
  */
 async function deployment() {
   const response = await fetch("./config");
@@ -377,6 +377,13 @@ async function sendChosenSettings() {
 }
 
 async function join() {
+  // Disabled before anything is awaited. The click handler decides from `call`, which
+  // stays null across every await below, so a button left live during the fetch takes a
+  // second click and starts a second join: another microphone, another mint, another
+  // billed room with an agent dispatched into it. The error path re-derives the label
+  // from whether a call is held, so a join that fails still lands on a usable button.
+  showButton("joining…", false);
+
   // Only the three the mint needs. The overrides on the form reach the call through
   // `settings` below and by no other route — spreading the whole form here would hand
   // `Call.join` the api key twice and the conversation's settings as a stale snapshot,
@@ -385,7 +392,6 @@ async function join() {
   // decides what the form is allowed to be missing.
   const deployed = await deployment();
   const { apiKey, agentId, participantName } = readForm(requiredFields(deployed));
-  showButton("joining…", false);
 
   call = await Call.join({
     apiKey,
@@ -473,7 +479,7 @@ for (const name of OVERRIDES) {
  */
 async function offerAuth() {
   try {
-    els.apiKey.closest("label").hidden = !(await deployment()).requires_api_key;
+    CONTROLS.apiKey.closest("label").hidden = !(await deployment()).requires_api_key;
   } catch (error) {
     render(log("error", `could not read whether this deployment wants an api key: ${error.message}`));
   }

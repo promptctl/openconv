@@ -97,7 +97,18 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // caught on the way up rather than after the first call of the day. It holds the same
     // log and the same client the routes do, so what it closes and what they report
     // cannot come from two different pictures. [LAW:one-source-of-truth]
-    openconv_server::reconcile::run_periodically(state.log.clone(), state.livekit.clone());
+    let sweeps = openconv_server::reconcile::run_periodically(state.log.clone(), state.livekit.clone());
+
+    // The sweep loop never returns on its own, so this only fires if the task panicked or
+    // was cancelled. Watched rather than dropped, because the thing it would fail at is
+    // noticing that something silently did not happen — and a reconciler that has stopped
+    // reconciling looks exactly like one with nothing to do. [LAW:no-silent-failure]
+    tokio::spawn(async move {
+        match sweeps.await {
+            Ok(()) => tracing::error!("conversation log sweeps stopped; lost room_finished deliveries will no longer be recovered"),
+            Err(error) => tracing::error!("conversation log sweeps stopped: {error}; lost room_finished deliveries will no longer be recovered"),
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
 
@@ -105,6 +116,10 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         bind = %config.bind,
         livekit = %config.livekit_url,
         conversation_log = %config.conversation_log.display(),
+        // Whether this deployment asks callers for anything, which is otherwise invisible
+        // until somebody is refused or nobody is. The key itself is never logged; that it
+        // exists is the operational fact. [LAW:no-silent-failure]
+        callers = if config.api_key.is_some() { "must present xi-api-key" } else { "unauthenticated" },
         "openconv listening"
     );
 

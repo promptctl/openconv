@@ -158,6 +158,51 @@ mod tests {
         assert_eq!(serde_json::from_str::<ConversationRecord>(&json).unwrap(), sample());
     }
 
+    /// Every event kind is read back off disk by a later process — `usage::conversations`
+    /// and `reconcile::abandoned` both fold the whole log — so the tag and field names are
+    /// a format, not an internal detail. A rename that compiles would silently stop
+    /// matching lines already written, and the conversations they closed would reopen.
+    #[test]
+    fn every_event_kind_round_trips_through_json() {
+        let events = [
+            ConversationEvent::Started(sample()),
+            ConversationEvent::Finished {
+                conversation_id: sample().conversation_id,
+                ended_at_unix_secs: 1_700_000_600,
+            },
+            ConversationEvent::Abandoned {
+                conversation_id: sample().conversation_id,
+                observed_at_unix_secs: 1_700_000_900,
+            },
+        ];
+
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ConversationEvent>(&json).unwrap(),
+                event,
+                "{json}",
+            );
+        }
+    }
+
+    /// The tags themselves, named rather than round-tripped: the assertion above passes
+    /// just as happily if every tag is renamed in step, and the lines already on disk in
+    /// the homelab say `started`, `finished` and `abandoned`.
+    #[test]
+    fn the_event_tags_are_the_ones_already_written_to_disk() {
+        let tag = |event: &ConversationEvent| serde_json::to_value(event).unwrap()["event"].clone();
+
+        assert_eq!(tag(&ConversationEvent::Started(sample())), "started");
+        assert_eq!(
+            tag(&ConversationEvent::Abandoned {
+                conversation_id: sample().conversation_id,
+                observed_at_unix_secs: 1,
+            }),
+            "abandoned",
+        );
+    }
+
     #[test]
     fn the_byo_path_records_no_user() {
         let record = ConversationRecord::start(

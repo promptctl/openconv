@@ -65,30 +65,57 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let mut missing = Vec::new();
-        let mut required = |name: &'static str| {
-            std::env::var(name).map_err(|_| missing.push(name)).ok()
+        let mut problems = Vec::new();
+
+        // Absent is a whole answer for this one and the default one: a deployment that
+        // configures no credential asks callers for none. Present-but-unusable is not an
+        // answer, and `read` is what tells the two apart.
+        let api_key = match read("OPENCONV_API_KEY") {
+            Ok(value) => value.map(XiApiKey::new),
+            Err(problem) => {
+                problems.push(problem);
+                None
+            }
         };
 
-        let livekit_api_key = required("LIVEKIT_API_KEY");
-        let livekit_api_secret = required("LIVEKIT_API_SECRET");
-        let anthropic_api_key = required("ANTHROPIC_API_KEY");
+        // Scoped so the borrow of `problems` ends with the reads that contribute to it.
+        let (livekit_api_key, livekit_api_secret, anthropic_api_key) = {
+            let mut require = |name: &'static str| match read(name) {
+                Ok(Some(value)) => Some(value),
+                Ok(None) => {
+                    problems.push(Problem::Missing(name));
+                    None
+                }
+                Err(problem) => {
+                    problems.push(problem);
+                    None
+                }
+            };
 
-        // Reporting every missing name in one pass beats failing on the first: an
-        // operator bringing the service up for the first time gets the whole list.
+            (
+                require("LIVEKIT_API_KEY"),
+                require("LIVEKIT_API_SECRET"),
+                require("ANTHROPIC_API_KEY"),
+            )
+        };
+
+        // Everything wrong with the environment in one report, rather than one deploy per
+        // problem: an operator standing a deployment up for the first time is usually
+        // missing more than one thing, and learning them one restart at a time is how a
+        // fifteen-minute setup becomes an afternoon.
         let (
             Some(livekit_api_key),
             Some(livekit_api_secret),
             Some(anthropic_api_key),
         ) = (livekit_api_key, livekit_api_secret, anthropic_api_key)
         else {
-            return Err(ConfigError::Missing(missing));
+            return Err(ConfigError::Environment(problems));
         };
 
-        // Not in that pass, because it is not missing: asking for no credential is a whole
-        // answer, and the only unusable reading of this variable is the one `api_key_from`
-        // refuses.
-        let api_key = api_key_from(std::env::var("OPENCONV_API_KEY").ok())?;
+        // Reached when all three are present and the optional key was the unusable one.
+        if !problems.is_empty() {
+            return Err(ConfigError::Environment(problems));
+        }
 
         let livekit_url = optional("LIVEKIT_URL", "https://livekit.sanctuary.gdn")
             .trim_end_matches('/')
@@ -137,32 +164,46 @@ fn optional(name: &str, fallback: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| fallback.to_owned())
 }
 
-/// The credential this deployment asks callers for, read from what the environment said.
+/// The one way this process reads a variable: absent, usable, or a named problem.
 ///
-/// Three readings, because the third is the one that bites. Unset asks for none: the
-/// deployment's network is its boundary, which is true of an openconv reachable only over
-/// a tailnet by the service that calls it. A value is the credential every caller
-/// presents. Empty is neither — a Nomad template whose Vault lookup found nothing renders
-/// `OPENCONV_API_KEY=` with nothing after it, and that is a deployment that meant to ask
-/// for a credential and was handed none. Reading it as "asks for none" is how a service
-/// comes up open, minting LiveKit tokens and spending an Anthropic budget for anyone who
-/// can reach it, with nothing reporting a problem — so it stops instead.
+/// [LAW:single-enforcer] Every secret goes through here, and that uniformity is the whole
+/// point rather than tidiness. These four values arrive by the same Nomad-and-Vault path,
+/// so they fail the same ways, and a reading applied to one of them is a reading the other
+/// three need. Before this, `OPENCONV_API_KEY` refused an empty value while an equally
+/// empty `LIVEKIT_API_KEY` sailed through as present — the same accident caught in one
+/// place and waved through in another, to be discovered later as a cryptic auth failure on
+/// the first call of the day.
+///
+/// The two failures it names are the two a template produces. Empty is a Vault lookup that
+/// found nothing and rendered `NAME=` with nothing after it. Non-unicode is a mangled
+/// render — and it matters most for the optional key, where `std::env::var(..).ok()` would
+/// collapse it into "nobody configured a credential" and bring the deployment up open,
+/// which is the exact outcome the empty check exists to prevent, reached by another door.
 /// [LAW:no-silent-failure]
 ///
-/// A pure function of the value rather than a reader of the variable, so the rule can be
-/// pinned by tests: setting environment variables is process-wide, and a test that does
-/// it races every other test in the binary. [LAW:effects-at-boundaries]
+/// The value is trimmed, so what is judged empty and what is later compared are the same
+/// string. A key rendered with a trailing newline configured that key — HTTP strips the
+/// same whitespace from the header before it is ever compared, so keeping it would refuse
+/// the very credential the operator set, in a `401` blaming the caller.
+/// [LAW:parse-dont-validate]
+fn read(name: &'static str) -> Result<Option<String>, Problem> {
+    interpret(name, std::env::var(name))
+}
+
+/// The reading itself, as a function of what the environment said.
 ///
-/// All three readings are taken from the trimmed value, so what is judged empty and what
-/// is later compared are the same string. A template that renders the key with a trailing
-/// newline is the same accident as one that renders it empty, and reading the two
-/// differently is how a deployment refuses the very key its operator configured, in a
-/// `401` that says the caller got it wrong. [LAW:parse-dont-validate]
-fn api_key_from(value: Option<String>) -> Result<Option<XiApiKey>, ConfigError> {
-    match value.as_deref().map(str::trim) {
-        None => Ok(None),
-        Some("") => Err(ConfigError::EmptyApiKey),
-        Some(key) => Ok(Some(XiApiKey::new(key))),
+/// Split from [`read`] so the rule can be held by tests: setting a variable is
+/// process-wide, so a test that did it would race every other test in this binary.
+/// [LAW:effects-at-boundaries]
+fn interpret(
+    name: &'static str,
+    value: Result<String, std::env::VarError>,
+) -> Result<Option<String>, Problem> {
+    match value {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Problem::NotUnicode(name)),
+        Ok(value) if value.trim().is_empty() => Err(Problem::Empty(name)),
+        Ok(value) => Ok(Some(value.trim().to_owned())),
     }
 }
 
@@ -215,33 +256,60 @@ impl fmt::Debug for XiApiKey {
     }
 }
 
+/// What was wrong with one variable, named so the operator can act on it without reading
+/// this file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Problem {
+    Missing(&'static str),
+    /// Set, with nothing in it. Almost always a Vault lookup that found nothing.
+    Empty(&'static str),
+    /// Set, and not text. A mangled render rather than a choice anybody made.
+    NotUnicode(&'static str),
+}
+
+impl fmt::Display for Problem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing(name) => write!(f, "{name} is not set"),
+            Self::Empty(name) => write!(
+                f,
+                "{name} is set to nothing — the usual cause is a Vault lookup that found \
+                 nothing"
+            ),
+            Self::NotUnicode(name) => write!(f, "{name} is set to something that is not text"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
-    Missing(Vec<&'static str>),
+    /// Everything wrong with the environment, in one report.
+    Environment(Vec<Problem>),
     NotASocketAddr(String),
-    /// `OPENCONV_API_KEY` was set to nothing.
-    EmptyApiKey,
 }
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Missing(names) => write!(
-                f,
-                "missing required environment {}: {}. The LiveKit pair lives in Vault at \
-                 secret/livekit",
-                if names.len() == 1 { "variable" } else { "variables" },
-                names.join(", ")
-            ),
+            Self::Environment(problems) => {
+                write!(f, "the environment is not usable: ")?;
+                for (position, problem) in problems.iter().enumerate() {
+                    write!(f, "{}{problem}", if position == 0 { "" } else { "; " })?;
+                }
+
+                // The two hints worth carrying, because the fix for either problem is a
+                // place rather than a syntax. Said once at the end rather than per
+                // variable, so a report of four problems is still one paragraph.
+                write!(
+                    f,
+                    ". The LiveKit pair lives in Vault at secret/livekit. OPENCONV_API_KEY \
+                     is the credential callers must send — unset it entirely to ask callers \
+                     for no credential at all"
+                )
+            }
             Self::NotASocketAddr(value) => {
                 write!(f, "OPENCONV_BIND={value:?} is not a socket address")
             }
-            Self::EmptyApiKey => f.write_str(
-                "OPENCONV_API_KEY is set to nothing, which asks callers for a credential \
-                 nobody can present — the usual cause is a Vault lookup that found nothing. \
-                 Give it the key callers must send, or unset it to ask for no credential at \
-                 all",
-            ),
         }
     }
 }
@@ -260,37 +328,75 @@ mod tests {
         assert_ne!(XiApiKey::new(""), XiApiKey::new("sk-abc"));
     }
 
-    #[test]
-    fn a_value_is_the_credential_callers_must_present() {
-        let configured = api_key_from(Some("sk-abc".to_owned())).expect("a stated key");
-        assert_eq!(configured, Some(XiApiKey::new("sk-abc")));
+    const NAME: &str = "OPENCONV_API_KEY";
+
+    fn said(value: &str) -> Result<String, std::env::VarError> {
+        Ok(value.to_owned())
     }
 
     #[test]
-    fn an_unset_variable_asks_callers_for_no_credential() {
-        assert_eq!(api_key_from(None).expect("no key is an answer"), None);
+    fn a_value_is_the_credential_callers_must_present() {
+        assert_eq!(interpret(NAME, said("sk-abc")), Ok(Some("sk-abc".to_owned())));
+    }
+
+    /// Absent is an answer rather than a problem — for the optional credential it is the
+    /// default posture, and for a required one the caller turns it into `Missing`.
+    #[test]
+    fn an_unset_variable_is_absent_rather_than_a_problem() {
+        assert_eq!(interpret(NAME, Err(std::env::VarError::NotPresent)), Ok(None));
     }
 
     /// The failure this shape exists to prevent: a deployment that meant to ask for a
     /// credential, whose secret rendered empty, must stop rather than come up open.
     #[test]
-    fn an_empty_value_stops_the_process_rather_than_opening_it() {
+    fn an_empty_value_is_a_problem_rather_than_an_absent_one() {
         for empty in ["", " ", "\n"] {
-            assert!(
-                matches!(api_key_from(Some(empty.to_owned())), Err(ConfigError::EmptyApiKey)),
-                "{empty:?}",
-            );
+            assert_eq!(interpret(NAME, said(empty)), Err(Problem::Empty(NAME)), "{empty:?}");
         }
     }
 
-    /// The near miss of the one above: a template that renders the key with a newline
+    /// The same failure by the other door: a mangled render must not read as "nobody
+    /// configured a credential", which is what `std::env::var(..).ok()` would have made of
+    /// it — and what would have brought the deployment up open.
+    #[test]
+    fn a_value_that_is_not_text_is_a_problem_rather_than_an_absent_one() {
+        let mangled = Err(std::env::VarError::NotUnicode(std::ffi::OsString::from("sk-")));
+        assert_eq!(interpret(NAME, mangled), Err(Problem::NotUnicode(NAME)));
+    }
+
+    /// The near miss of the empty case: a template that renders the key with a newline
     /// after it configured a key, not nothing, and the caller sending that key must be
     /// admitted — HTTP strips the same whitespace from the header before the extractor
     /// ever sees it, so an untrimmed value here is one no caller could ever present.
     #[test]
     fn a_value_is_read_without_the_whitespace_a_template_wrapped_it_in() {
-        let configured = api_key_from(Some("sk-abc\n".to_owned())).expect("a stated key");
-        assert_eq!(configured, Some(XiApiKey::new("sk-abc")));
+        assert_eq!(interpret(NAME, said("sk-abc\n")), Ok(Some("sk-abc".to_owned())));
+    }
+
+    /// Every secret is read the same way, which is the point of there being one reader:
+    /// the accident that empties one variable empties the others identically, and a
+    /// deployment whose LiveKit key rendered empty must stop at startup rather than fail
+    /// on its first room-service call.
+    #[test]
+    fn every_secret_is_read_by_the_same_rule() {
+        for name in ["LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "ANTHROPIC_API_KEY"] {
+            assert_eq!(interpret(name, said("")), Err(Problem::Empty(name)));
+            assert_eq!(interpret(name, said(" value \n")), Ok(Some("value".to_owned())));
+        }
+    }
+
+    /// A report names every problem it found, so an operator standing a deployment up
+    /// learns all of them at once instead of one restart at a time.
+    #[test]
+    fn one_report_names_every_problem() {
+        let rendered = ConfigError::Environment(vec![
+            Problem::Missing("ANTHROPIC_API_KEY"),
+            Problem::Empty("OPENCONV_API_KEY"),
+        ])
+        .to_string();
+
+        assert!(rendered.contains("ANTHROPIC_API_KEY is not set"), "{rendered}");
+        assert!(rendered.contains("OPENCONV_API_KEY is set to nothing"), "{rendered}");
     }
 
     #[test]

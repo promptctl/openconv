@@ -15,12 +15,29 @@
 //! stay in [`sweep`], at the edge. [LAW:effects-at-boundaries]
 
 use crate::conversation::ConversationId;
-use crate::livekit::LiveKit;
+use crate::livekit::{LiveKit, LiveKitError};
 use crate::record::{now_unix_secs, ConversationEvent};
 use crate::store::{ConversationLog, LogError};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Whatever can say which rooms are open right now.
+///
+/// A seam for one reason: the order in which a sweep takes its two readings is the whole
+/// correctness argument below, and against the concrete client that order is untestable —
+/// nothing can start a conversation in the gap between the two awaits. Behind this trait a
+/// test can, which is what turns "the reads are the right way round" from a comment into
+/// something that fails when it stops being true. [LAW:verifiable-goals]
+pub trait RoomSource {
+    fn open_rooms(&self) -> impl Future<Output = Result<HashSet<String>, LiveKitError>> + Send;
+}
+
+impl RoomSource for LiveKit {
+    fn open_rooms(&self) -> impl Future<Output = Result<HashSet<String>, LiveKitError>> + Send {
+        self.live_rooms()
+    }
+}
 
 /// How often the log is checked against the SFU.
 ///
@@ -73,11 +90,19 @@ pub fn abandoned(events: &[ConversationEvent], live_rooms: &HashSet<String>) -> 
 /// including the ones happening at that moment.
 pub async fn sweep(
     log: &ConversationLog,
-    livekit: &LiveKit,
+    rooms: &impl RoomSource,
     observed_at_unix_secs: i64,
 ) -> Result<usize, SweepError> {
-    let live_rooms = livekit.live_rooms().await.map_err(SweepError::AskingLiveKit)?;
+    // The log first and the room list second, which is the only order that is safe.
+    //
+    // A conversation's room is created before its `Started` line is appended
+    // (`api::conversation_token`), so anything carrying a `Started` in this snapshot had a
+    // room strictly before the snapshot was taken, and a room list asked for afterwards is
+    // guaranteed to show it. Asking the SFU first inverts that: a call born between the two
+    // reads is in the log and missing from the rooms, and gets written off mid-call — into
+    // an append-only log, so permanently. [LAW:no-ambient-temporal-coupling]
     let events = log.read_all().await.map_err(SweepError::ReadingLog)?;
+    let live_rooms = rooms.open_rooms().await.map_err(SweepError::AskingLiveKit)?;
 
     let closing = abandoned(&events, &live_rooms);
     for conversation_id in &closing {
@@ -107,12 +132,15 @@ pub async fn sweep(
 /// with the SFU is a smaller problem than a voice service that stops answering calls
 /// because it could not tidy its ledger — but it is still said out loud, because a sweep
 /// that has been failing since Tuesday is a thing somebody needs to know.
-pub fn run_periodically(log: Arc<ConversationLog>, livekit: Arc<LiveKit>) -> tokio::task::JoinHandle<()> {
+pub fn run_periodically<R: RoomSource + Send + Sync + 'static>(
+    log: Arc<ConversationLog>,
+    rooms: Arc<R>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
         loop {
             ticker.tick().await;
-            match sweep(&log, &livekit, now_unix_secs()).await {
+            match sweep(&log, &*rooms, now_unix_secs()).await {
                 Ok(0) => tracing::debug!("conversation log agrees with the SFU"),
                 Ok(closed) => tracing::info!(
                     closed,
@@ -150,8 +178,12 @@ mod tests {
     use crate::record::{AgentId, ConversationRecord, HappyUserId};
 
     fn started(id: &str) -> ConversationEvent {
+        started_with_id(ConversationId::parse(id).expect("a well-formed id"))
+    }
+
+    fn started_with_id(conversation_id: ConversationId) -> ConversationEvent {
         ConversationEvent::Started(ConversationRecord {
-            conversation_id: ConversationId::parse(id).expect("a well-formed id"),
+            conversation_id,
             agent_id: AgentId::new("agent_happy"),
             happy_user: Some(HappyUserId::new("u_someone")),
             started_at_unix_secs: 1_700_000_000,
@@ -166,10 +198,64 @@ mod tests {
         names.iter().map(|name| (*name).to_owned()).collect()
     }
 
+    /// A room list that reports nothing, and starts a conversation while it is being asked.
+    ///
+    /// Stands in for the only moment that matters: a caller minting a token in the gap
+    /// between a sweep's two readings. The room it creates is not in the list this returns,
+    /// exactly as a room created after the SFU was asked would not be.
+    struct SfuThatStartsACallWhileAnswering {
+        log: Arc<ConversationLog>,
+        conversation: ConversationId,
+    }
+
+    impl RoomSource for SfuThatStartsACallWhileAnswering {
+        async fn open_rooms(&self) -> Result<HashSet<String>, LiveKitError> {
+            self.log
+                .append(&started_with_id(self.conversation.clone()))
+                .await
+                .expect("the log accepts the conversation that just started");
+            Ok(HashSet::new())
+        }
+    }
+
+    fn temp_log() -> ConversationLog {
+        ConversationLog::new(std::env::temp_dir().join(format!(
+            "openconv-reconcile-test-{}-{}.jsonl",
+            std::process::id(),
+            ConversationId::generate()
+        )))
+    }
+
     #[test]
     fn a_conversation_whose_room_is_gone_is_abandoned() {
         let events = [started("conv_aaa")];
         assert_eq!(abandoned(&events, &rooms(&[])), vec![id("conv_aaa")]);
+    }
+
+    /// The race this ordering exists to close, and the reason the two reads may not be
+    /// swapped back: a call born mid-sweep must not be written off.
+    ///
+    /// Reading the log first is what makes it safe — the conversation this SFU starts while
+    /// answering cannot be in a snapshot taken before it existed. With the readings the
+    /// other way round it is in the log and absent from the rooms, and the sweep closes a
+    /// call that is still running, permanently.
+    #[tokio::test]
+    async fn a_conversation_that_starts_mid_sweep_is_not_written_off() {
+        let log = Arc::new(temp_log());
+        let born = ConversationId::generate();
+        let sfu = SfuThatStartsACallWhileAnswering { log: log.clone(), conversation: born.clone() };
+
+        let closed = sweep(&log, &sfu, 1_700_000_100).await.expect("the sweep runs");
+
+        assert_eq!(closed, 0, "a call that started mid-sweep was written off");
+        let events = log.read_all().await.expect("the log reads back");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                ConversationEvent::Abandoned { conversation_id, .. } if *conversation_id == born
+            )),
+            "the log holds an Abandoned for a conversation that had only just started",
+        );
     }
 
     /// The state that must survive a sweep untouched, whatever else it does: a call
