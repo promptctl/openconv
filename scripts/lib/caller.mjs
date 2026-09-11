@@ -904,12 +904,14 @@ export class Checks {
   }
 }
 
-/** The one boundary: everything downstream runs on values known to exist. */
+/** The one boundary: everything downstream runs on values this run is going to use. */
 export function readEnvironment(env, argv) {
-  const xiApiKey = env.OPENCONV_API_KEY;
-  if (!xiApiKey) throw new Error("missing OPENCONV_API_KEY");
   return {
-    xiApiKey,
+    // Absent unless the deployment under test asks for a credential, which by default it
+    // does not. Not refused when missing, because "no key" is how most runs are correct;
+    // a run against a deployment that does hold one is refused by that deployment, in a
+    // 401 that names the header.
+    xiApiKey: env.OPENCONV_API_KEY ?? null,
     openconv: (argv[2] ?? "http://127.0.0.1:8080").replace(/\/$/, ""),
     livekitUrl: argv[3] ?? "wss://livekit.sanctuary.gdn",
   };

@@ -53,21 +53,20 @@ const REQUEST_TIMEOUT_MS = 30_000;
  * The LiveKit credentials, or a refusal naming what is missing and where to get it.
  *
  * One fact — these two variables must exist, and they live in Vault at secret/livekit —
- * held once. Three scripts need exactly it and each had its own copy: `livekit-smoke`,
- * `loopback-acceptance`, and `webhook-delivery-acceptance` (which sources its other
- * variables separately through `readEnvironment`, so its LiveKit check stood alone).
+ * held once. Every script that needs the pair reads it here: `livekit-smoke`,
+ * `loopback-acceptance`, `webhook-delivery-acceptance`, `token-endpoint-acceptance` and
+ * `conversations-acceptance`.
  *
- * Two scripts deliberately do NOT use this, and the reason is the same for both.
- * `token-endpoint-acceptance` and `conversations-acceptance` each check `OPENCONV_API_KEY`
- * alongside the pair and report every missing variable in ONE message. Routing their
- * LiveKit half through here would split that into two throws, so an operator missing both
- * would learn about one, fix it, rerun, and learn about the other. Same shape, different
- * fact — "everything this run needs" is not "the LiveKit pair" — and the diagnostic is
- * what makes the difference worth keeping.
+ * The last two abstained until the caller credential became optional, and the reason they
+ * did is worth keeping in view: they checked `OPENCONV_API_KEY` alongside the pair so that
+ * an operator missing both was told about both in one message, which routing through here
+ * would have split into two throws. That reason expired rather than being overruled — a
+ * key that a run does not need cannot be missing from it. Any future variable that a run
+ * genuinely requires alongside the pair brings the same argument back.
  *
- * That is the whole census: three callers, two deliberate abstainers, no other copy. It is
- * written out because the first version of this docblock named one abstainer and missed a
- * caller, which is the same miscount this module's own header was corrected for.
+ * That is the whole census: five callers, no abstainers, no other copy. It is written out
+ * because two earlier versions of this docblock miscounted, which is the same miscount
+ * this module's own header was corrected for.
  */
 export function livekitCredentials(env) {
   const missing = ["LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"].filter((name) => !env[name]);

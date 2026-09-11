@@ -168,6 +168,20 @@ const claims = (token) => {
 export const conversationOf = (token) => claims(token).video.room;
 
 /**
+ * What a caller sends to identify itself: the key when it holds one, and nothing when it
+ * does not.
+ *
+ * A deployment asks for a credential or it does not, and every caller here — this page,
+ * the acceptance scripts, the probes — has to say the same thing about a key it does not
+ * have. One rendering, because the tempting one-liner is wrong in a way that reads as a
+ * server fault: `{ "xi-api-key": undefined }` is not an omitted header. `fetch` rejects it
+ * outright in Node and sends the literal string "undefined" in a browser, so the page
+ * would present a credential nobody configured and be refused by the one deployment that
+ * does check. [LAW:one-source-of-truth]
+ */
+export const callerHeaders = (apiKey) => (apiKey ? { "xi-api-key": apiKey } : {});
+
+/**
  * Mints a conversation token, which is also what dispatches the agent into the room.
  *
  * A parser rather than a check: it returns a token and the conversation that token admits
@@ -180,7 +194,7 @@ export async function mintConversation({ openconv, apiKey, agentId, participantN
   url.searchParams.set("agent_id", agentId);
   url.searchParams.set("participant_name", participantName);
 
-  const response = await fetch(url, { headers: { "xi-api-key": apiKey } });
+  const response = await fetch(url, { headers: callerHeaders(apiKey) });
   const body = await response.text();
   if (!response.ok) {
     throw new Error(`mint failed: HTTP ${response.status} ${body}`);

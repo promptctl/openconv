@@ -1,6 +1,6 @@
 // Checks a running openconv against the contract Happy's server actually depends on.
 //
-//   OPENCONV_API_KEY=... LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
+//   [OPENCONV_API_KEY=...] LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
 //     node scripts/token-endpoint-acceptance.mjs [openconv-url] [livekit-url]
 //
 // This exercises the endpoint end to end against a real LiveKit deployment, which is
@@ -12,20 +12,17 @@
 // from the endpoint's own documentation, so this fails when openconv stops satisfying
 // its caller — not when it stops matching what we believed its caller wanted.
 
-import { Rooms } from "./lib/livekit.mjs";
+import { callerHeaders } from "../web/conversation.js";
+import { Rooms, livekitCredentials } from "./lib/livekit.mjs";
 
-// The one boundary: everything below runs on values known to exist.
+// The one boundary: everything below runs on values this run is going to use.
 function readConfig(env, argv) {
-  const missing = ["OPENCONV_API_KEY", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"].filter(
-    (name) => !env[name],
-  );
-  if (missing.length > 0) {
-    throw new Error(`missing ${missing.join(", ")} — the LiveKit pair lives in Vault at secret/livekit`);
-  }
   return {
-    xiApiKey: env.OPENCONV_API_KEY,
-    apiKey: env.LIVEKIT_API_KEY,
-    apiSecret: env.LIVEKIT_API_SECRET,
+    ...livekitCredentials(env),
+    // Absent against a deployment that asks callers for no credential, which is the
+    // default. What this run checks about the key is read from the deployment rather
+    // than from here — see the enforcement checks at the end.
+    xiApiKey: env.OPENCONV_API_KEY ?? null,
     openconv: (argv[2] ?? "http://127.0.0.1:8080").replace(/\/$/, ""),
     livekit: (argv[3] ?? "https://livekit.sanctuary.gdn").replace(/\/$/, ""),
   };
@@ -41,7 +38,7 @@ const check = (name, ok, detail = "") => {
 
 async function mint(query, apiKey = config.xiApiKey) {
   const response = await fetch(`${config.openconv}/v1/convai/conversation/token?${query}`, {
-    headers: { "xi-api-key": apiKey },
+    headers: callerHeaders(apiKey),
   });
   return { status: response.status, body: await response.text() };
 }
@@ -66,6 +63,17 @@ console.log(`openconv ${config.openconv} against LiveKit ${roomService.url}\n`);
 // ---- the metered path: agent_id plus a participant_name carrying Happy's user ID ----
 const minted = await mint("agent_id=agent_happy&participant_name=u_acceptance");
 check("metered mint returns 200", minted.status === 200, `HTTP ${minted.status}`);
+
+// Stop here rather than read a token out of a refusal. A 401 body is valid JSON with no
+// `token` in it, so every line below would run on `undefined` and the script would die on
+// `token.split` with a TypeError, before printing a single result — turning "you did not
+// give me the key this deployment wants" into a stack trace. [LAW:no-silent-failure]
+if (minted.status !== 200) {
+  const posture = config.xiApiKey ? "the key in OPENCONV_API_KEY was refused" : "no OPENCONV_API_KEY was set";
+  console.error(`\ncannot go on: the mint answered HTTP ${minted.status} and ${posture}.`);
+  console.error(`  ${minted.body}`);
+  process.exit(1);
+}
 
 const { token } = JSON.parse(minted.body);
 check("response carries a token field", typeof token === "string" && token.length > 0);
@@ -116,12 +124,21 @@ if (byo.status === 200) {
   check("BYO conversation is distinct from the metered one", byoId !== conversationId);
 }
 
-// ---- the credential is actually enforced ----
-const wrongKey = await mint("agent_id=agent_happy", "sk-not-the-key");
-check("a wrong xi-api-key is refused", wrongKey.status === 401, `HTTP ${wrongKey.status}`);
+// ---- the deployment's own posture is the one that is enforced ----
+// Both mints below always run; what they are expected to answer is a value read from the
+// deployment, not a branch in this script. [LAW:dataflow-not-control-flow] `/call/config`
+// is the same answer the page shows its api key field on, so a deployment that asks for a
+// key and a deployment that does not are each held to what they said about themselves —
+// and a deployment that asks for one and then serves a caller who has none fails here.
+const { requires_api_key: requiresKey } = await (await fetch(`${config.openconv}/call/config`)).json();
+const expected = requiresKey ? 401 : 200;
+const posture = `requires_api_key=${requiresKey}`;
 
-const noKey = await fetch(`${config.openconv}/v1/convai/conversation/token?agent_id=agent_happy`);
-check("a missing xi-api-key is refused", noKey.status === 401, `HTTP ${noKey.status}`);
+const wrongKey = await mint("agent_id=agent_happy", "sk-not-the-key");
+check(`a wrong xi-api-key gets ${expected}`, wrongKey.status === expected, `HTTP ${wrongKey.status}, ${posture}`);
+
+const noKey = await mint("agent_id=agent_happy", null);
+check(`a missing xi-api-key gets ${expected}`, noKey.status === expected, `HTTP ${noKey.status}, ${posture}`);
 
 const noAgent = await mint("");
 check("a request with no agent_id is rejected", noAgent.status >= 400, `HTTP ${noAgent.status}`);

@@ -120,13 +120,39 @@ longer string and neither raises an error when the pattern does not match. A
 whose name breaks that regex cannot be named.
 
 ```
-LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... OPENCONV_API_KEY=... ANTHROPIC_API_KEY=... \
+LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... ANTHROPIC_API_KEY=... \
   cargo run --release -p openconv-server
 ```
 
-`LIVEKIT_URL`, `OPENCONV_BIND`, `OPENCONV_CONVERSATION_LOG`, `OPENCONV_WHISPER_MODEL`,
-and `OPENCONV_LLM_MODEL` have defaults; the four above do not, and the process refuses
-to start without them — with every missing name listed at once.
+`LIVEKIT_URL`, `OPENCONV_PUBLIC_LIVEKIT_URL`, `OPENCONV_BIND`,
+`OPENCONV_CONVERSATION_LOG`, `OPENCONV_WHISPER_MODEL`, `OPENCONV_LLM_MODEL`,
+`OPENCONV_TTS_URL` and `OPENCONV_TTS_VOICE` have defaults; the ones above do not, and the
+process refuses to start without them — with every missing name listed at once.
+
+**No caller is asked for a credential unless you set `OPENCONV_API_KEY`.** Unset, which is
+the default, the two metered routes serve whatever can reach them: a deployment that is its
+own only caller — Happy and openconv on the same private network — gains nothing from a
+shared secret it must provision, sync and rotate on both sides, because the network is
+already the boundary. Set it, and `GET /v1/convai/conversation/token` and
+`GET /v1/convai/conversations` ask for that value in `xi-api-key`. Those two are the whole
+of it, and the rest are unasked for reasons of their own: `/health` exists to answer a
+prober that holds no secret, `/livekit/webhook` authenticates the SFU by its own signature
+over the body, and the `/call` pages are what a browser loads *before* it has a key to
+send. One variable, and turning the check on or off is the presence of a value rather than
+a second flag to keep consistent with the first.
+
+Setting it to *nothing* is the one reading refused, at startup, by name. An empty
+`OPENCONV_API_KEY` is what a Nomad template renders when its Vault lookup found nothing,
+and it is not a deployment asking for no credential — it is one that meant to ask and was
+handed none. Coming up open on it is how a service ends up minting LiveKit tokens and
+spending an Anthropic budget for anyone who can reach it, with nothing anywhere reporting
+a problem.
+
+Happy's side needs no coordination either way: with `VOICE_CONVAI_ORIGIN` pointed here, its
+`ELEVENLABS_API_KEY` is optional, and it sends whatever it holds — a key an open deployment
+ignores, and the key an authenticated one expects. The `/call` page asks `GET /call/config`
+whether this deployment wants one and shows its api key field accordingly, so what it shows
+and what it insists on cannot disagree.
 
 It also serves `POST /livekit/webhook`, which is how conversations get their durations.
 The end of a call is observed rather than reported — the SFU sees the room close even
@@ -134,11 +160,25 @@ when the agent crashed, and a conversation with no end reads to Happy as free us
 That makes the conversation log an event log: `started` and `finished` are two appended
 lines, and a conversation is the fold of them, so nothing is ever rewritten in place.
 
+There is a third line, and it exists because the second one can go missing. A delivery
+that never arrives leaves its conversation reading as in progress forever — accruing
+against its caller up to the six-hour cap and never past it — and nothing in the webhook
+path can notice, because what it would have to notice is a message it did not receive. So
+`crates/openconv-server/src/reconcile.rs` re-reads the log against the thing the log is a
+record of: LiveKit's room list is the authority on whether a call is still happening, and
+a started conversation with no ending and no room is written off as `abandoned`. It runs
+once at startup — which is where a delivery lost while this process was down gets caught —
+and hourly after that, and it is idempotent, so a second pass over the first pass's output
+has nothing to do. `abandoned` is a separate line from `finished` on purpose: it says the
+call is over and deliberately does not say when it ended, because by then nothing knows.
+Its duration stays capped for the reason it always was — between the start and the moment
+somebody noticed, this crate knows only that the call was somewhere inside.
+
 Two acceptance scripts check a running instance against what its callers actually do,
 rather than against what this README claims:
 
 ```
-OPENCONV_API_KEY=... LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
+LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
   node scripts/token-endpoint-acceptance.mjs  http://127.0.0.1:8080
   node scripts/conversations-acceptance.mjs   http://127.0.0.1:8080
 ```
@@ -165,11 +205,13 @@ Note for anyone building this on macOS: `.cargo/config.toml` passes `-ObjC`, and
 load-bearing. libwebrtc implements part of itself as Objective-C categories that the
 linker otherwise drops, and the process aborts the first time an agent joins a room.
 
-Two further caveats before trusting any of this in production: openconv accepts
-`room_finished` deliveries, but the LiveKit deployment is not yet configured to send
-them. That is `webhook.urls` in `jobs/livekit.nomad.hcl` over in `home-infra`, and it
-needs a reachable openconv to point at. Until it is set, every conversation reads as
-in-progress and is billed for elapsed time capped at six hours.
+One caveat before trusting any of this in production: openconv accepts `room_finished`
+deliveries and the homelab's SFU is configured to send them (`webhook.urls` in
+`jobs/livekit.nomad.hcl` over in `home-infra`), but a deployment that has not set that up
+gets its durations from the sweep instead of from the call that ended — which runs at
+startup and every hour after, so a conversation reads as in-progress and is billed for
+elapsed time, capped at six hours, until the next sweep finds its room gone and writes it
+off.
 
 The agent holds a conversation. It joins, announces, transcribes what the caller says,
 answers with an LLM, publishes the reply as `agent_response`, and speaks it into the
@@ -205,7 +247,7 @@ the first call through Metal compiles a shader library, and unpaid it lands on t
 thing the first caller ever says.
 
 ```
-OPENCONV_API_KEY=... node scripts/agent-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
+node scripts/agent-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
 ```
 
 That one needs `npm install @livekit/rtc-node`. It joins a real room as the app would
@@ -214,7 +256,7 @@ participant, its first control event is the announcement, a `vad_score` follows,
 frames are flowing on the published track.
 
 ```
-OPENCONV_API_KEY=... node scripts/live-call-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
+node scripts/live-call-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
 ```
 
 That one holds a whole turn, which is the only place the assembled path is exercised:
@@ -257,8 +299,8 @@ two different ideas of what a caller is. Minting is the one part the happy scrip
 itself, because happy's mint is the thing it is there to test.
 
 ```
-OPENCONV_API_KEY=... node scripts/stt-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
-OPENCONV_API_KEY=... node scripts/llm-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
+node scripts/stt-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
+node scripts/llm-acceptance.mjs http://127.0.0.1:8080 wss://livekit.sanctuary.gdn
 ```
 
 That one speaks. It renders a sentence with the macOS `say` voice, publishes it as a
@@ -335,13 +377,15 @@ entry in `crates/openconv-agent/Cargo.toml` turns on `load-dynamic` for Linux al
 which takes it out of the static link entirely — at the price of a shared library the
 image has to carry, which is why that feature is not on for the checkout build.
 
-The SFU is configured to post `room_finished` back to the deployment, which is the only
-way a conversation ever gets a duration. `conversations-acceptance.mjs` signs its own
+The SFU is configured to post `room_finished` back to the deployment, which is the only way
+a conversation gets a duration *at the moment it ends* — the hourly sweep writes one off
+eventually, but a billed number that arrives up to an hour late is not the same number.
+`conversations-acceptance.mjs` signs its own
 deliveries and so passes whether or not anything is sending them; this one closes a real
 room through the room service and waits for the number to come back:
 
 ```
-OPENCONV_API_KEY=... LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
+LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
   node scripts/webhook-delivery-acceptance.mjs https://openconv.sanctuary.gdn
 ```
 

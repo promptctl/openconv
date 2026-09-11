@@ -61,11 +61,23 @@ const chosenSettings = () => {
  * the deployment choose", and refusing it would take away the only state available
  * before the roster has loaded or when it cannot.
  */
-const REQUIRED = {
-  apiKey: "the api key",
+const ALWAYS_REQUIRED = {
   agentId: "an agent",
   participantName: "a participant",
 };
+
+/**
+ * The same table for the deployment this page is served by.
+ *
+ * Whether a key is required is a fact about the deployment and not about the form, so it
+ * is asked for rather than assumed. Assuming it either way costs something: a page that
+ * always demands one asks for a secret an open deployment does not have, and a page that
+ * never does sends a request that comes back 401 with no field to fix it in.
+ * [LAW:one-source-of-truth]
+ */
+function requiredFields({ requires_api_key }) {
+  return requires_api_key ? { apiKey: "the api key", ...ALWAYS_REQUIRED } : ALWAYS_REQUIRED;
+}
 
 /**
  * Reads the form, refusing a blank where blank is not an answer.
@@ -86,13 +98,13 @@ const REQUIRED = {
  * visit is the same kind of value every other control remembers. Turning "" into "no
  * particular voice" happens once, where the message that says it is built.
  */
-function readForm() {
+function readForm(required) {
   const chosen = showing();
 
-  const missing = Object.keys(REQUIRED).filter((name) => chosen[name] === "");
+  const missing = Object.keys(required).filter((name) => chosen[name] === "");
   if (missing.length > 0) {
     throw new Error(
-      `fill in ${missing.map((name) => REQUIRED[name]).join(" and ")} before joining`,
+      `fill in ${missing.map((name) => required[name]).join(" and ")} before joining`,
     );
   }
 
@@ -326,9 +338,9 @@ function showButton(label, enabled) {
  * taking the prompt and the voice down with it. The server knows both answers, so both are
  * asked for rather than re-typed here where they can drift. [LAW:one-source-of-truth]
  *
- * One reader with two callers rather than two fetches: they want the answer at different
- * moments — the languages as the page loads, the SFU on the click that joins — and they
- * survive a failure differently, which is the whole reason each asks when it does.
+ * One reader, asked by each caller at the moment that caller needs the answer rather than
+ * once for all of them: they want it at different times and survive a failure differently,
+ * which is the whole reason each asks when it does.
  */
 async function deployment() {
   const response = await fetch("./config");
@@ -365,18 +377,27 @@ async function sendChosenSettings() {
 }
 
 async function join() {
+  // Disabled before anything is awaited. The click handler decides from `call`, which
+  // stays null across every await below, so a button left live during the fetch takes a
+  // second click and starts a second join: another microphone, another mint, another
+  // billed room with an agent dispatched into it. The error path re-derives the label
+  // from whether a call is held, so a join that fails still lands on a usable button.
+  showButton("joining…", false);
+
   // Only the three the mint needs. The overrides on the form reach the call through
   // `settings` below and by no other route — spreading the whole form here would hand
   // `Call.join` the api key twice and the conversation's settings as a stale snapshot,
   // and one of those two mistakes ends up on the data channel.
-  const { apiKey, agentId, participantName } = readForm();
-  showButton("joining…", false);
+  // Both answers off one read. Asked before the form is parsed because one of them
+  // decides what the form is allowed to be missing.
+  const deployed = await deployment();
+  const { apiKey, agentId, participantName } = readForm(requiredFields(deployed));
 
   call = await Call.join({
     apiKey,
     agentId,
     participantName,
-    livekitUrl: (await deployment()).livekit_url,
+    livekitUrl: deployed.livekit_url,
     // A reader of the controls rather than the values they held a moment ago. The form
     // stays the one place that says what this call is, so changing any of it mid-call
     // reaches the agent with nothing to keep in step. [LAW:one-source-of-truth]
@@ -443,6 +464,28 @@ for (const name of OVERRIDES) {
   CONTROLS[name].addEventListener("change", sendChosenSettings);
 }
 
+/**
+ * Takes the api key field away on a deployment that asks for no key.
+ *
+ * Shown by default and hidden on the answer, rather than hidden and revealed: the page
+ * is served before the answer arrives, and of the two ways to be wrong for those few
+ * milliseconds, showing a field that turns out to be unnecessary is the one that loses
+ * nothing. A failure leaves it showing and says so — an unexplained missing field is how
+ * someone concludes the page is broken.
+ *
+ * The refusal to join without one is decided from the same fetch at the same moment
+ * (`requiredFields`), so the field the page shows and the field it insists on cannot
+ * disagree. [LAW:one-source-of-truth]
+ */
+async function offerAuth() {
+  try {
+    CONTROLS.apiKey.closest("label").hidden = !(await deployment()).requires_api_key;
+  } catch (error) {
+    render(log("error", `could not read whether this deployment wants an api key: ${error.message}`));
+  }
+}
+
 const seeded = seedFields();
+offerAuth();
 offerVoices(seeded.voiceId);
 offerLanguages(seeded.language);

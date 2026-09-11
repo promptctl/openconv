@@ -1,6 +1,6 @@
 // Checks that the agent honours the session configuration the client sends.
 //
-//   OPENCONV_API_KEY=... node scripts/llm-acceptance.mjs [openconv-url] [livekit-ws-url]
+//   [OPENCONV_API_KEY=...] node scripts/llm-acceptance.mjs [openconv-url] [livekit-ws-url]
 //
 // Needs @livekit/rtc-node and macOS `say`:
 //

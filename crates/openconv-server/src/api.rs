@@ -34,14 +34,32 @@ pub fn router() -> Router<AppState> {
         .route("/health", get(|| async { "ok" }))
 }
 
-/// Proof that the request carried the right `xi-api-key`.
+/// Whether a caller presenting `presented` clears the bar a deployment holding
+/// `configured` sets.
 ///
-/// The value cannot be constructed except by presenting the key, so a handler that
-/// takes one has already been authenticated and no handler can forget to check. That
-/// makes this extractor the single place the credential is verified.
-pub struct Authenticated;
+/// A deployment that configured no key asks for none, so every request clears it — the
+/// header is not consulted, and a caller that sends one anyway (Happy sends the key it
+/// holds whatever this deployment does with it) is neither helped nor refused by it.
+///
+/// A pure function of the two, rather than a method on either, because that is the whole
+/// rule and the extractor below is its residue — this is what the tests hold, and they
+/// need no `AppState`, no whisper model and no SFU to do it.
+fn admits(configured: Option<&XiApiKey>, presented: Option<&XiApiKey>) -> bool {
+    configured.is_none_or(|required| presented == Some(required))
+}
 
-impl FromRequestParts<AppState> for Authenticated {
+/// Proof that the request cleared whatever bar this deployment sets.
+///
+/// The value cannot be constructed except by going through [`admits`], so a handler that
+/// takes one has already been admitted and no handler can forget to ask. That makes this
+/// extractor the single place a caller is let in. [LAW:parse-dont-validate]
+///
+/// Not named `Authenticated`, because on a deployment that configures no key nobody was:
+/// the name says what this proves — the caller is through the door — rather than how,
+/// which is the deployment's business and not any handler's.
+pub struct Admitted;
+
+impl FromRequestParts<AppState> for Admitted {
     type Rejection = ApiError;
 
     async fn from_request_parts(
@@ -52,9 +70,9 @@ impl FromRequestParts<AppState> for Authenticated {
             .headers
             .get(API_KEY_HEADER)
             .and_then(|value| value.to_str().ok())
-            .ok_or(ApiError::Unauthenticated)?;
+            .map(XiApiKey::new);
 
-        (XiApiKey::new(presented) == state.xi_api_key)
+        admits(state.api_key.as_ref(), presented.as_ref())
             .then_some(Self)
             .ok_or(ApiError::Unauthenticated)
     }
@@ -89,7 +107,7 @@ pub struct TokenResponse {
 /// the process. Any other order can hand out a token for a room that does not exist or
 /// for a call that will never be billed.
 async fn conversation_token(
-    _: Authenticated,
+    _: Admitted,
     State(state): State<AppState>,
     Query(request): Query<TokenRequest>,
 ) -> Result<Json<TokenResponse>, ApiError> {
@@ -160,7 +178,7 @@ fn parse_created_after(raw: &str) -> Result<i64, ApiError> {
 
 /// Serves the usage history Happy sums to decide whether a user may start a call.
 async fn conversations(
-    _: Authenticated,
+    _: Admitted,
     State(state): State<AppState>,
     Query(request): Query<ConversationsRequest>,
 ) -> Result<Json<ConversationPage>, ApiError> {
@@ -302,5 +320,36 @@ impl IntoResponse for ApiError {
         };
 
         (code, Json(ErrorBody { detail: ErrorDetail { status, message } })).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deployment that configures no key is open to whatever can reach it, which is the
+    /// default and the whole point of the option: the network is the boundary, and no
+    /// caller has to be issued anything to use it.
+    #[test]
+    fn a_deployment_with_no_key_admits_every_caller() {
+        assert!(admits(None, None));
+        assert!(admits(None, Some(&XiApiKey::new("sk-anything"))));
+    }
+
+    #[test]
+    fn a_configured_key_admits_the_caller_that_presents_it() {
+        let configured = XiApiKey::new("sk-abc");
+        assert!(admits(Some(&configured), Some(&XiApiKey::new("sk-abc"))));
+    }
+
+    /// Both arms of being refused, because they are one fact — the caller did not present
+    /// the key — and a deployment that asks for a credential must not be talked past by
+    /// sending the wrong one or by sending none.
+    #[test]
+    fn a_configured_key_refuses_a_wrong_or_absent_one() {
+        let configured = XiApiKey::new("sk-abc");
+        assert!(!admits(Some(&configured), Some(&XiApiKey::new("sk-abd"))));
+        assert!(!admits(Some(&configured), Some(&XiApiKey::new(""))));
+        assert!(!admits(Some(&configured), None));
     }
 }

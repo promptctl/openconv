@@ -1,7 +1,7 @@
 // Verifies the agent by being the client: joins a real conversation room and asserts
 // what the ElevenLabs SDK would need in order to work.
 //
-//   OPENCONV_API_KEY=... node scripts/agent-acceptance.mjs [openconv-url] [livekit-ws-url]
+//   [OPENCONV_API_KEY=...] node scripts/agent-acceptance.mjs [openconv-url] [livekit-ws-url]
 //
 // Needs @livekit/rtc-node, which is not a dependency of anything else here:
 //

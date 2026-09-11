@@ -1,6 +1,6 @@
 // Speaks a sentence into a live conversation and checks the agent heard it.
 //
-//   OPENCONV_API_KEY=... node scripts/stt-acceptance.mjs [openconv-url] [livekit-ws-url]
+//   [OPENCONV_API_KEY=...] node scripts/stt-acceptance.mjs [openconv-url] [livekit-ws-url]
 //
 // Needs @livekit/rtc-node and macOS `say`, which supplies the voice:
 //

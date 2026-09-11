@@ -1,6 +1,6 @@
 // Verifies that the agent tells background context from a typed turn.
 //
-//   OPENCONV_API_KEY=... node scripts/inbound-text-acceptance.mjs [openconv-url] [livekit-ws-url]
+//   [OPENCONV_API_KEY=...] node scripts/inbound-text-acceptance.mjs [openconv-url] [livekit-ws-url]
 //
 // Needs @livekit/rtc-node:
 //

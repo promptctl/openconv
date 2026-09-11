@@ -83,35 +83,54 @@ pub fn conversations(
     // finish" without scanning, and so an end that arrives before its start — which a
     // truncated or reordered log can produce — simply finds no start to attach to
     // rather than inventing a conversation with no user.
-    let ends: HashMap<&ConversationId, i64> = events
-        .iter()
-        .filter_map(|event| match event {
+    let mut ends: HashMap<&ConversationId, Ending> = HashMap::new();
+    for event in events {
+        let recorded = match event {
             ConversationEvent::Finished { conversation_id, ended_at_unix_secs } => {
-                Some((conversation_id, *ended_at_unix_secs))
+                (conversation_id, Ending::Reported(*ended_at_unix_secs))
             }
-            ConversationEvent::Started(_) => None,
-        })
-        .collect();
+            ConversationEvent::Abandoned { conversation_id, observed_at_unix_secs } => {
+                (conversation_id, Ending::Abandoned(*observed_at_unix_secs))
+            }
+            ConversationEvent::Started(_) => continue,
+        };
+        let (conversation_id, ending) = recorded;
+
+        // One conversation can carry two endings: a `room_finished` delivered late enough
+        // to land either side of the sweep that had already given up on it. Which one wins
+        // is decided by what they mean, never by which line was written last — a reported
+        // end is a measurement from the SFU, an abandonment is only this crate's inference
+        // that no measurement was ever coming. Letting file order decide would make the
+        // same pair of events mean different things depending on how a race fell.
+        // [LAW:one-source-of-truth]
+        ends.entry(conversation_id)
+            .and_modify(|held| {
+                if matches!(ending, Ending::Reported(_)) {
+                    *held = ending;
+                }
+            })
+            .or_insert(ending);
+    }
 
     let mut matched: Vec<Conversation> = events
         .iter()
         .filter_map(|event| match event {
             ConversationEvent::Started(record) => Some(record),
-            ConversationEvent::Finished { .. } => None,
+            ConversationEvent::Finished { .. } | ConversationEvent::Abandoned { .. } => None,
         })
         .filter(|record| query.matches(record.happy_user.as_ref(), record.started_at_unix_secs))
         .map(|record| {
-            let (ended_at, status) = ends.get(&record.conversation_id).map_or(
-                (now_unix_secs, ConversationStatus::InProgress),
-                |ended| (*ended, ConversationStatus::Done),
-            );
+            let ending = ends
+                .get(&record.conversation_id)
+                .copied()
+                .unwrap_or(Ending::StillOpen(now_unix_secs));
 
             Conversation {
                 conversation_id: record.conversation_id.clone(),
                 agent_id: record.agent_id.clone(),
                 start_time_unix_secs: record.started_at_unix_secs,
-                call_duration_secs: duration_secs(record.started_at_unix_secs, ended_at, status),
-                status,
+                call_duration_secs: duration_secs(record.started_at_unix_secs, ending),
+                status: ending.status(),
             }
         })
         .collect();
@@ -127,17 +146,53 @@ pub fn conversations(
     ConversationPage { conversations: matched, has_more }
 }
 
+/// How a conversation stopped, as the log knows it.
+///
+/// Three states inside, two on the wire: whether an end was reported or inferred changes
+/// what this crate may credit, and does not change what a caller is told — the call is
+/// over either way, and [`ConversationStatus`] keeps the shape ElevenLabs' own list has.
+/// [LAW:types-are-the-program]
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    /// The SFU reported the room closed at this time. The only exact answer there is.
+    Reported(i64),
+    /// A sweep found the room gone at this time, having never been told when it went.
+    Abandoned(i64),
+    /// No end of any kind yet, measured against this "now".
+    StillOpen(i64),
+}
+
+impl Ending {
+    fn status(self) -> ConversationStatus {
+        match self {
+            // An abandoned call is over, and a caller asking what happened to it is owed
+            // that rather than the reason this crate had to work it out.
+            Self::Reported(_) | Self::Abandoned(_) => ConversationStatus::Done,
+            Self::StillOpen(_) => ConversationStatus::InProgress,
+        }
+    }
+}
+
 /// How long a call is credited with.
 ///
 /// Clamped at both ends. Clocks moving backwards would otherwise produce a negative
-/// duration that *subtracts* from a user's usage, and an unfinished conversation is
-/// capped so a lost webhook cannot accrue against a user forever.
-fn duration_secs(started_at: i64, ended_at: i64, status: ConversationStatus) -> i64 {
+/// duration that *subtracts* from a user's usage, and any call whose end was not reported
+/// is capped so a lost webhook cannot accrue against a user forever.
+///
+/// The cap applies to an abandoned call as much as to an open one, and for the reason it
+/// always did: between its start and the moment somebody noticed, this crate knows only
+/// that the call was somewhere inside. Crediting the whole span would let a webhook lost
+/// two weeks ago bill a fortnight; crediting nothing would make losing one the cheap way
+/// to talk for free. The cap is the same conservative answer to both, now frozen at the
+/// observation instead of growing with every query.
+fn duration_secs(started_at: i64, ending: Ending) -> i64 {
+    let (ended_at, exact) = match ending {
+        Ending::Reported(at) => (at, true),
+        Ending::Abandoned(at) | Ending::StillOpen(at) => (at, false),
+    };
+
     let elapsed = (ended_at - started_at).max(0);
-    match status {
-        ConversationStatus::Done => elapsed,
-        ConversationStatus::InProgress => elapsed.min(MAX_UNREPORTED_DURATION_SECS),
-    }
+    if exact { elapsed } else { elapsed.min(MAX_UNREPORTED_DURATION_SECS) }
 }
 
 impl UsageQuery {
@@ -175,6 +230,13 @@ mod tests {
         ConversationEvent::Finished {
             conversation_id: ConversationId::parse(id).unwrap(),
             ended_at_unix_secs: at,
+        }
+    }
+
+    fn abandoned(id: &str, at: i64) -> ConversationEvent {
+        ConversationEvent::Abandoned {
+            conversation_id: ConversationId::parse(id).unwrap(),
+            observed_at_unix_secs: at,
         }
     }
 
@@ -245,12 +307,62 @@ mod tests {
     }
 
     /// A lost `room_finished` webhook must not accrue against a user forever.
+    ///
+    /// Named for what it covers: a conversation with no ending event of any kind, still
+    /// reading as in progress. The swept case is below, and the two differ in what the
+    /// caller is told as well as in what they are charged.
     #[test]
-    fn an_abandoned_conversation_stops_accruing_at_the_cap() {
+    fn a_conversation_with_no_ending_stops_accruing_at_the_cap() {
         let events = vec![started("conv_aaa", Some("u_alice"), NOW - 400 * 86400)];
         let page = conversations(&events, &query(Some("u_alice"), None), NOW);
 
         assert_eq!(page.conversations[0].call_duration_secs, MAX_UNREPORTED_DURATION_SECS);
+        assert_eq!(page.conversations[0].status, ConversationStatus::InProgress);
+    }
+
+    /// What a sweep changes for the caller: the call reads as over, and its duration stops
+    /// at the moment somebody noticed rather than growing with every query.
+    #[test]
+    fn a_swept_conversation_is_done_and_frozen_at_the_observation() {
+        let events = vec![
+            started("conv_aaa", Some("u_alice"), NOW - 900),
+            abandoned("conv_aaa", NOW - 600),
+        ];
+
+        let page = conversations(&events, &query(Some("u_alice"), None), NOW);
+
+        assert_eq!(page.conversations[0].status, ConversationStatus::Done);
+        assert_eq!(page.conversations[0].call_duration_secs, 300);
+
+        // Asked again an hour later it is still 300s: an ending that was observed does not
+        // move, which is the whole difference from the case above.
+        let later = conversations(&events, &query(Some("u_alice"), None), NOW + 3600);
+        assert_eq!(later.conversations[0].call_duration_secs, 300);
+    }
+
+    /// An abandonment is this crate's guess that no measurement was coming; a
+    /// `room_finished` is the measurement. When the log holds both — a late delivery
+    /// landing either side of the sweep that gave up on it — the measurement wins, and it
+    /// wins from either position in the file. Order-dependence here would bill the same
+    /// pair of events differently depending on how a race fell.
+    #[test]
+    fn a_reported_ending_beats_a_sweeps_guess_from_either_side_of_it() {
+        let swept_first = vec![
+            started("conv_aaa", Some("u_alice"), NOW - 900),
+            abandoned("conv_aaa", NOW - 600),
+            finished("conv_aaa", NOW - 300),
+        ];
+        let reported_first = vec![
+            started("conv_aaa", Some("u_alice"), NOW - 900),
+            finished("conv_aaa", NOW - 300),
+            abandoned("conv_aaa", NOW - 600),
+        ];
+
+        for events in [swept_first, reported_first] {
+            let page = conversations(&events, &query(Some("u_alice"), None), NOW);
+            assert_eq!(page.conversations[0].call_duration_secs, 600);
+            assert_eq!(page.conversations[0].status, ConversationStatus::Done);
+        }
     }
 
     /// A backwards clock must never hand usage back to a user.

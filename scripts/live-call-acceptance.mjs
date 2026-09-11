@@ -1,6 +1,6 @@
 // Verifies one whole conversational turn, by being the human on the other end.
 //
-//   OPENCONV_API_KEY=... node scripts/live-call-acceptance.mjs [openconv-url] [livekit-ws-url]
+//   [OPENCONV_API_KEY=...] node scripts/live-call-acceptance.mjs [openconv-url] [livekit-ws-url]
 //
 // Needs @livekit/rtc-node and macOS `say`:
 //

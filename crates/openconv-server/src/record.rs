@@ -87,6 +87,22 @@ pub enum ConversationEvent {
         conversation_id: ConversationId,
         ended_at_unix_secs: i64,
     },
+    /// Written when a sweep finds the room gone with no end ever reported for it.
+    ///
+    /// A distinct fact from [`Self::Finished`], and distinct in the one way that matters:
+    /// it says the call is over and does *not* say when it ended. Writing it as a
+    /// `Finished` at the moment of the sweep would put a duration in the log that nobody
+    /// measured — a number with the exact shape of an observation, standing in for the
+    /// absence of one. [LAW:no-silent-failure]
+    ///
+    /// Its existence is what makes a lost `room_finished` recoverable rather than
+    /// permanent: without it the conversation reads as in progress forever, accruing
+    /// against its caller until the cap and never past it.
+    Abandoned {
+        conversation_id: ConversationId,
+        /// When the sweep noticed. Not when the call ended, which is unknowable by then.
+        observed_at_unix_secs: i64,
+    },
 }
 
 impl ConversationEvent {
@@ -95,6 +111,7 @@ impl ConversationEvent {
         match self {
             Self::Started(record) => &record.conversation_id,
             Self::Finished { conversation_id, .. } => conversation_id,
+            Self::Abandoned { conversation_id, .. } => conversation_id,
         }
     }
 }
@@ -139,6 +156,58 @@ mod tests {
     fn a_record_round_trips_through_json() {
         let json = serde_json::to_string(&sample()).unwrap();
         assert_eq!(serde_json::from_str::<ConversationRecord>(&json).unwrap(), sample());
+    }
+
+    /// Every event kind is read back off disk by a later process — `usage::conversations`
+    /// and `reconcile::abandoned` both fold the whole log — so the tag and field names are
+    /// a format, not an internal detail. A rename that compiles would silently stop
+    /// matching lines already written, and the conversations they closed would reopen.
+    #[test]
+    fn every_event_kind_round_trips_through_json() {
+        let events = [
+            ConversationEvent::Started(sample()),
+            ConversationEvent::Finished {
+                conversation_id: sample().conversation_id,
+                ended_at_unix_secs: 1_700_000_600,
+            },
+            ConversationEvent::Abandoned {
+                conversation_id: sample().conversation_id,
+                observed_at_unix_secs: 1_700_000_900,
+            },
+        ];
+
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ConversationEvent>(&json).unwrap(),
+                event,
+                "{json}",
+            );
+        }
+    }
+
+    /// The tags themselves, named rather than round-tripped: the assertion above passes
+    /// just as happily if every tag is renamed in step, and the lines already on disk in
+    /// the homelab say `started`, `finished` and `abandoned`.
+    #[test]
+    fn the_event_tags_are_the_ones_already_written_to_disk() {
+        let tag = |event: &ConversationEvent| serde_json::to_value(event).unwrap()["event"].clone();
+
+        assert_eq!(tag(&ConversationEvent::Started(sample())), "started");
+        assert_eq!(
+            tag(&ConversationEvent::Finished {
+                conversation_id: sample().conversation_id,
+                ended_at_unix_secs: 1,
+            }),
+            "finished",
+        );
+        assert_eq!(
+            tag(&ConversationEvent::Abandoned {
+                conversation_id: sample().conversation_id,
+                observed_at_unix_secs: 1,
+            }),
+            "abandoned",
+        );
     }
 
     #[test]

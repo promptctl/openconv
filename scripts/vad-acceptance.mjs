@@ -1,6 +1,6 @@
 // Verifies what voice activity detection is for, by being the human on the other end.
 //
-//   OPENCONV_API_KEY=... node scripts/vad-acceptance.mjs [openconv-url] [livekit-ws-url]
+//   [OPENCONV_API_KEY=...] node scripts/vad-acceptance.mjs [openconv-url] [livekit-ws-url]
 //
 // Needs @livekit/rtc-node and macOS `say`:
 //

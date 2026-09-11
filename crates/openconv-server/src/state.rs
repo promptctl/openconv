@@ -31,7 +31,7 @@ pub struct AppState {
     ///
     /// [`Synthesizer`]: openconv_agent::speak::Synthesizer
     pub tts: Arc<Tts>,
-    pub xi_api_key: XiApiKey,
+    pub api_key: Option<XiApiKey>,
 }
 
 impl AppState {
@@ -51,7 +51,7 @@ impl AppState {
                 &config.livekit_api_key,
                 &config.livekit_api_secret,
             )),
-            xi_api_key: config.xi_api_key.clone(),
+            api_key: config.api_key.clone(),
         }
     }
 }

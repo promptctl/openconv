@@ -1,6 +1,6 @@
 // Verifies that the agent can drive the app, by being the app on the other end.
 //
-//   OPENCONV_API_KEY=... node scripts/tools-acceptance.mjs [openconv-url] [livekit-ws-url]
+//   [OPENCONV_API_KEY=...] node scripts/tools-acceptance.mjs [openconv-url] [livekit-ws-url]
 //
 // Needs @livekit/rtc-node and macOS `say`:
 //

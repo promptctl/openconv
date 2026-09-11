@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { NotTold, conversationInitiation, conversationWith, isAgent } from "./conversation.js";
+import { NotTold, callerHeaders, conversationInitiation, conversationWith, isAgent } from "./conversation.js";
 
 /** A transport that records what was published rather than reaching an SFU. */
 const transportOf = (identities, publishBytes) => {
@@ -446,4 +446,19 @@ test("the agent is recognised by the identity openconv actually mints", () => {
   // would disagree about the same room. `crates/openconv-server/src/livekit.rs` mints it.
   assert.ok(isAgent("agent_conv_01J8"));
   assert.ok(!isAgent("u_browser"));
+});
+
+// The one rendering of the credential every client shares. Its whole reason to exist is
+// that the obvious one-liner is wrong in a way that reads as a server fault: an
+// `xi-api-key` header holding "undefined" or "null" is a credential nobody configured
+// being presented to a deployment that may well check it.
+test("a configured key is sent as the header the deployment reads", () => {
+  assert.deepEqual(callerHeaders("sk-abc"), { "xi-api-key": "sk-abc" });
+});
+
+test("no key sends no header at all, rather than a header saying nothing", () => {
+  for (const absent of [null, undefined, ""]) {
+    assert.deepEqual(callerHeaders(absent), {}, `${absent}`);
+    assert.ok(!("xi-api-key" in callerHeaders(absent)), `${absent}`);
+  }
 });

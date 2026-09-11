@@ -1,6 +1,6 @@
 // Checks the usage endpoint against the contract Happy's gating depends on.
 //
-//   OPENCONV_API_KEY=... LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
+//   [OPENCONV_API_KEY=...] LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \
 //     node scripts/conversations-acceptance.mjs [openconv-url]
 //
 // Runs a whole conversation lifecycle: mint a token (which creates a real room on the
@@ -14,20 +14,18 @@
 
 import { createHmac, createHash, randomUUID } from "node:crypto";
 
+import { callerHeaders } from "../web/conversation.js";
+import { livekitCredentials } from "./lib/livekit.mjs";
+
 const b64url = (buf) =>
   Buffer.from(buf).toString("base64").replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 
 function readConfig(env, argv) {
-  const missing = ["OPENCONV_API_KEY", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"].filter(
-    (name) => !env[name],
-  );
-  if (missing.length > 0) {
-    throw new Error(`missing ${missing.join(", ")} — the LiveKit pair lives in Vault at secret/livekit`);
-  }
   return {
-    xiApiKey: env.OPENCONV_API_KEY,
-    apiKey: env.LIVEKIT_API_KEY,
-    apiSecret: env.LIVEKIT_API_SECRET,
+    ...livekitCredentials(env),
+    // Absent against a deployment that asks callers for no credential, which is the
+    // default; `token-endpoint-acceptance` is where that posture itself is checked.
+    xiApiKey: env.OPENCONV_API_KEY ?? null,
     openconv: (argv[2] ?? "http://127.0.0.1:8080").replace(/\/$/, ""),
   };
 }
@@ -64,7 +62,7 @@ function signWebhook(body) {
 async function mint(userId) {
   const response = await fetch(
     `${config.openconv}/v1/convai/conversation/token?agent_id=agent_happy&participant_name=${userId}`,
-    { headers: { "xi-api-key": config.xiApiKey } },
+    { headers: callerHeaders(config.xiApiKey) },
   );
   if (!response.ok) throw new Error(`mint failed: HTTP ${response.status} ${await response.text()}`);
   const { token } = await response.json();
@@ -89,7 +87,7 @@ async function endConversation(room, endedAt, auth = null) {
 
 async function usage(query) {
   const response = await fetch(`${config.openconv}/v1/convai/conversations?${query}`, {
-    headers: { "xi-api-key": config.xiApiKey },
+    headers: callerHeaders(config.xiApiKey),
   });
   if (!response.ok) return { status: response.status, conversations: [] };
   return { status: response.status, ...(await response.json()) };

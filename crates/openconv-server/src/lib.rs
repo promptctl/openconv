@@ -20,6 +20,7 @@ pub mod app;
 pub mod config;
 pub mod conversation;
 pub mod livekit;
+pub mod reconcile;
 pub mod record;
 pub mod state;
 pub mod store;
