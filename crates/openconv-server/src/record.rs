@@ -195,6 +195,13 @@ mod tests {
 
         assert_eq!(tag(&ConversationEvent::Started(sample())), "started");
         assert_eq!(
+            tag(&ConversationEvent::Finished {
+                conversation_id: sample().conversation_id,
+                ended_at_unix_secs: 1,
+            }),
+            "finished",
+        );
+        assert_eq!(
             tag(&ConversationEvent::Abandoned {
                 conversation_id: sample().conversation_id,
                 observed_at_unix_secs: 1,
