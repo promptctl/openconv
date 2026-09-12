@@ -171,6 +171,19 @@ export class Call {
     // Listeners are attached before connecting: a track can be subscribed and a control
     // event delivered during `connect`, and a handler registered afterwards waits for
     // events that have already fired — which reads as an agent that never spoke.
+    // What every way of ending a call has in common: nobody is in a room this page is no
+    // longer in. Stated rather than read back from the room, because the roster is the one
+    // thing a torn-down room is not a reliable witness to, and a page that has hung up owns
+    // this fact without asking. [LAW:one-source-of-truth]
+    //
+    // Three ways to end and one sentence between them: the join that failed partway, the
+    // caller who pressed leave, and the connection that dropped on its own. The last is why
+    // this is also a listener — it is the ending the page did not cause, and the one the
+    // `room` cell already learns about from `ConnectionStateChanged` while the agent cell,
+    // until now, did not. [LAW:no-silent-failure]
+    const roomEnded = () => onRoster([]);
+    room.on(RoomEvent.Disconnected, roomEnded);
+
     room.on(RoomEvent.DataReceived, (payload) => onEvent(decodeEvent(payload)));
     room.on(RoomEvent.ConnectionStateChanged, onState);
     room.on(RoomEvent.ParticipantConnected, reportPresence);
@@ -219,7 +232,7 @@ export class Call {
       // whose audio is muted is still a call, and the page says which it got.
       const audible = await room.startAudio().then(() => room.canPlaybackAudio, () => false);
 
-      return new Call(room, microphone, conversationId, audible, conversation);
+      return new Call(room, microphone, conversationId, audible, conversation, roomEnded);
     } catch (error) {
       // The room and the microphone are both live by now on some paths and not others,
       // and a page left holding either one has an open capture light and a participant
@@ -237,18 +250,18 @@ export class Call {
       );
 
       // `open` may have reported an agent present before a later step failed, and that row
-      // would sit there describing a call that no longer exists. Said here rather than left
-      // to a `ParticipantDisconnected` that teardown may or may not emit for a participant
-      // it is dropping — a cell this page draws should not depend on which.
-      onRoster([]);
+      // would otherwise sit there describing a call that no longer exists.
+      roomEnded();
 
       throw new Error(`${error.message}${alsoFailed}`, { cause: error });
     }
   }
 
-  constructor(room, microphone, conversationId, audible, conversation) {
+  constructor(room, microphone, conversationId, audible, conversation, roomEnded) {
     this.room = room;
     this.microphone = microphone;
+    /** Says the room is empty, for the hang-up this object is the only one that can see. */
+    this.roomEnded = roomEnded;
     /** What the server logs this call under, so a call on screen can be found in a log. */
     this.conversationId = conversationId;
     /**
@@ -285,6 +298,7 @@ export class Call {
   async leave() {
     this.microphone.stop();
     await this.room.disconnect();
+    this.roomEnded();
   }
 }
 
