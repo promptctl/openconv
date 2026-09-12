@@ -337,6 +337,12 @@ fn reached<E: Unreached>(name: &'static str, outcome: Result<(), E>) -> Stage {
 /// unwell — and answering 5xx would fail the page's own fetch and draw nothing at all,
 /// which is the silence this exists to end. [LAW:no-silent-failure]
 ///
+/// Unauthenticated like the routes beside it, and it reaches two upstreams per hit rather
+/// than reading state this process holds. Uncached on purpose: a readout answering from a
+/// few seconds ago states a past fact as a present one, which is the failure it exists to
+/// refuse. What bounds the load is the deployment rather than this code — nothing here is
+/// exposed to the internet, so its callers are tailnet peers and the page's one per load.
+///
 /// What it does *not* prove: that speech comes out. `voices` is a listing, served from a
 /// different path than the `/v1/text-to-speech/{voice}/stream` a conversation runs on, so
 /// a router answering its listing while the engine behind it refuses every synthesis

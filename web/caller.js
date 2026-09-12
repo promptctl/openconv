@@ -235,6 +235,13 @@ export class Call {
         () => "",
         (failure) => ` (the room also failed to disconnect: ${failure.message})`,
       );
+
+      // `open` may have reported an agent present before a later step failed, and that row
+      // would sit there describing a call that no longer exists. Said here rather than left
+      // to a `ParticipantDisconnected` that teardown may or may not emit for a participant
+      // it is dropping — a cell this page draws should not depend on which.
+      onRoster([]);
+
       throw new Error(`${error.message}${alsoFailed}`, { cause: error });
     }
   }
