@@ -117,6 +117,7 @@ export class Call {
     onTrack,
     onState,
     onPresence,
+    onRoster,
   }) {
     const microphone = await createLocalAudioTrack();
     const room = new Room();
@@ -145,6 +146,19 @@ export class Call {
       }
       reported = present;
 
+      // Who is in the room *now*, reported on every sweep including the one that found
+      // nothing new. The rows above are a diff and cannot state an absence: an agent that
+      // never arrives produces no row, so a caller watching for one cannot tell a room
+      // with nobody in it from a room it forgot to look at. So it is reported as a fact
+      // rather than left to be inferred from the lack of one, which is the difference
+      // between a page that says nothing arrived and a page that says nothing.
+      // [LAW:no-silent-failure]
+      //
+      // The roster itself rather than a verdict about it: which identities count as agents
+      // is `conversation.js`'s answer to give, and deciding it here would be a second one.
+      // [LAW:one-source-of-truth]
+      onRoster([...present]);
+
       // Every agent that just arrived is told what this conversation is, off the shared
       // module's own diff rather than off this one — the rows above are about everybody
       // in the room and that is about the agents, two questions the same roster answers.
@@ -157,6 +171,20 @@ export class Call {
     // Listeners are attached before connecting: a track can be subscribed and a control
     // event delivered during `connect`, and a handler registered afterwards waits for
     // events that have already fired — which reads as an agent that never spoke.
+    // What every way of ending a call has in common: nobody is in a room this page is no
+    // longer in. Stated rather than read back, because teardown empties the roster without
+    // emitting a `ParticipantDisconnected` for anyone standing in it — so the diff above
+    // never sees the last participant leave, and the cell would keep its final value for a
+    // call that has ended. [LAW:no-silent-failure]
+    //
+    // A listener, because `disconnect()` emits this for the caller who pressed leave and
+    // for the connection that dropped on its own alike, so both endings arrive here without
+    // either site having to remember. The ending it does not cover is a join that failed
+    // before the room ever connected: `disconnect()` on a room already in that state
+    // returns early and emits nothing, which is why the catch below says it outright.
+    const roomEnded = () => onRoster([]);
+    room.on(RoomEvent.Disconnected, roomEnded);
+
     room.on(RoomEvent.DataReceived, (payload) => onEvent(decodeEvent(payload)));
     room.on(RoomEvent.ConnectionStateChanged, onState);
     room.on(RoomEvent.ParticipantConnected, reportPresence);
@@ -213,14 +241,19 @@ export class Call {
       microphone.stop();
 
       // A disconnect that fails while cleaning up must not become the story — "mint
-      // failed: HTTP 401" is the useful sentence, not something about a socket, and a
-      // room that never connected rejects here rather than being inert. So its outcome
-      // is a value, empty when it worked, appended to the cause that actually brought
-      // us here. Neither failure is dropped and neither hides the other.
+      // failed: HTTP 401" is the useful sentence, not something about a socket. So its
+      // outcome is a value, empty when it worked, appended to the cause that actually
+      // brought us here. Neither failure is dropped and neither hides the other.
       const alsoFailed = await room.disconnect().then(
         () => "",
         (failure) => ` (the room also failed to disconnect: ${failure.message})`,
       );
+
+      // `open` may have reported an agent present before a later step failed, and that row
+      // would otherwise sit there describing a call that no longer exists. Said here rather
+      // than left to the listener, which a room that never connected does not reach.
+      roomEnded();
+
       throw new Error(`${error.message}${alsoFailed}`, { cause: error });
     }
   }
