@@ -310,7 +310,7 @@ async function offerLanguages(wanted) {
  */
 const STAGE = {
   reachable: () => "reachable",
-  unreachable: ({ because }) => `UNREACHABLE — ${because}`,
+  unreachable: (stage) => `UNREACHABLE — ${stage.because}`,
 };
 
 /**

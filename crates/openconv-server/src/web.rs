@@ -229,6 +229,12 @@ struct SpeechPath {
 /// The stages are instances of one type rather than a field each, so the page draws
 /// whatever it is sent and a stage added here needs no page change to appear.
 /// [LAW:one-type-per-behavior]
+///
+/// `name` is also the cell the page draws it into, and the page names cells of its own —
+/// `agent`, `room`, `call`, `audio`, `hearing`, `voice`. A stage taking one of those would
+/// give that cell two writers and show whichever wrote last, so a new stage gets a name
+/// none of them uses. `agent` is the trap worth naming: it is the obvious third stage and
+/// the page already draws it from the room's roster. [LAW:one-source-of-truth]
 #[derive(Debug, Serialize)]
 struct Stage {
     name: &'static str,
@@ -283,7 +289,10 @@ impl Unreached for TtsError {
 impl Unreached for LiveKitError {
     fn because(&self) -> &'static str {
         match self {
-            Self::ListRooms(_) => "the SFU did not answer",
+            // Not "did not answer": this variant also carries an SFU that answered
+            // promptly with 401 on a rotated credential, and sending a reader to check
+            // whether a healthy SFU is up is the wrong errand.
+            Self::ListRooms(_) => "the SFU would not say which rooms are open",
             Self::CreateRoom(_) => "the SFU refused to open a room",
             Self::MintToken(_) => "this deployment could not sign a token for the SFU",
             Self::Metadata(_) => "this deployment could not describe a conversation to the SFU",
@@ -313,10 +322,10 @@ fn reached<E: Unreached>(name: &'static str, outcome: Result<(), E>) -> Stage {
 
 /// Whether this deployment can currently reach what a conversation needs.
 ///
-/// Probed with the very calls a conversation makes — the voice listing every caller's
+/// Probed with calls this deployment already makes — the voice listing every caller's
 /// dropdown is built from, and the room listing [`crate::reconcile`] trusts — rather than
-/// with a ping written for this route. A reachability check that exercises a different
-/// path than the conversation does is free to be green while every call is silent.
+/// with a ping written for this route, so a green stage is a fact about the real client,
+/// address and credential rather than about a code path only this handler runs.
 /// [LAW:one-source-of-truth]
 ///
 /// Both are asked, always, and neither can cut the other short: a dead text-to-speech
@@ -328,10 +337,16 @@ fn reached<E: Unreached>(name: &'static str, outcome: Result<(), E>) -> Stage {
 /// unwell — and answering 5xx would fail the page's own fetch and draw nothing at all,
 /// which is the silence this exists to end. [LAW:no-silent-failure]
 ///
-/// What it does *not* prove: that a browser can reach the SFU. This deployment dials
-/// [`LiveKit::signaling_url`] and hands the page [`LiveKit::public_signaling_url`], which
-/// a homelab deliberately makes different addresses — so a reachable SFU here and a
-/// browser that cannot join are compatible readings, and that gap is `.15`'s to close.
+/// What it does *not* prove: that speech comes out. `voices` is a listing, served from a
+/// different path than the `/v1/text-to-speech/{voice}/stream` a conversation runs on, so
+/// a router answering its listing while the engine behind it refuses every synthesis
+/// reads green here. This narrows the causes of silence; it does not exhaust them, and a
+/// green strip beside a silent call means the fault is past where this can see.
+///
+/// Nor that a browser can reach the SFU. This deployment dials [`LiveKit::signaling_url`]
+/// and hands the page [`LiveKit::public_signaling_url`], which a homelab deliberately
+/// makes different addresses — so a reachable SFU here and a browser that cannot join are
+/// compatible readings, and that gap is `.15`'s to close.
 ///
 /// [`LiveKit::signaling_url`]: crate::livekit::LiveKit::signaling_url
 /// [`LiveKit::public_signaling_url`]: crate::livekit::LiveKit::public_signaling_url
@@ -349,6 +364,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use livekit_api::access_token::AccessTokenError;
+    use livekit_api::services::ServiceError;
     use openconv_protocol::*;
 
     /// Every relative path one file of the page names, as a browser would resolve them
@@ -504,6 +521,19 @@ mod tests {
         ]
     }
 
+    /// Every `LiveKitError`, the other half of what a stage can be.
+    ///
+    /// No secret beside each one, unlike [`carried`]: these never reach a body, and what
+    /// is being held to a bar here is the sentence this file gives them.
+    fn refused() -> [LiveKitError; 4] {
+        [
+            LiveKitError::ListRooms(ServiceError::Env(std::env::VarError::NotPresent)),
+            LiveKitError::CreateRoom(ServiceError::Env(std::env::VarError::NotPresent)),
+            LiveKitError::MintToken(AccessTokenError::InvalidKeys),
+            LiveKitError::Metadata(serde_json::from_str::<i32>("{").expect_err("not a number")),
+        ]
+    }
+
     /// The readout is unauthenticated, so a stage that failed must name the stage and
     /// nothing else about the far side.
     ///
@@ -529,16 +559,24 @@ mod tests {
     /// whether to restart something or go and look at it.
     ///
     /// Collapsing these onto one sentence would leave every assertion above passing while
-    /// the page went back to reporting one symptom for four causes — which is the whole of
+    /// the page went back to reporting one symptom for many causes — which is the whole of
     /// what this ticket exists to end.
+    ///
+    /// Both impls, because a sentence is only unique against the ones it shares a readout
+    /// with, and only `ListRooms` of the SFU's four ever reaches a screen — so the other
+    /// three could be given each other's words with nothing on the page to contradict it.
     #[test]
     fn each_way_a_stage_can_fail_reads_differently() {
-        let mut said: Vec<&str> = carried().iter().map(|(error, _)| error.because()).collect();
+        let mut said: Vec<&str> = carried()
+            .iter()
+            .map(|(error, _)| error.because())
+            .chain(refused().iter().map(|error| error.because()))
+            .collect();
         said.sort_unstable();
-        let distinct = said.len();
+        let total = said.len();
         said.dedup();
 
-        assert_eq!(said.len(), distinct, "two ways of failing report the same sentence");
+        assert_eq!(said.len(), total, "two ways of failing report the same sentence");
         assert!(said.iter().all(|because| !because.is_empty()), "a failure with no account");
     }
 
@@ -550,6 +588,27 @@ mod tests {
             .expect("serializes");
 
         assert_eq!(body, serde_json::json!({"name": "sfu", "reach": "reachable"}));
+    }
+
+    /// Whether the page reads `name` written as `syntax`, where `{}` stands for the name.
+    ///
+    /// Bare containment is not a guard, because most short names are already somewhere in
+    /// a 500-line file: `ok` is inside `response.ok`, `stage` inside `for (const stage of`,
+    /// and `name` and `status` are everywhere. Nor is it enough to demand the surrounding
+    /// syntax, since one name can sit inside another wearing it — `.stage` inside
+    /// `.stages`, `reachable:` inside `unreachable:`. So each syntax delimits one end of
+    /// the name and this checks the other, which is the end a longer name would run past.
+    fn read_as(page: &str, syntax: &str, name: &str) -> bool {
+        let needle = syntax.replace("{}", name);
+        let extends = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+
+        page.match_indices(&needle).any(|(at, _)| {
+            if syntax.ends_with("{}") {
+                !page[at + needle.len()..].chars().next().is_some_and(extends)
+            } else {
+                !page[..at].chars().next_back().is_some_and(extends)
+            }
+        })
     }
 
     /// The page reads this body by field name, and a rename does not fail — it renders
@@ -579,23 +638,28 @@ mod tests {
             .expect("the page has no module that reads this")
             .body;
 
-        // Every field name, plus every word a stage's `reach` can be. Those words are as
-        // much of the contract as the names are, because the page keys its rendering on
-        // them — where a stage's `name` and its `because` are printed verbatim by a page
-        // that never knows what they say, and so are the server's alone to word.
-        let mut named: Vec<String> = body.keys().cloned().collect();
+        // Searched for in the syntax that actually reads them: a field as `.field`, and a
+        // `reach` word as the `word:` that keys the page's table.
+        let mut wanted: Vec<(&'static str, String)> =
+            body.keys().map(|field| (".{}", field.clone())).collect();
         for stage in body["stages"].as_array().expect("stages is a list") {
             let stage = stage.as_object().expect("a stage is an object");
-            named.extend(stage.keys().cloned());
-            named.push(stage["reach"].as_str().expect("a stage with no reach").to_owned());
+            wanted.extend(stage.keys().map(|field| (".{}", field.clone())));
+            wanted.push((
+                "{}:",
+                stage["reach"].as_str().expect("a stage with no reach").to_owned(),
+            ));
         }
 
         // Otherwise a serialization that produced nothing would pass by having nothing to
         // check, which is the shape of failure this whole route exists to refuse.
-        assert!(named.len() > 4, "the readout named almost nothing: {named:?}");
+        assert!(wanted.len() > 4, "the readout named almost nothing: {wanted:?}");
 
-        for name in named {
-            assert!(page.contains(&name), "this route sends {name:?}, which the page never reads");
+        for (syntax, name) in wanted {
+            assert!(
+                read_as(page, syntax, &name),
+                "this route sends {name:?}, which the page never reads as {syntax:?}"
+            );
         }
     }
 
