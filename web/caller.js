@@ -117,6 +117,7 @@ export class Call {
     onTrack,
     onState,
     onPresence,
+    onRoster,
   }) {
     const microphone = await createLocalAudioTrack();
     const room = new Room();
@@ -144,6 +145,19 @@ export class Call {
         onPresence(identity, "left");
       }
       reported = present;
+
+      // Who is in the room *now*, reported on every sweep including the one that found
+      // nothing new. The rows above are a diff and cannot state an absence: an agent that
+      // never arrives produces no row, so a caller watching for one cannot tell a room
+      // with nobody in it from a room it forgot to look at. So it is reported as a fact
+      // rather than left to be inferred from the lack of one, which is the difference
+      // between a page that says nothing arrived and a page that says nothing.
+      // [LAW:no-silent-failure]
+      //
+      // The roster itself rather than a verdict about it: which identities count as agents
+      // is `conversation.js`'s answer to give, and deciding it here would be a second one.
+      // [LAW:one-source-of-truth]
+      onRoster([...present]);
 
       // Every agent that just arrived is told what this conversation is, off the shared
       // module's own diff rather than off this one — the rows above are about everybody

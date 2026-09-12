@@ -18,6 +18,7 @@
 //! serving that to a browser produced a `ws://` URL on an `https://` page that browsers
 //! refuse as mixed content, reported only as a transport error naming nothing.
 
+use crate::livekit::LiveKitError;
 use crate::state::AppState;
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
@@ -95,7 +96,7 @@ const ASSETS: &[Asset] = &[
 /// tests, beside the [`router`] whose `route` calls it mirrors, because two lines apart
 /// is the only distance at which the mirror is checked by anyone reading either.
 #[cfg(test)]
-const ENDPOINTS: &[&str] = &["config", "voices"];
+const ENDPOINTS: &[&str] = &["config", "voices", "health"];
 
 pub fn router() -> Router<AppState> {
     let assets = ASSETS.iter().fold(Router::new(), |router, asset| {
@@ -112,6 +113,7 @@ pub fn router() -> Router<AppState> {
         .route("/call", get(|| async { Redirect::permanent(MOUNT) }))
         .route("/call/config", get(config))
         .route("/call/voices", get(voices))
+        .route("/call/health", get(health))
 }
 
 /// What the page cannot know without being told.
@@ -200,6 +202,148 @@ impl IntoResponse for NoVoices {
         let said = "the text-to-speech server did not answer with a voice listing";
         (StatusCode::BAD_GATEWAY, said).into_response()
     }
+}
+
+/// What the caller cannot reach, named — so that silence on a call stops being one
+/// symptom with four causes.
+///
+/// A dead text-to-speech server, an SFU this deployment cannot talk to, an agent that
+/// never arrived and a microphone that never opened all present to a caller as the same
+/// nothing, and telling them apart has meant a shell on the cluster. This is the half of
+/// that a server can answer about itself. [LAW:no-silent-failure]
+///
+/// A route of its own for the reason [`voices`] is one: it crosses the network, and a
+/// readout answered beside [`config`] would take the SFU address down with it and leave
+/// nobody able to join at all — losing the whole call over the part of it that reports on
+/// calls. [LAW:decomposition]
+///
+/// Distinct from `/health`, which answers whether this process is up. A process can be
+/// perfectly up and unable to speak, and that gap is exactly what this names.
+#[derive(Debug, Serialize)]
+struct SpeechPath {
+    stages: Vec<Stage>,
+}
+
+/// One dependency a conversation runs through, and whether this deployment reached it.
+///
+/// The stages are instances of one type rather than a field each, so the page draws
+/// whatever it is sent and a stage added here needs no page change to appear.
+/// [LAW:one-type-per-behavior]
+#[derive(Debug, Serialize)]
+struct Stage {
+    name: &'static str,
+    #[serde(flatten)]
+    reach: Reach,
+}
+
+/// Whether a stage answered.
+///
+/// A union rather than a bool beside an optional reason, which would admit both states
+/// that mean nothing — reached with a complaint, unreached with no account of itself.
+/// [LAW:types-are-the-program]
+#[derive(Debug, Serialize)]
+#[serde(tag = "reach", rename_all = "snake_case")]
+enum Reach {
+    Reachable,
+    Unreachable {
+        /// Why, in words chosen here rather than carried off the failure.
+        ///
+        /// `&'static str` and not `String`, and that is the whole guarantee: this body
+        /// goes to an unauthenticated caller, upstream errors carry bearer tokens, LAN
+        /// addresses and paths off this filesystem, and a literal cannot hold any of
+        /// them. The leak is unrepresentable rather than guarded against — the same
+        /// split [`NoVoices`] makes, made by the type this time.
+        /// [LAW:types-are-the-program]
+        because: &'static str,
+    },
+}
+
+/// A failure that has a public account of itself, separate from the one an operator needs.
+///
+/// One trait rather than a rendering per stage, so [`reached`] is a single function over
+/// every upstream this route probes. [LAW:one-type-per-behavior]
+trait Unreached: std::error::Error {
+    fn because(&self) -> &'static str;
+}
+
+/// Matched exhaustively, with no catch-all arm: a variant added to [`TtsError`] should
+/// stop the build here and be given its own sentence, rather than be absorbed into the
+/// nearest one and reported as a fault it is not.
+impl Unreached for TtsError {
+    fn because(&self) -> &'static str {
+        match self {
+            Self::Unreachable(_) => "the text-to-speech server did not answer",
+            Self::Refused { .. } => "the text-to-speech server refused the request",
+            Self::Undecodable(_) => "the text-to-speech server answered with something that is not audio",
+            Self::Unreadable(_) => "the text-to-speech server's voice listing could not be read",
+        }
+    }
+}
+
+impl Unreached for LiveKitError {
+    fn because(&self) -> &'static str {
+        match self {
+            Self::ListRooms(_) => "the SFU did not answer",
+            Self::CreateRoom(_) => "the SFU refused to open a room",
+            Self::MintToken(_) => "this deployment could not sign a token for the SFU",
+            Self::Metadata(_) => "this deployment could not describe a conversation to the SFU",
+        }
+    }
+}
+
+/// One stage's outcome, told twice: in full to whoever can act on it, and in this file's
+/// own words to the page.
+///
+/// The single place that split is made, so a stage added here cannot be the one that
+/// reports an upstream's `Display` to an unauthenticated caller by having been written
+/// slightly differently. [LAW:single-enforcer]
+fn reached<E: Unreached>(name: &'static str, outcome: Result<(), E>) -> Stage {
+    let reach = match outcome {
+        Ok(()) => Reach::Reachable,
+        Err(error) => {
+            // The detail goes where an operator will find it, which is the only place it
+            // can go: the body below is read by a caller who presented no credential.
+            tracing::error!(stage = name, error = %error, "a stage of the speech path did not answer");
+            Reach::Unreachable { because: error.because() }
+        }
+    };
+
+    Stage { name, reach }
+}
+
+/// Whether this deployment can currently reach what a conversation needs.
+///
+/// Probed with the very calls a conversation makes — the voice listing every caller's
+/// dropdown is built from, and the room listing [`crate::reconcile`] trusts — rather than
+/// with a ping written for this route. A reachability check that exercises a different
+/// path than the conversation does is free to be green while every call is silent.
+/// [LAW:one-source-of-truth]
+///
+/// Both are asked, always, and neither can cut the other short: a dead text-to-speech
+/// server that stopped this from reporting on the SFU would be this ticket's own bug
+/// wearing a new shape. [LAW:dataflow-not-control-flow] Concurrently because they are
+/// independent, and a caller looking at this page is waiting on it.
+///
+/// 200 whatever the stages say. The readout succeeded — it is the subject that is
+/// unwell — and answering 5xx would fail the page's own fetch and draw nothing at all,
+/// which is the silence this exists to end. [LAW:no-silent-failure]
+///
+/// What it does *not* prove: that a browser can reach the SFU. This deployment dials
+/// [`LiveKit::signaling_url`] and hands the page [`LiveKit::public_signaling_url`], which
+/// a homelab deliberately makes different addresses — so a reachable SFU here and a
+/// browser that cannot join are compatible readings, and that gap is `.15`'s to close.
+///
+/// [`LiveKit::signaling_url`]: crate::livekit::LiveKit::signaling_url
+/// [`LiveKit::public_signaling_url`]: crate::livekit::LiveKit::public_signaling_url
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let (voices, rooms) = tokio::join!(state.tts.voices(), state.livekit.live_rooms());
+
+    Json(SpeechPath {
+        stages: vec![
+            reached("sfu", rooms.map(drop)),
+            reached("text-to-speech", voices.map(drop)),
+        ],
+    })
 }
 
 #[cfg(test)]
@@ -346,6 +490,115 @@ mod tests {
         }
     }
 
+    /// Every `TtsError`, as a stage of the readout, beside the secret it carries.
+    ///
+    /// The same fixtures the 502 leak test uses, because the exposure is the same one: an
+    /// unauthenticated caller, and errors whose `Display` names a LAN address, a bearer
+    /// token and a path off this filesystem.
+    fn carried() -> [(TtsError, &'static str); 4] {
+        [
+            (TtsError::Unreachable("http://10.4.0.7:20977/v1/voices".to_owned()), "10.4.0.7"),
+            (TtsError::Refused { status: 401, body: "bad token sk-abcdef".to_owned() }, "sk-abcdef"),
+            (TtsError::Undecodable("/srv/openconv/voices/heart.onnx".to_owned()), "heart.onnx"),
+            (TtsError::Unreadable("missing `voices` at line 3".to_owned()), "line 3"),
+        ]
+    }
+
+    /// The readout is unauthenticated, so a stage that failed must name the stage and
+    /// nothing else about the far side.
+    ///
+    /// Asserted against the serialized body rather than against `because` alone: what
+    /// reaches the caller is the JSON, and a later field carrying the error would pass a
+    /// check that only ever read the one field known to be safe.
+    #[test]
+    fn an_unreachable_stage_tells_the_caller_nothing_about_why() {
+        for (error, secret) in carried() {
+            // The fixture has to still carry the secret for this to be proving anything.
+            assert!(error.to_string().contains(secret), "the fixture stopped carrying {secret:?}");
+
+            let stage = reached("text-to-speech", Err(error));
+            let body = serde_json::to_string(&stage).expect("serializes");
+
+            assert!(!body.contains(secret), "the readout leaked {secret:?}: {body}");
+            assert!(body.contains("text-to-speech"), "the readout does not name the stage: {body}");
+            assert!(body.contains("unreachable"), "a stage that failed does not say so: {body}");
+        }
+    }
+
+    /// The point of naming a stage is naming *which* fault it has, so a reader knows
+    /// whether to restart something or go and look at it.
+    ///
+    /// Collapsing these onto one sentence would leave every assertion above passing while
+    /// the page went back to reporting one symptom for four causes — which is the whole of
+    /// what this ticket exists to end.
+    #[test]
+    fn each_way_a_stage_can_fail_reads_differently() {
+        let mut said: Vec<&str> = carried().iter().map(|(error, _)| error.because()).collect();
+        said.sort_unstable();
+        let distinct = said.len();
+        said.dedup();
+
+        assert_eq!(said.len(), distinct, "two ways of failing report the same sentence");
+        assert!(said.iter().all(|because| !because.is_empty()), "a failure with no account");
+    }
+
+    /// A stage that answered carries no complaint at all — not an empty one, which the
+    /// page would have to decide how to read.
+    #[test]
+    fn a_stage_that_answered_says_only_that() {
+        let body = serde_json::to_value(reached("sfu", Ok::<(), TtsError>(())))
+            .expect("serializes");
+
+        assert_eq!(body, serde_json::json!({"name": "sfu", "reach": "reachable"}));
+    }
+
+    /// The page reads this body by field name, and a rename does not fail — it renders
+    /// `undefined` into a status cell, in a browser nobody is running during the change
+    /// that caused it.
+    ///
+    /// The names come from serializing the real type rather than from being typed out
+    /// here, so this compares the page against the route itself. The same guard the
+    /// control-message test above puts on the protocol.
+    #[test]
+    fn the_page_reads_the_field_names_this_route_actually_sends() {
+        let readout = SpeechPath {
+            stages: vec![
+                reached("sfu", Ok::<(), TtsError>(())),
+                reached("text-to-speech", Err(TtsError::Unreachable("nope".to_owned()))),
+            ],
+        };
+        let serde_json::Value::Object(body) =
+            serde_json::to_value(&readout).expect("serializes")
+        else {
+            panic!("the readout is not a JSON object");
+        };
+
+        let page = ASSETS
+            .iter()
+            .find(|asset| asset.path.ends_with("app.js"))
+            .expect("the page has no module that reads this")
+            .body;
+
+        // Every field name, plus every word a stage's `reach` can be. Those words are as
+        // much of the contract as the names are, because the page keys its rendering on
+        // them — where a stage's `name` and its `because` are printed verbatim by a page
+        // that never knows what they say, and so are the server's alone to word.
+        let mut named: Vec<String> = body.keys().cloned().collect();
+        for stage in body["stages"].as_array().expect("stages is a list") {
+            let stage = stage.as_object().expect("a stage is an object");
+            named.extend(stage.keys().cloned());
+            named.push(stage["reach"].as_str().expect("a stage with no reach").to_owned());
+        }
+
+        // Otherwise a serialization that produced nothing would pass by having nothing to
+        // check, which is the shape of failure this whole route exists to refuse.
+        assert!(named.len() > 4, "the readout named almost nothing: {named:?}");
+
+        for name in named {
+            assert!(page.contains(&name), "this route sends {name:?}, which the page never reads");
+        }
+    }
+
     /// The 502 body is read by a caller who presented no credential, and `TtsError`
     /// carries the far side's own words: a URL that would not answer, the body it refused
     /// with, a path off this filesystem. That text reached an unauthenticated caller once
@@ -355,14 +608,7 @@ mod tests {
     /// `Display` being handed to the response at all.
     #[tokio::test]
     async fn a_refused_voice_listing_tells_the_caller_nothing_about_why() {
-        let carried = [
-            (TtsError::Unreachable("http://10.4.0.7:20977/v1/voices".to_owned()), "10.4.0.7"),
-            (TtsError::Refused { status: 401, body: "bad token sk-abcdef".to_owned() }, "sk-abcdef"),
-            (TtsError::Undecodable("/srv/openconv/voices/heart.onnx".to_owned()), "heart.onnx"),
-            (TtsError::Unreadable("missing `voices` at line 3".to_owned()), "line 3"),
-        ];
-
-        for (error, secret) in carried {
+        for (error, secret) in carried() {
             let spoken = error.to_string();
             assert!(spoken.contains(secret), "the fixture stopped carrying {secret:?}");
 

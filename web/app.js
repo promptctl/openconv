@@ -1,6 +1,7 @@
 // The page: what the button does.
 
 import { Call } from "./caller.js";
+import { isAgent } from "./conversation.js";
 import { cell, log, render, show } from "./transcript.js";
 
 const els = {
@@ -300,6 +301,53 @@ async function offerLanguages(wanted) {
 }
 
 /**
+ * How one stage of the speech path reads on screen.
+ *
+ * A table rather than a chain of comparisons, the same shape the control-message views
+ * take: a new way for a stage to be is a row here. One this page has no row for prints
+ * raw rather than rendering as nothing, because a readout that silently drops a state it
+ * does not recognise is precisely the silence it exists to end. [LAW:no-silent-failure]
+ */
+const STAGE = {
+  reachable: () => "reachable",
+  unreachable: ({ because }) => `UNREACHABLE — ${because}`,
+};
+
+/**
+ * Says what this deployment can currently reach of the speech path.
+ *
+ * A call that plays silence has four causes that look identical from here — a dead
+ * text-to-speech server, an SFU this deployment cannot talk to, an agent that never
+ * arrived, a microphone that never opened — and finding out which has meant a shell on
+ * the cluster. This draws the two the server can answer about itself; the agent is drawn
+ * from the room's own roster at the join, and the microphone reports itself already.
+ *
+ * A cell per stage, named by the server rather than by this page, so a stage added to the
+ * readout appears here without a line changing. [LAW:one-source-of-truth] Every stage the
+ * response carries is drawn, whatever it says — a readout that only drew the broken ones
+ * would leave "healthy" and "not asked" looking the same.
+ *
+ * A readout that cannot be fetched at all says so in the transcript rather than leaving
+ * cells out: the stage names live on the server, so there is nothing honest to draw a cell
+ * for, and an empty strip would read as a page that had not got round to checking.
+ */
+async function showHealth() {
+  try {
+    const response = await fetch("./health");
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} ${await response.text()}`);
+    }
+
+    for (const stage of (await response.json()).stages) {
+      const reads = STAGE[stage.reach] ?? ((raw) => JSON.stringify(raw));
+      render(cell(stage.name, reads(stage)));
+    }
+  } catch (error) {
+    render(log("error", `could not read what this deployment can reach: ${error.message}`));
+  }
+}
+
+/**
  * Keeps the current settings for next time.
  *
  * Called only after a join that worked, so what is remembered is a set of values known
@@ -409,6 +457,12 @@ async function join() {
     // nothing happened" is almost always an agent that never arrived, and that is a
     // different problem from one that arrived and stayed quiet.
     onPresence: (identity, presence) => render(log("system", `${identity} ${presence}`)),
+    // Whether anything is there to answer, which is the one thing the rows above cannot
+    // state: they are a diff, and an agent that never arrives produces no row at all.
+    // Read off the roster handed over rather than tallied up from those rows, so there is
+    // nothing here that can come to disagree with the room. [LAW:one-source-of-truth]
+    onRoster: (identities) =>
+      render(cell("agent", identities.some(isAgent) ? "in the room" : "NOT IN THE ROOM")),
   });
 
   // A voice or language list that arrived while this join was in flight has already
@@ -489,3 +543,8 @@ const seeded = seedFields();
 offerAuth();
 offerVoices(seeded.voiceId);
 offerLanguages(seeded.language);
+// Read as the page opens rather than at the join, and not awaited by one: somebody is
+// looking at this page because something is wrong, so the answer belongs on screen before
+// they press anything — and a text-to-speech server that is down must never be able to
+// slow a join down or fail it. The transcript works whatever this says.
+showHealth();
